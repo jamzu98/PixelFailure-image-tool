@@ -43,6 +43,16 @@
 	<array>
 		<dict>
 			<key>UTTypeIdentifier</key>
+			<string>com.pixelfailure.layer</string>
+			<key>UTTypeDescription</key>
+			<string>PixelFailure Layer</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+		</dict>
+		<dict>
+			<key>UTTypeIdentifier</key>
 			<string>com.pixelfailure.project</string>
 			<key>UTTypeDescription</key>
 			<string>PixelFailure Project</string>

@@ -13,6 +13,7 @@ struct CanvasViewport: View {
     @State private var pan: CGSize = .zero
     @State private var magnifyStartZoom: CGFloat?
     @State private var dragMode: DragMode?
+    @State private var hoverLocation: CGPoint = .zero
     @FocusState private var isFocused: Bool
 
     private enum DragMode {
@@ -77,8 +78,90 @@ struct CanvasViewport: View {
                 // space (or outside the canvas) deselects.
                 selectAt(location.applying(canvasTransform.inverted()))
             }
+            .onContinuousHover { phase in
+                if case .active(let location) = phase { hoverLocation = location }
+            }
+            .contextMenu {
+                contextMenuContent(canvasTransform: canvasTransform)
+            }
+            .copyable(copyableItems())
+            .cuttable(for: LayerTransfer.self) {
+                guard let id = editorState.selectedLayerID,
+                      let payload = document.transferPayload(for: id) else { return [] }
+                document.deleteLayer(id: id, undoManager: undoManager)
+                editorState.selectedLayerID = nil
+                return [payload]
+            }
+            .pasteDestination(for: LayerTransfer.self) { items in
+                for item in items {
+                    editorState.selectedLayerID = document.pasteLayer(item, undoManager: undoManager)
+                }
+            }
         }
         .clipped()
+    }
+
+    // MARK: - Copy / paste / context menu
+
+    private func copyableItems() -> [LayerTransfer] {
+        guard let id = editorState.selectedLayerID,
+              let payload = document.transferPayload(for: id) else { return [] }
+        return [payload]
+    }
+
+    /// Right-click acts on the layer under the cursor (falling back to the
+    /// current selection), matching what design apps do.
+    @ViewBuilder
+    private func contextMenuContent(canvasTransform: CGAffineTransform) -> some View {
+        let hovered = hitTest(hoverLocation.applying(canvasTransform.inverted()))
+        let target = hovered ?? document.model.layer(id: editorState.selectedLayerID)
+
+        if let layer = target {
+            Section(layer.name) {
+                Button("Copy") {
+                    editorState.selectedLayerID = layer.id
+                    document.copyLayer(id: layer.id)
+                }
+                Button("Cut") {
+                    document.cutLayer(id: layer.id, undoManager: undoManager)
+                    if editorState.selectedLayerID == layer.id { editorState.selectedLayerID = nil }
+                }
+                Button("Duplicate") {
+                    editorState.selectedLayerID = document.duplicateLayer(id: layer.id, undoManager: undoManager)
+                }
+            }
+        }
+
+        Button("Paste") {
+            if let transfer = LayerPasteboard.read() {
+                editorState.selectedLayerID = document.pasteLayer(transfer, undoManager: undoManager)
+            }
+        }
+        .disabled(!LayerPasteboard.hasLayer)
+
+        if let layer = target {
+            Divider()
+            Menu("Arrange") {
+                Button("Bring to Front") { document.reorderLayer(id: layer.id, offset: .max, undoManager: undoManager) }
+                Button("Bring Forward") { document.reorderLayer(id: layer.id, offset: 1, undoManager: undoManager) }
+                Button("Send Backward") { document.reorderLayer(id: layer.id, offset: -1, undoManager: undoManager) }
+                Button("Send to Back") { document.reorderLayer(id: layer.id, offset: .min, undoManager: undoManager) }
+            }
+            Button(layer.isVisible ? "Hide" : "Show") {
+                document.update(undoManager, actionName: layer.isVisible ? "Hide Layer" : "Show Layer") { model in
+                    model.modifyLayer(id: layer.id) { $0.isVisible.toggle() }
+                }
+            }
+            Button("Delete", role: .destructive) {
+                document.deleteLayer(id: layer.id, undoManager: undoManager)
+                if editorState.selectedLayerID == layer.id { editorState.selectedLayerID = nil }
+            }
+        }
+
+        if editorState.selectedLayerID != nil {
+            Divider()
+            Button("Deselect") { editorState.selectedLayerID = nil }
+        }
     }
 
     // MARK: - Transform math

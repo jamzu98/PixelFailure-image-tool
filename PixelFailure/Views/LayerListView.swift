@@ -14,6 +14,22 @@ struct LayerListView: View {
                     LayerRow(document: document, layer: layer)
                         .tag(layer.id)
                         .contextMenu {
+                            Button("Copy") {
+                                document.copyLayer(id: layer.id)
+                            }
+                            Button("Cut") {
+                                document.cutLayer(id: layer.id, undoManager: undoManager)
+                                if editorState.selectedLayerID == layer.id {
+                                    editorState.selectedLayerID = nil
+                                }
+                            }
+                            Button("Paste") {
+                                if let transfer = LayerPasteboard.read() {
+                                    editorState.selectedLayerID = document.pasteLayer(transfer, undoManager: undoManager)
+                                }
+                            }
+                            .disabled(!LayerPasteboard.hasLayer)
+                            Divider()
                             Button("Duplicate") {
                                 if let newID = document.duplicateLayer(id: layer.id, undoManager: undoManager) {
                                     editorState.selectedLayerID = newID

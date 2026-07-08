@@ -88,6 +88,81 @@ extension PixelDocument {
         }
     }
 
+    // MARK: - Copy / cut / paste
+
+    /// Pasteboard payload for a layer, bundling image bytes for image layers.
+    @MainActor
+    func transferPayload(for layerID: UUID) -> LayerTransfer? {
+        guard let layer = model.layer(id: layerID) else { return nil }
+        let data = layer.imageConfig.flatMap { imageData(for: $0.imageKey) }
+        return LayerTransfer(layer: layer, imageData: data)
+    }
+
+    @MainActor
+    func copyLayer(id: UUID) {
+        guard let payload = transferPayload(for: id) else { return }
+        LayerPasteboard.write(payload)
+    }
+
+    @MainActor
+    func cutLayer(id: UUID, undoManager: UndoManager?) {
+        guard let payload = transferPayload(for: id) else { return }
+        LayerPasteboard.write(payload)
+        deleteLayer(id: id, undoManager: undoManager)
+    }
+
+    /// Pastes a transferred layer on top of the stack; returns the new id.
+    @MainActor
+    @discardableResult
+    func pasteLayer(_ transfer: LayerTransfer, undoManager: UndoManager?) -> UUID {
+        var layer = transfer.layer
+        layer.id = UUID()
+        // Nudge so a paste-in-place is visibly a new layer.
+        layer.transform.position.x += model.canvasSize.width * 0.02
+        layer.transform.position.y += model.canvasSize.height * 0.02
+
+        if var config = layer.imageConfig {
+            // Re-store the image bytes: the key from the source document
+            // means nothing here (and pasting within one document is
+            // harmless — the store is append-only).
+            if let data = transfer.imageData {
+                let ext = (config.imageKey as NSString).pathExtension
+                config.imageKey = storeImage(data: data, fileExtension: ext.isEmpty ? "png" : ext)
+                layer.kind = .image(config)
+            } else if imageData(for: config.imageKey) == nil {
+                // No bytes and unknown key: drop the paste rather than add a broken layer.
+                return layer.id
+            }
+        }
+
+        if var config = layer.patternConfig,
+           let sourceID = config.sourceImageLayerID,
+           model.layer(id: sourceID) == nil {
+            config.sourceImageLayerID = nil
+            layer.kind = .pattern(config)
+        }
+
+        let pasted = layer
+        update(undoManager, actionName: "Paste Layer") { model in
+            model.layers.append(pasted)
+        }
+        return pasted.id
+    }
+
+    /// Move a layer within the stack: +1 = one step toward the front,
+    /// -1 = one step toward the back, .max/.min = all the way.
+    @MainActor
+    func reorderLayer(id: UUID, offset: Int, undoManager: UndoManager?) {
+        update(undoManager, actionName: "Reorder Layer") { model in
+            guard let index = model.layerIndex(id: id) else { return }
+            let layer = model.layers.remove(at: index)
+            let target = offset == Int.max ? model.layers.count
+                : offset == Int.min ? 0
+                : min(max(index + offset, 0), model.layers.count)
+            model.layers.insert(layer, at: target)
+        }
+    }
+
     /// Reroll a pattern layer's seed; optionally randomize its parameters too.
     @MainActor
     func reroll(layerID: UUID, randomizeParams: Bool, undoManager: UndoManager?) {
