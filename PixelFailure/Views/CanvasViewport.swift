@@ -66,8 +66,16 @@ struct CanvasViewport: View {
                 editorState.selectedLayerID = nil
                 return .handled
             }
-            .onTapGesture {
+            .onKeyPress(.escape) {
+                guard editorState.selectedLayerID != nil else { return .ignored }
+                editorState.selectedLayerID = nil
+                return .handled
+            }
+            .onTapGesture(count: 1) { location in
                 isFocused = true
+                // Click selects the layer under the cursor; clicking empty
+                // space (or outside the canvas) deselects.
+                selectAt(location.applying(canvasTransform.inverted()))
             }
         }
         .clipped()

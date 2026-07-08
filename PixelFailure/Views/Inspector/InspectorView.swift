@@ -7,6 +7,8 @@ struct InspectorView: View {
     @Bindable var editorState: EditorState
     let renderStore: RenderStore
     @Environment(\.undoManager) private var undoManager
+    @State private var draftWidth: Int = 0
+    @State private var draftHeight: Int = 0
 
     var body: some View {
         VStack(spacing: 0) {
@@ -115,9 +117,25 @@ struct InspectorView: View {
     private var canvasSection: some View {
         Section("Canvas") {
             LabeledContent("Size") {
-                Text("\(Int(document.model.canvasSize.width)) × \(Int(document.model.canvasSize.height)) px")
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    TextField("W", value: $draftWidth, format: .number.grouping(.never))
+                        .frame(width: 64)
+                        .multilineTextAlignment(.trailing)
+                    Text("×")
+                    TextField("H", value: $draftHeight, format: .number.grouping(.never))
+                        .frame(width: 64)
+                        .multilineTextAlignment(.trailing)
+                    Text("px")
+                        .foregroundStyle(.secondary)
+                }
+                .textFieldStyle(.roundedBorder)
             }
+
+            if draftSizeDiffers {
+                Button("Apply Size") { applyDraftSize() }
+                    .keyboardShortcut(.defaultAction)
+            }
+
             ColorPicker("Background", selection: Binding(
                 get: { document.model.background.color },
                 set: { newValue in
@@ -126,9 +144,28 @@ struct InspectorView: View {
                     }
                 }
             ))
-            Text("Select a layer to edit its settings. Use the toolbar to change canvas size.")
+            Text("Type any resolution above, or pick a preset from the toolbar. Select a layer to edit its settings.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+        .onAppear { syncDraftSize() }
+        .onChange(of: document.model.canvasSize) { _, _ in syncDraftSize() }
+    }
+
+    private var draftSizeDiffers: Bool {
+        draftWidth != Int(document.model.canvasSize.width) || draftHeight != Int(document.model.canvasSize.height)
+    }
+
+    private func syncDraftSize() {
+        draftWidth = Int(document.model.canvasSize.width)
+        draftHeight = Int(document.model.canvasSize.height)
+    }
+
+    private func applyDraftSize() {
+        let width = min(max(draftWidth, 16), 20000)
+        let height = min(max(draftHeight, 16), 20000)
+        draftWidth = width
+        draftHeight = height
+        document.setCanvasSize(CGSize(width: width, height: height), undoManager: undoManager)
     }
 }

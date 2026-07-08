@@ -35,6 +35,34 @@ struct LayerListView: View {
 
             Divider()
 
+            // Canvas pseudo-row: selects "nothing", which shows the canvas
+            // settings (size, background) in the inspector.
+            Button {
+                editorState.selectedLayerID = nil
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "aspectratio")
+                        .foregroundStyle(.secondary)
+                        .frame(width: 16)
+                    Text("Canvas")
+                    Spacer()
+                    Text("\(Int(document.model.canvasSize.width)) × \(Int(document.model.canvasSize.height))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .contentShape(Rectangle())
+                .background(editorState.selectedLayerID == nil ? Color.accentColor.opacity(0.22) : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 6))
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .help("Canvas settings (size, background color)")
+
+            Divider()
+
             HStack(spacing: 8) {
                 Menu {
                     Menu("Pattern") {

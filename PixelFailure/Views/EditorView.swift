@@ -52,6 +52,11 @@ struct EditorView: View {
                 canvasSizeButton("5K — 5120 × 2880", CGSize(width: 5120, height: 2880))
                 canvasSizeButton("Phone — 1290 × 2796", CGSize(width: 1290, height: 2796))
                 canvasSizeButton("Poster — 2480 × 3508", CGSize(width: 2480, height: 3508))
+                Divider()
+                Button("Custom…") {
+                    // Deselect so the inspector shows the canvas size fields.
+                    editorState.selectedLayerID = nil
+                }
             } label: {
                 Label("Canvas", systemImage: "aspectratio")
             }
