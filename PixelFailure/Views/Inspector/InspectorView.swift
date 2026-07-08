@@ -15,6 +15,7 @@ struct InspectorView: View {
             Form {
                 if let layer = document.model.layer(id: editorState.selectedLayerID) {
                     commonSection(layer)
+                    maskSection(layer)
                     switch layer.kind {
                     case .pattern(let config):
                         PatternInspector(document: document, layerID: layer.id, config: config)
@@ -22,6 +23,10 @@ struct InspectorView: View {
                         ImageInspector(document: document, layerID: layer.id, config: config)
                     case .text(let config):
                         TextInspector(document: document, layerID: layer.id, config: config)
+                    case .fill(let config):
+                        FillInspector(document: document, layerID: layer.id, config: config)
+                    case .shape(let config):
+                        ShapeInspector(document: document, layerID: layer.id, config: config)
                     }
                 } else {
                     canvasSection
@@ -111,6 +116,60 @@ struct InspectorView: View {
         }
     }
 
+    // MARK: - Mask
+
+    @ViewBuilder
+    private func maskSection(_ layer: Layer) -> some View {
+        Section("Mask") {
+            if let mask = layer.mask {
+                Toggle("Enabled", isOn: Binding(
+                    get: { mask.isEnabled },
+                    set: { newValue in
+                        document.update(undoManager, actionName: "Toggle Mask") { model in
+                            model.modifyLayer(id: layer.id) { $0.mask?.isEnabled = newValue }
+                        }
+                    }
+                ))
+                Toggle("Invert", isOn: Binding(
+                    get: { mask.inverted },
+                    set: { newValue in
+                        document.update(undoManager, actionName: "Invert Mask") { model in
+                            model.modifyLayer(id: layer.id) { $0.mask?.inverted = newValue }
+                        }
+                    }
+                ))
+                let isEditing = editorState.editingMaskLayerID == layer.id
+                Button(isEditing ? "Done Editing Mask" : "Edit Mask (Paint)") {
+                    if isEditing {
+                        editorState.editingMaskLayerID = nil
+                        editorState.activeTool = .move
+                    } else {
+                        editorState.editingMaskLayerID = layer.id
+                        editorState.activeTool = .brush
+                    }
+                }
+                Button("Delete Mask", role: .destructive) {
+                    if editorState.editingMaskLayerID == layer.id {
+                        editorState.editingMaskLayerID = nil
+                    }
+                    document.deleteMask(from: layer.id, undoManager: undoManager)
+                }
+            } else {
+                HStack {
+                    Button("Add Mask") {
+                        document.addMask(to: layer.id, hideAll: false, renderStore: renderStore, undoManager: undoManager)
+                    }
+                    Button("Add Hiding Mask") {
+                        document.addMask(to: layer.id, hideAll: true, renderStore: renderStore, undoManager: undoManager)
+                    }
+                }
+                Text("Masks hide parts of the layer: paint black to hide, white to reveal.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
     // MARK: - Canvas (no selection)
 
     @ViewBuilder
@@ -150,6 +209,12 @@ struct InspectorView: View {
         }
         .onAppear { syncDraftSize() }
         .onChange(of: document.model.canvasSize) { _, _ in syncDraftSize() }
+
+        EffectStackSection(document: document,
+                           title: "Canvas Effects",
+                           target: .canvas,
+                           effects: document.model.canvasEffects,
+                           footnote: "Applied to the whole composite. Affects PNG export and the preview; SVG export skips them.")
     }
 
     private var draftSizeDiffers: Bool {

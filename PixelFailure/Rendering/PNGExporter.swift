@@ -43,6 +43,8 @@ enum PNGExporter {
             ctx.beginTransparencyLayer(auxiliaryInfo: nil)
             ctx.concatenate(item.transform)
 
+            let naturalRect = CGRect(origin: .zero, size: item.naturalSize)
+
             switch item.content {
             case .primitives(let primitives):
                 for primitive in primitives {
@@ -63,12 +65,17 @@ enum PNGExporter {
                     }
                 }
             case .raster(let image):
-                // Un-flip locally so the raster draws upright.
-                let rect = CGRect(origin: .zero, size: item.naturalSize)
+                drawUpright(image, in: naturalRect, context: ctx)
+            case .fill(let config):
+                drawFill(config, in: naturalRect, context: ctx)
+            }
+
+            // Mask inside the layer's transparency layer: keep only the pixels
+            // where the mask's alpha is set.
+            if let mask = item.mask {
                 ctx.saveGState()
-                ctx.translateBy(x: rect.minX, y: rect.maxY)
-                ctx.scaleBy(x: 1, y: -1)
-                ctx.draw(image, in: CGRect(origin: .zero, size: rect.size))
+                ctx.setBlendMode(.destinationIn)
+                drawUpright(mask.alpha, in: naturalRect, context: ctx)
                 ctx.restoreGState()
             }
 
@@ -77,6 +84,47 @@ enum PNGExporter {
         }
 
         return ctx.makeImage()
+    }
+
+    /// Draws a CGImage upright inside our y-down coordinate space.
+    private static func drawUpright(_ image: CGImage, in rect: CGRect, context ctx: CGContext) {
+        ctx.saveGState()
+        ctx.translateBy(x: rect.minX, y: rect.maxY)
+        ctx.scaleBy(x: 1, y: -1)
+        ctx.draw(image, in: CGRect(origin: .zero, size: rect.size))
+        ctx.restoreGState()
+    }
+
+    private static func drawFill(_ config: FillConfig, in rect: CGRect, context ctx: CGContext) {
+        guard config.colors.count > 1, config.style != .solid else {
+            ctx.setFillColor((config.colors.first ?? .black).cgColor)
+            ctx.fill(rect)
+            return
+        }
+        let cgColors = config.colors.map(\.cgColor) as CFArray
+        let locations: [CGFloat] = config.colors.indices.map {
+            CGFloat($0) / CGFloat(config.colors.count - 1)
+        }
+        guard let gradient = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.sRGB),
+                                        colors: cgColors,
+                                        locations: locations) else { return }
+        ctx.saveGState()
+        ctx.clip(to: rect)
+        switch config.style {
+        case .linearGradient:
+            let points = ShapeGeometry.linearGradientPoints(angleDegrees: config.angle, in: rect.size)
+            ctx.drawLinearGradient(gradient, start: points.start, end: points.end,
+                                   options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
+        case .radialGradient:
+            let center = CGPoint(x: rect.midX, y: rect.midY)
+            ctx.drawRadialGradient(gradient, startCenter: center, startRadius: 0,
+                                   endCenter: center,
+                                   endRadius: hypot(rect.width, rect.height) / 2,
+                                   options: [.drawsAfterEndLocation])
+        case .solid:
+            break
+        }
+        ctx.restoreGState()
     }
 
     static func pngData(_ image: CGImage) -> Data? {

@@ -31,4 +31,24 @@ extension Layer {
         change(&config)
         kind = .text(config)
     }
+
+    var fillConfig: FillConfig? {
+        if case .fill(let config) = kind { config } else { nil }
+    }
+
+    var shapeConfig: ShapeConfig? {
+        if case .shape(let config) = kind { config } else { nil }
+    }
+
+    mutating func modifyFill(_ change: (inout FillConfig) -> Void) {
+        guard case .fill(var config) = kind else { return }
+        change(&config)
+        kind = .fill(config)
+    }
+
+    mutating func modifyShape(_ change: (inout ShapeConfig) -> Void) {
+        guard case .shape(var config) = kind else { return }
+        change(&config)
+        kind = .shape(config)
+    }
 }

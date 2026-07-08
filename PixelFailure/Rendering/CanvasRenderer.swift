@@ -16,21 +16,51 @@ enum CanvasRenderer {
             layerContext.blendMode = item.blendMode.graphicsContextMode
             layerContext.drawLayer { inner in
                 inner.concatenate(item.transform)
-                switch item.content {
-                case .primitives(let primitives):
-                    for primitive in primitives {
-                        if let fill = primitive.fill {
-                            inner.fill(primitive.path, with: .color(fill.color))
-                        }
-                        if let stroke = primitive.stroke {
-                            inner.stroke(primitive.path, with: .color(stroke.color), style: primitive.strokeStyle)
-                        }
+                let naturalRect = CGRect(origin: .zero, size: item.naturalSize)
+                if let mask = item.mask {
+                    inner.clipToLayer { maskContext in
+                        maskContext.draw(Image(decorative: mask.alpha, scale: 1), in: naturalRect)
                     }
-                case .raster(let image):
-                    inner.draw(Image(decorative: image, scale: 1),
-                               in: CGRect(origin: .zero, size: item.naturalSize))
+                }
+                draw(item.content, naturalRect: naturalRect, in: inner)
+            }
+        }
+    }
+
+    private static func draw(_ content: RenderItem.Content, naturalRect: CGRect, in context: GraphicsContext) {
+        switch content {
+        case .primitives(let primitives):
+            for primitive in primitives {
+                if let fill = primitive.fill {
+                    context.fill(primitive.path, with: .color(fill.color))
+                }
+                if let stroke = primitive.stroke {
+                    context.stroke(primitive.path, with: .color(stroke.color), style: primitive.strokeStyle)
                 }
             }
+        case .raster(let image):
+            context.draw(Image(decorative: image, scale: 1), in: naturalRect)
+        case .fill(let config):
+            context.fill(Path(naturalRect), with: shading(for: config, in: naturalRect.size))
+        }
+    }
+
+    private static func shading(for config: FillConfig, in size: CGSize) -> GraphicsContext.Shading {
+        let colors = config.colors.map(\.color)
+        guard colors.count > 1, config.style != .solid else {
+            return .color(colors.first ?? .black)
+        }
+        switch config.style {
+        case .solid:
+            return .color(colors[0])
+        case .linearGradient:
+            let points = ShapeGeometry.linearGradientPoints(angleDegrees: config.angle, in: size)
+            return .linearGradient(Gradient(colors: colors), startPoint: points.start, endPoint: points.end)
+        case .radialGradient:
+            return .radialGradient(Gradient(colors: colors),
+                                   center: CGPoint(x: size.width / 2, y: size.height / 2),
+                                   startRadius: 0,
+                                   endRadius: Double(hypot(size.width, size.height)) / 2)
         }
     }
 }

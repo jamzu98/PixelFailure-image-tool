@@ -88,6 +88,153 @@ extension PixelDocument {
         }
     }
 
+    @MainActor
+    @discardableResult
+    func addFillLayer(undoManager: UndoManager?) -> UUID {
+        let palette = model.palette.sortedByLuminance
+        let colors = [palette.color(0), palette.color(palette.colors.count - 1)]
+        let layer = Layer(name: "Gradient",
+                          transform: LayerTransform(position: model.canvasCenter),
+                          kind: .fill(FillConfig(style: .linearGradient, colors: colors)))
+        update(undoManager, actionName: "Add Fill") { model in
+            model.layers.append(layer)
+        }
+        return layer.id
+    }
+
+    @MainActor
+    @discardableResult
+    func addShapeLayer(_ kind: ShapeKind, undoManager: UndoManager?) -> UUID {
+        let side = min(model.canvasSize.width, model.canvasSize.height) / 2.5
+        var config = ShapeConfig(kind: kind, size: CGSize(width: side, height: side))
+        config.fill = model.palette.color(1)
+        if kind == .line {
+            config.size.height = max(8, side * 0.02)
+            config.fill = nil
+            config.stroke = model.palette.color(1)
+            config.strokeWidth = max(4, Double(side) * 0.03)
+        }
+        let layer = Layer(name: kind.displayName,
+                          transform: LayerTransform(position: model.canvasCenter),
+                          kind: .shape(config))
+        update(undoManager, actionName: "Add Shape") { model in
+            model.layers.append(layer)
+        }
+        return layer.id
+    }
+
+    /// A transparent, canvas-sized image layer ready for brush painting.
+    @MainActor
+    @discardableResult
+    func addPaintLayer(undoManager: UndoManager?) -> UUID? {
+        let maxDim = 4096.0
+        let scale = min(1, maxDim / max(model.canvasSize.width, model.canvasSize.height))
+        let width = max(8, Int(model.canvasSize.width * scale))
+        let height = max(8, Int(model.canvasSize.height * scale))
+        guard let ctx = CGContext(data: nil, width: width, height: height,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+              let image = ctx.makeImage(),
+              let data = PNGExporter.pngData(image) else { return nil }
+
+        let key = storeImage(data: data, fileExtension: "png")
+        let pixelSize = CGSize(width: width, height: height)
+        let fitScale = model.canvasSize.width / pixelSize.width
+        let layer = Layer(name: "Paint",
+                          transform: LayerTransform(position: model.canvasCenter, scale: fitScale),
+                          kind: .image(ImageConfig(imageKey: key, pixelSize: pixelSize)))
+        update(undoManager, actionName: "Add Paint Layer") { model in
+            model.layers.append(layer)
+        }
+        return layer.id
+    }
+
+    // MARK: - Masks
+
+    /// Adds a grayscale mask at the layer's content resolution (capped).
+    /// Reveal-all = white, hide-all = black.
+    @MainActor
+    func addMask(to layerID: UUID, hideAll: Bool, renderStore: RenderStore, undoManager: UndoManager?) {
+        guard let layer = model.layer(id: layerID), layer.mask == nil else { return }
+        let naturalSize = renderStore.naturalSize(for: layer, model: model)
+        guard naturalSize.width > 0, naturalSize.height > 0 else { return }
+
+        let maxDim = 2048.0
+        let scale = min(1, maxDim / Double(max(naturalSize.width, naturalSize.height)))
+        let width = max(8, Int(Double(naturalSize.width) * scale))
+        let height = max(8, Int(Double(naturalSize.height) * scale))
+
+        guard let ctx = CGContext(data: nil, width: width, height: height,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceGray(),
+                                  bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return }
+        ctx.setFillColor(CGColor(gray: hideAll ? 0 : 1, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        guard let image = ctx.makeImage(), let data = PNGExporter.pngData(image) else { return }
+
+        let key = storeImage(data: data, fileExtension: "png")
+        let mask = LayerMask(imageKey: key, pixelSize: CGSize(width: width, height: height))
+        update(undoManager, actionName: "Add Mask") { model in
+            model.modifyLayer(id: layerID) { $0.mask = mask }
+        }
+    }
+
+    @MainActor
+    func deleteMask(from layerID: UUID, undoManager: UndoManager?) {
+        update(undoManager, actionName: "Delete Mask") { model in
+            model.modifyLayer(id: layerID) { $0.mask = nil }
+        }
+    }
+
+    // MARK: - Rasterize
+
+    /// Bakes a layer into pixels: vector layers (pattern/text/fill/shape)
+    /// render at natural size × scale; image layers bake crop + effects.
+    /// Position, rotation, opacity, blend mode, and mask stay live.
+    @MainActor
+    func rasterizeLayer(id: UUID, renderStore: RenderStore, undoManager: UndoManager?) {
+        guard let layer = model.layer(id: id) else { return }
+
+        let naturalSize = renderStore.naturalSize(for: layer, model: model)
+        guard naturalSize.width > 0, naturalSize.height > 0 else { return }
+
+        // Bake at the effective on-canvas resolution, capped for sanity.
+        let bakeScale = min(max(layer.transform.scale, 0.01),
+                            8192 / Double(max(naturalSize.width, naturalSize.height)))
+        let pixelSize = CGSize(width: max(1, (naturalSize.width * bakeScale).rounded()),
+                               height: max(1, (naturalSize.height * bakeScale).rounded()))
+
+        // Render just this layer's content, untransformed, into a bitmap.
+        var flat = layer
+        flat.isVisible = true
+        flat.opacity = 1
+        flat.blendMode = .normal
+        flat.mask = nil
+        flat.transform = LayerTransform(position: CGPoint(x: naturalSize.width / 2,
+                                                          y: naturalSize.height / 2))
+        var soloModel = model
+        soloModel.layers = [flat]
+        soloModel.background = .clear
+        soloModel.canvasSize = naturalSize
+
+        let items = renderStore.renderItems(model: soloModel, quality: .full)
+        guard let baked = PNGExporter.render(items: items,
+                                             background: .clear,
+                                             canvasSize: naturalSize,
+                                             targetPixelSize: pixelSize),
+              let data = PNGExporter.pngData(baked) else { return }
+
+        let key = storeImage(data: data, fileExtension: "png")
+        let newScale = layer.transform.scale * Double(naturalSize.width) / Double(pixelSize.width)
+        update(undoManager, actionName: "Rasterize Layer") { model in
+            model.modifyLayer(id: id) { layer in
+                layer.kind = .image(ImageConfig(imageKey: key, pixelSize: pixelSize))
+                layer.transform.scale = newScale
+            }
+        }
+    }
+
     // MARK: - Copy / cut / paste
 
     /// Pasteboard payload for a layer, bundling image bytes for image layers.
@@ -176,6 +323,20 @@ extension PixelDocument {
                                                                keeping: config.params)
                     }
                 }
+            }
+        }
+    }
+
+    /// Crop the canvas to a rectangle (canvas coordinates): the canvas takes
+    /// the rect's size and every layer shifts so content stays in place.
+    @MainActor
+    func cropCanvas(rect: CGRect, undoManager: UndoManager?) {
+        let size = CGSize(width: max(16, rect.width.rounded()), height: max(16, rect.height.rounded()))
+        update(undoManager, actionName: "Crop Canvas") { model in
+            model.canvasSize = size
+            for i in model.layers.indices {
+                model.layers[i].transform.position.x -= rect.minX
+                model.layers[i].transform.position.y -= rect.minY
             }
         }
     }

@@ -5,6 +5,7 @@ import SwiftUI
 struct LayerListView: View {
     @ObservedObject var document: PixelDocument
     @Bindable var editorState: EditorState
+    let renderStore: RenderStore
     @Environment(\.undoManager) private var undoManager
 
     var body: some View {
@@ -34,6 +35,9 @@ struct LayerListView: View {
                                 if let newID = document.duplicateLayer(id: layer.id, undoManager: undoManager) {
                                     editorState.selectedLayerID = newID
                                 }
+                            }
+                            Button("Rasterize") {
+                                document.rasterizeLayer(id: layer.id, renderStore: renderStore, undoManager: undoManager)
                             }
                             Button("Delete", role: .destructive) {
                                 document.deleteLayer(id: layer.id, undoManager: undoManager)
@@ -81,19 +85,7 @@ struct LayerListView: View {
 
             HStack(spacing: 8) {
                 Menu {
-                    Menu("Pattern") {
-                        ForEach(GeneratorType.allCases, id: \.self) { type in
-                            Button(type.displayName) {
-                                editorState.selectedLayerID = document.addPatternLayer(type, undoManager: undoManager)
-                            }
-                        }
-                    }
-                    Button("Image…") {
-                        editorState.showImageImporter = true
-                    }
-                    Button("Text") {
-                        editorState.selectedLayerID = document.addTextLayer(undoManager: undoManager)
-                    }
+                    AddLayerMenuItems(document: document, editorState: editorState)
                 } label: {
                     Image(systemName: "plus")
                 }
@@ -168,6 +160,13 @@ private struct LayerRow: View {
                         model.modifyLayer(id: layer.id) { $0.name = name }
                     }
                 }
+
+            if layer.mask != nil {
+                Image(systemName: "circle.lefthalf.filled")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .help("Has a mask")
+            }
         }
         .opacity(layer.isVisible ? 1 : 0.55)
         .onAppear { draftName = layer.name }

@@ -68,9 +68,14 @@ struct ExportSheet: View {
                         .foregroundStyle(.secondary)
                 }
             } else {
-                Text("Patterns and text export as true vectors; image layers are embedded as PNG.")
+                Text("Patterns, shapes, and text export as true vectors; image layers are embedded as PNG.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if !document.model.canvasEffects.isEmpty {
+                    Text("Canvas effects are raster-only and will be skipped in SVG.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             }
 
             if let errorMessage {
@@ -119,19 +124,28 @@ struct ExportSheet: View {
         do {
             switch format {
             case .png:
-                guard let image = PNGExporter.render(items: items,
+                guard var image = PNGExporter.render(items: items,
                                                      background: model.background,
                                                      canvasSize: model.canvasSize,
-                                                     targetPixelSize: targetSize()),
-                      let data = PNGExporter.pngData(image) else {
+                                                     targetPixelSize: targetSize()) else {
                     errorMessage = "Rendering failed."
+                    return
+                }
+                if !model.canvasEffects.isEmpty {
+                    image = EffectPipeline.shared.apply(effects: model.canvasEffects,
+                                                        to: image,
+                                                        palette: model.palette)
+                }
+                guard let data = PNGExporter.pngData(image) else {
+                    errorMessage = "Encoding failed."
                     return
                 }
                 try data.write(to: url)
             case .svg:
                 let svg = SVGExporter.svg(items: items,
                                           background: model.background,
-                                          canvasSize: model.canvasSize)
+                                          canvasSize: model.canvasSize,
+                                          skippedGlobalEffects: !model.canvasEffects.isEmpty)
                 try svg.write(to: url, atomically: true, encoding: .utf8)
             }
             dismiss()

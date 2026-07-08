@@ -6,18 +6,14 @@ import SwiftUI
 enum SVGExporter {
     static func svg(items: [RenderItem],
                     background: RGBAColor,
-                    canvasSize: CGSize) -> String {
+                    canvasSize: CGSize,
+                    skippedGlobalEffects: Bool = false) -> String {
         let w = Int(canvasSize.width)
         let h = Int(canvasSize.height)
-        var out = """
-        <?xml version="1.0" encoding="UTF-8"?>
-        <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" \
-        width="\(w)" height="\(h)" viewBox="0 0 \(w) \(h)">
-        <rect width="\(w)" height="\(h)" fill="\(background.svgString)"/>
+        var defs = ""
+        var body = ""
 
-        """
-
-        for item in items {
+        for (index, item) in items.enumerated() {
             let t = item.transform
             let transform = "matrix(\(fmt(t.a)),\(fmt(t.b)),\(fmt(t.c)),\(fmt(t.d)),\(fmt(t.tx)),\(fmt(t.ty)))"
             var style = ""
@@ -25,25 +21,85 @@ enum SVGExporter {
                 style = " style=\"mix-blend-mode:\(item.blendMode.svgName)\""
             }
             let opacity = item.opacity < 0.999 ? " opacity=\"\(fmt(item.opacity))\"" : ""
-            out += "<g transform=\"\(transform)\"\(opacity)\(style)>\n"
+            body += "<g transform=\"\(transform)\"\(opacity)\(style)>\n"
+
+            // Masks live on an untransformed inner group so their coordinates
+            // are the layer's local space.
+            if let mask = item.mask, let maskPNG = PNGExporter.pngData(mask.luminance) {
+                let maskID = "mask\(index)"
+                let mw = fmt(Double(item.naturalSize.width))
+                let mh = fmt(Double(item.naturalSize.height))
+                defs += "<mask id=\"\(maskID)\" maskUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"\(mw)\" height=\"\(mh)\">\n"
+                defs += "<image width=\"\(mw)\" height=\"\(mh)\" preserveAspectRatio=\"none\" "
+                defs += "xlink:href=\"data:image/png;base64,\(maskPNG.base64EncodedString())\"/>\n</mask>\n"
+                body += "<g mask=\"url(#\(maskID))\">\n"
+            }
 
             switch item.content {
             case .primitives(let primitives):
                 for primitive in primitives {
-                    out += pathElement(primitive)
+                    body += pathElement(primitive)
                 }
             case .raster(let image):
                 if let png = PNGExporter.pngData(image) {
                     let base64 = png.base64EncodedString()
-                    out += "<image width=\"\(fmt(Double(item.naturalSize.width)))\" height=\"\(fmt(Double(item.naturalSize.height)))\" "
-                    out += "preserveAspectRatio=\"none\" xlink:href=\"data:image/png;base64,\(base64)\"/>\n"
+                    body += "<image width=\"\(fmt(Double(item.naturalSize.width)))\" height=\"\(fmt(Double(item.naturalSize.height)))\" "
+                    body += "preserveAspectRatio=\"none\" xlink:href=\"data:image/png;base64,\(base64)\"/>\n"
                 }
+            case .fill(let config):
+                body += fillElement(config, size: item.naturalSize, index: index, defs: &defs)
             }
-            out += "</g>\n"
+
+            if item.mask != nil {
+                body += "</g>\n"
+            }
+            body += "</g>\n"
         }
 
+        var out = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" \
+        width="\(w)" height="\(h)" viewBox="0 0 \(w) \(h)">
+
+        """
+        if skippedGlobalEffects {
+            out += "<!-- Canvas-level effects are raster-only and were not applied to this SVG. -->\n"
+        }
+        if !defs.isEmpty {
+            out += "<defs>\n\(defs)</defs>\n"
+        }
+        out += "<rect width=\"\(w)\" height=\"\(h)\" fill=\"\(background.svgString)\"/>\n"
+        out += body
         out += "</svg>\n"
         return out
+    }
+
+    private static func fillElement(_ config: FillConfig, size: CGSize, index: Int, defs: inout String) -> String {
+        let w = fmt(Double(size.width))
+        let h = fmt(Double(size.height))
+        guard config.colors.count > 1, config.style != .solid else {
+            let color = config.colors.first ?? .black
+            return "<rect width=\"\(w)\" height=\"\(h)\" fill=\"\(color.svgString)\"/>\n"
+        }
+
+        let gradientID = "grad\(index)"
+        let stops = config.colors.indices.map { i -> String in
+            let offset = Double(i) / Double(config.colors.count - 1)
+            return "<stop offset=\"\(fmt(offset))\" stop-color=\"\(config.colors[i].svgString)\"/>"
+        }.joined(separator: "\n")
+
+        switch config.style {
+        case .linearGradient:
+            let points = ShapeGeometry.linearGradientPoints(angleDegrees: config.angle, in: size)
+            defs += "<linearGradient id=\"\(gradientID)\" gradientUnits=\"userSpaceOnUse\" "
+            defs += "x1=\"\(fmt(points.start.x))\" y1=\"\(fmt(points.start.y))\" x2=\"\(fmt(points.end.x))\" y2=\"\(fmt(points.end.y))\">\n\(stops)\n</linearGradient>\n"
+        case .radialGradient:
+            defs += "<radialGradient id=\"\(gradientID)\" gradientUnits=\"userSpaceOnUse\" "
+            defs += "cx=\"\(fmt(Double(size.width) / 2))\" cy=\"\(fmt(Double(size.height) / 2))\" r=\"\(fmt(Double(hypot(size.width, size.height)) / 2))\">\n\(stops)\n</radialGradient>\n"
+        case .solid:
+            break
+        }
+        return "<rect width=\"\(w)\" height=\"\(h)\" fill=\"url(#\(gradientID))\"/>\n"
     }
 
     private static func pathElement(_ primitive: VectorPrimitive) -> String {

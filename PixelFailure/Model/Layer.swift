@@ -9,6 +9,8 @@ nonisolated struct Layer: Identifiable, Codable, Hashable, Sendable {
     var blendMode: LayerBlendMode
     var transform: LayerTransform
     var kind: LayerKind
+    /// Optional so documents from before masks existed keep decoding.
+    var mask: LayerMask?
 
     init(id: UUID = UUID(),
          name: String,
@@ -16,7 +18,8 @@ nonisolated struct Layer: Identifiable, Codable, Hashable, Sendable {
          opacity: Double = 1,
          blendMode: LayerBlendMode = .normal,
          transform: LayerTransform,
-         kind: LayerKind) {
+         kind: LayerKind,
+         mask: LayerMask? = nil) {
         self.id = id
         self.name = name
         self.isVisible = isVisible
@@ -24,6 +27,7 @@ nonisolated struct Layer: Identifiable, Codable, Hashable, Sendable {
         self.blendMode = blendMode
         self.transform = transform
         self.kind = kind
+        self.mask = mask
     }
 }
 
@@ -31,17 +35,123 @@ nonisolated enum LayerKind: Codable, Hashable, Sendable {
     case pattern(PatternConfig)
     case image(ImageConfig)
     case text(TextConfig)
+    case fill(FillConfig)
+    case shape(ShapeConfig)
 
     var isPattern: Bool { if case .pattern = self { true } else { false } }
     var isImage: Bool { if case .image = self { true } else { false } }
     var isText: Bool { if case .text = self { true } else { false } }
+    var isFill: Bool { if case .fill = self { true } else { false } }
+    var isShape: Bool { if case .shape = self { true } else { false } }
 
     var iconName: String {
         switch self {
         case .pattern: "circle.grid.3x3.fill"
         case .image: "photo"
         case .text: "textformat"
+        case .fill: "rectangle.fill"
+        case .shape: "square.on.circle"
         }
+    }
+}
+
+// MARK: - Fill / gradient
+
+nonisolated enum FillStyle: String, Codable, CaseIterable, Hashable, Sendable {
+    case solid, linearGradient, radialGradient
+
+    var displayName: String {
+        switch self {
+        case .solid: "Solid"
+        case .linearGradient: "Linear Gradient"
+        case .radialGradient: "Radial Gradient"
+        }
+    }
+}
+
+/// A canvas-filling solid color or gradient layer.
+nonisolated struct FillConfig: Codable, Hashable, Sendable {
+    var style: FillStyle
+    /// Gradient stops in order (>= 1 color; solid uses the first).
+    var colors: [RGBAColor]
+    /// Linear gradient direction in degrees (0 = left→right).
+    var angle: Double
+
+    init(style: FillStyle = .linearGradient,
+         colors: [RGBAColor] = [RGBAColor(hex: "#9C4A2F"), RGBAColor(hex: "#EAD7C2")],
+         angle: Double = 90) {
+        self.style = style
+        self.colors = colors
+        self.angle = angle
+    }
+}
+
+// MARK: - Shape
+
+nonisolated enum ShapeKind: String, Codable, CaseIterable, Hashable, Sendable {
+    case rectangle, roundedRectangle, ellipse, line, polygon, star
+
+    var displayName: String {
+        switch self {
+        case .rectangle: "Rectangle"
+        case .roundedRectangle: "Rounded Rectangle"
+        case .ellipse: "Ellipse"
+        case .line: "Line"
+        case .polygon: "Polygon"
+        case .star: "Star"
+        }
+    }
+}
+
+/// A single vector shape layer — stays vector all the way to SVG.
+nonisolated struct ShapeConfig: Codable, Hashable, Sendable {
+    var kind: ShapeKind
+    /// Natural size of the shape's bounding box.
+    var size: CGSize
+    var fill: RGBAColor?
+    var stroke: RGBAColor?
+    var strokeWidth: Double
+    /// For roundedRectangle, as a fraction of the smaller dimension (0...0.5).
+    var cornerRadius: Double
+    /// For polygon/star.
+    var sides: Int
+    /// For star: inner radius as a fraction of the outer.
+    var starInnerRatio: Double
+
+    init(kind: ShapeKind = .rectangle,
+         size: CGSize = CGSize(width: 800, height: 800),
+         fill: RGBAColor? = RGBAColor(hex: "#C4744F"),
+         stroke: RGBAColor? = nil,
+         strokeWidth: Double = 12,
+         cornerRadius: Double = 0.12,
+         sides: Int = 6,
+         starInnerRatio: Double = 0.45) {
+        self.kind = kind
+        self.size = size
+        self.fill = fill
+        self.stroke = stroke
+        self.strokeWidth = strokeWidth
+        self.cornerRadius = cornerRadius
+        self.sides = sides
+        self.starInnerRatio = starInnerRatio
+    }
+}
+
+// MARK: - Mask
+
+/// Grayscale mask stored in the document's image store.
+/// White reveals, black hides (Photoshop convention).
+nonisolated struct LayerMask: Codable, Hashable, Sendable {
+    var imageKey: String
+    var pixelSize: CGSize
+    var isEnabled: Bool
+    var inverted: Bool
+
+    init(imageKey: String, pixelSize: CGSize, isEnabled: Bool = true, inverted: Bool = false) {
+        self.imageKey = imageKey
+        self.pixelSize = pixelSize
+        self.isEnabled = isEnabled
+        self.inverted = inverted
     }
 }
 

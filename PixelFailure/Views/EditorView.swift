@@ -14,18 +14,31 @@ struct EditorView: View {
 
     var body: some View {
         HSplitView {
-            LayerListView(document: document, editorState: editorState)
+            LayerListView(document: document, editorState: editorState, renderStore: renderStore)
                 .frame(minWidth: 200, idealWidth: 230, maxWidth: 320)
 
-            CanvasViewport(document: document, editorState: editorState, renderStore: renderStore)
-                .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
-                .layoutPriority(1)
+            VStack(spacing: 0) {
+                if showsOptionsBar {
+                    ToolOptionsBar(document: document, editorState: editorState)
+                    Divider()
+                }
+                HStack(spacing: 0) {
+                    ToolStrip(document: document, editorState: editorState)
+                    Divider()
+                    CanvasViewport(document: document, editorState: editorState, renderStore: renderStore)
+                }
+            }
+            .frame(minWidth: 460, maxWidth: .infinity, maxHeight: .infinity)
+            .layoutPriority(1)
 
             InspectorView(document: document, editorState: editorState, renderStore: renderStore)
                 .frame(minWidth: 280, idealWidth: 310, maxWidth: 380)
         }
-        .frame(minWidth: 1080, minHeight: 640)
-        .focusedSceneValue(\.editorState, editorState)
+        .frame(minWidth: 1120, minHeight: 640)
+        .focusedSceneValue(\.editorFocus, EditorFocus(document: document,
+                                                      editorState: editorState,
+                                                      renderStore: renderStore,
+                                                      undoManager: undoManager))
         .toolbar { toolbarContent }
         .sheet(isPresented: Binding(get: { editorState.showExportSheet },
                                     set: { editorState.showExportSheet = $0 })) {
@@ -38,6 +51,13 @@ struct EditorView: View {
         }
         .onDrop(of: [.fileURL, .image], isTargeted: nil) { providers in
             handleDrop(providers)
+        }
+    }
+
+    private var showsOptionsBar: Bool {
+        switch editorState.activeTool {
+        case .brush, .eraser, .crop, .zoom, .eyedropper: true
+        case .move, .hand: false
         }
     }
 

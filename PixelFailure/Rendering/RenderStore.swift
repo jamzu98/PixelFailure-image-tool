@@ -2,12 +2,20 @@ import CoreGraphics
 import Foundation
 import ImageIO
 
+/// A layer mask ready for each renderer: alpha for Core Graphics/Canvas
+/// clipping, luminance (grayscale) for SVG's luminance-based masks.
+struct RenderMask {
+    var alpha: CGImage
+    var luminance: CGImage
+}
+
 /// A fully resolved, drawable layer. Both the live viewport (GraphicsContext)
 /// and the exporters (CGContext / SVG) consume arrays of these.
 struct RenderItem: Identifiable {
     enum Content {
         case primitives([VectorPrimitive])
         case raster(CGImage)
+        case fill(FillConfig)
     }
 
     let id: UUID
@@ -17,6 +25,7 @@ struct RenderItem: Identifiable {
     var transform: CGAffineTransform
     var naturalSize: CGSize
     var content: Content
+    var mask: RenderMask?
 }
 
 enum RenderQuality {
@@ -42,6 +51,12 @@ final class RenderStore {
     private var previewImages: [UUID: (hash: Int, image: CGImage)] = [:]
     private var primitives: [UUID: (hash: Int, primitives: [VectorPrimitive], naturalSize: CGSize)] = [:]
     private var samplers: [UUID: (hash: Int, sampler: ImageSampler)] = [:]
+    private var masks: [UUID: (hash: Int, mask: RenderMask)] = [:]
+    private var composite: (hash: Int, image: CGImage)?
+
+    /// While a brush stroke is in flight, this session's buffer overrides the
+    /// target layer's content (or mask) so painting previews live.
+    var activePaintSession: PaintSession?
 
     init(document: PixelDocument) {
         self.document = document
@@ -58,9 +73,10 @@ final class RenderStore {
 
     func naturalSize(for layer: Layer, model: ProjectModel) -> CGSize {
         switch layer.kind {
-        case .pattern: model.canvasSize
+        case .pattern, .fill: model.canvasSize
         case .image(let config): config.croppedPixelSize
         case .text: primitivesResult(for: layer, model: model).naturalSize
+        case .shape(let config): config.size
         }
     }
 
@@ -80,20 +96,49 @@ final class RenderStore {
         previewImages.removeAll()
         primitives.removeAll()
         samplers.removeAll()
+        masks.removeAll()
+        composite = nil
+    }
+
+    /// Flattened composite with the canvas-level effect stack applied, at
+    /// preview resolution. Used by the viewport when canvasEffects is
+    /// non-empty. `extraHash` lets callers force refresh (e.g. paint ticks).
+    func compositePreview(model: ProjectModel, extraHash: Int = 0) -> CGImage? {
+        guard !model.canvasEffects.isEmpty else { return nil }
+        var hasher = Hasher()
+        hasher.combine(model)
+        hasher.combine(extraHash)
+        let hash = hasher.finalize()
+        if let composite, composite.hash == hash { return composite.image }
+
+        let maxDim = 1400.0
+        let scale = min(1, maxDim / Double(max(model.canvasSize.width, model.canvasSize.height)))
+        let target = CGSize(width: max(8, model.canvasSize.width * scale),
+                            height: max(8, model.canvasSize.height * scale))
+        let items = renderItems(model: model, quality: .preview)
+        guard let flat = PNGExporter.render(items: items,
+                                            background: model.background,
+                                            canvasSize: model.canvasSize,
+                                            targetPixelSize: target) else { return nil }
+        let result = EffectPipeline.shared.apply(effects: model.canvasEffects, to: flat, palette: model.palette)
+        composite = (hash, result)
+        return result
     }
 
     // MARK: - Layer resolution
 
     private func renderItem(for layer: Layer, model: ProjectModel, quality: RenderQuality) -> RenderItem? {
+        let mask = renderMask(for: layer)
         switch layer.kind {
-        case .pattern, .text:
+        case .pattern, .text, .shape:
             let result = primitivesResult(for: layer, model: model)
             return RenderItem(id: layer.id,
                               opacity: layer.opacity,
                               blendMode: layer.blendMode,
                               transform: layer.transform.affine(naturalSize: result.naturalSize),
                               naturalSize: result.naturalSize,
-                              content: .primitives(result.primitives))
+                              content: .primitives(result.primitives),
+                              mask: mask)
         case .image(let config):
             guard let image = resolvedImage(for: layer, config: config, model: model, quality: quality) else { return nil }
             let naturalSize = config.croppedPixelSize
@@ -102,8 +147,43 @@ final class RenderStore {
                               blendMode: layer.blendMode,
                               transform: layer.transform.affine(naturalSize: naturalSize),
                               naturalSize: naturalSize,
-                              content: .raster(image))
+                              content: .raster(image),
+                              mask: mask)
+        case .fill(let config):
+            return RenderItem(id: layer.id,
+                              opacity: layer.opacity,
+                              blendMode: layer.blendMode,
+                              transform: layer.transform.affine(naturalSize: model.canvasSize),
+                              naturalSize: model.canvasSize,
+                              content: .fill(config),
+                              mask: mask)
         }
+    }
+
+    /// Alpha + luminance mask images for a layer, cached by mask hash.
+    private func renderMask(for layer: Layer) -> RenderMask? {
+        guard let mask = layer.mask, mask.isEnabled else { return nil }
+        // Live mask painting preview.
+        if let session = activePaintSession,
+           session.isMask,
+           session.targetLayerID == layer.id,
+           let live = session.currentImage,
+           let images = EffectPipeline.shared.maskImages(from: live, inverted: mask.inverted) {
+            return RenderMask(alpha: images.alpha, luminance: images.luminance)
+        }
+        var hasher = Hasher()
+        hasher.combine(mask)
+        let hash = hasher.finalize()
+        if let cached = masks[layer.id], cached.hash == hash {
+            return cached.mask
+        }
+        guard let grayscale = originalImage(key: mask.imageKey),
+              let images = EffectPipeline.shared.maskImages(from: grayscale, inverted: mask.inverted) else {
+            return nil
+        }
+        let renderMask = RenderMask(alpha: images.alpha, luminance: images.luminance)
+        masks[layer.id] = (hash, renderMask)
+        return renderMask
     }
 
     private func primitivesResult(for layer: Layer, model: ProjectModel) -> (primitives: [VectorPrimitive], naturalSize: CGSize) {
@@ -140,7 +220,16 @@ final class RenderStore {
             primitives[layer.id] = (hash, result.primitives, result.size)
             return (result.primitives, result.size)
 
-        case .image:
+        case .shape(let config):
+            let hash = hasher.finalize()
+            if let cached = primitives[layer.id], cached.hash == hash {
+                return (cached.primitives, cached.naturalSize)
+            }
+            let prims = ShapeGeometry.primitives(for: config)
+            primitives[layer.id] = (hash, prims, config.size)
+            return (prims, config.size)
+
+        case .image, .fill:
             return ([], .zero)
         }
     }
@@ -156,6 +245,25 @@ final class RenderStore {
 
     /// Crop + effect chain, at preview or native resolution.
     func resolvedImage(for layer: Layer, config: ImageConfig, model: ProjectModel, quality: RenderQuality) -> CGImage? {
+        // Live paint preview: show the in-flight buffer raw (effects re-apply
+        // when the stroke commits).
+        if let session = activePaintSession,
+           !session.isMask,
+           session.targetLayerID == layer.id,
+           let live = session.currentImage {
+            if let crop = config.crop {
+                let rect = CGRect(x: crop.minX * CGFloat(live.width),
+                                  y: crop.minY * CGFloat(live.height),
+                                  width: crop.width * CGFloat(live.width),
+                                  height: crop.height * CGFloat(live.height)).integral
+                return live.cropping(to: rect) ?? live
+            }
+            return live
+        }
+        return resolvedImageIgnoringSession(for: layer, config: config, model: model, quality: quality)
+    }
+
+    private func resolvedImageIgnoringSession(for layer: Layer, config: ImageConfig, model: ProjectModel, quality: RenderQuality) -> CGImage? {
         var hasher = Hasher()
         hasher.combine(config)
         hasher.combine(model.palette)

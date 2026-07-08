@@ -163,3 +163,137 @@ struct PaletteTests {
         #expect(hasRed && hasBlue)
     }
 }
+
+// MARK: - Image-editor expansion tests
+
+struct BackCompatTests {
+    /// A manifest saved before fill/shape/mask/canvasEffects existed must decode.
+    @Test func oldManifestStillDecodes() throws {
+        let old = """
+        {
+          "background": {"a": 1, "b": 0.1, "g": 0.12, "r": 0.13},
+          "canvasSize": [1000, 1000],
+          "layers": [
+            {
+              "id": "6F1E0F52-7E4B-4E5A-9B7B-111111111111",
+              "isVisible": true,
+              "kind": {"pattern": {"_0": {
+                "generator": "flowField",
+                "params": {"storage": {"curl": 1.2}},
+                "seed": 42
+              }}},
+              "name": "Flow Field",
+              "opacity": 1,
+              "blendMode": "normal",
+              "transform": {"position": [500, 500], "rotationDegrees": 0, "scale": 1}
+            }
+          ],
+          "palette": {"colors": [{"a": 1, "b": 0.2, "g": 0.4, "r": 0.6}], "name": "Test"}
+        }
+        """
+        let model = try JSONDecoder().decode(ProjectModel.self, from: Data(old.utf8))
+        #expect(model.layers.count == 1)
+        #expect(model.canvasEffects.isEmpty)
+        #expect(model.layers[0].mask == nil)
+        #expect(model.layers[0].patternConfig?.seed == 42)
+    }
+
+    @Test func newFieldsRoundTrip() throws {
+        var model = ProjectModel()
+        model.canvasEffects = [Effect(type: .grain)]
+        model.layers = [
+            Layer(name: "Fill", transform: LayerTransform(position: .zero),
+                  kind: .fill(FillConfig(style: .radialGradient)),
+                  mask: LayerMask(imageKey: "m.png", pixelSize: CGSize(width: 10, height: 10), inverted: true)),
+            Layer(name: "Star", transform: LayerTransform(position: .zero),
+                  kind: .shape(ShapeConfig(kind: .star, sides: 5))),
+        ]
+        let data = try JSONEncoder().encode(model)
+        let decoded = try JSONDecoder().decode(ProjectModel.self, from: data)
+        #expect(decoded == model)
+    }
+}
+
+@MainActor
+struct FillShapeSVGTests {
+    @Test func gradientFillExportsDefs() {
+        let config = FillConfig(style: .linearGradient,
+                                colors: [RGBAColor(hex: "#000000"), RGBAColor(hex: "#FFFFFF")],
+                                angle: 90)
+        let item = RenderItem(id: UUID(), opacity: 1, blendMode: .normal,
+                              transform: .identity,
+                              naturalSize: CGSize(width: 100, height: 100),
+                              content: .fill(config), mask: nil)
+        let svg = SVGExporter.svg(items: [item], background: .black,
+                                  canvasSize: CGSize(width: 100, height: 100))
+        #expect(svg.contains("<linearGradient"))
+        #expect(svg.contains("url(#grad0)"))
+    }
+
+    @Test func shapeStaysVector() {
+        let config = ShapeConfig(kind: .star, size: CGSize(width: 200, height: 200))
+        let primitives = ShapeGeometry.primitives(for: config)
+        #expect(primitives.count == 1)
+        #expect(primitives[0].fill != nil)
+        let item = RenderItem(id: UUID(), opacity: 1, blendMode: .normal,
+                              transform: .identity,
+                              naturalSize: config.size,
+                              content: .primitives(primitives), mask: nil)
+        let svg = SVGExporter.svg(items: [item], background: .black,
+                                  canvasSize: CGSize(width: 200, height: 200))
+        #expect(svg.contains("<path d=\"M"))
+        #expect(!svg.contains("<image"))
+    }
+
+    @Test func globalEffectsCommentAppears() {
+        let svg = SVGExporter.svg(items: [], background: .black,
+                                  canvasSize: CGSize(width: 10, height: 10),
+                                  skippedGlobalEffects: true)
+        #expect(svg.contains("Canvas-level effects"))
+    }
+}
+
+@MainActor
+struct RasterizeTests {
+    @Test func rasterizeReplacesVectorWithImage() {
+        let document = PixelDocument()
+        let store = RenderStore(document: document)
+        let layerID = document.model.layers[0].id
+        #expect(document.model.layers[0].kind.isPattern)
+
+        document.rasterizeLayer(id: layerID, renderStore: store, undoManager: nil)
+
+        let layer = document.model.layer(id: layerID)
+        #expect(layer?.kind.isImage == true)
+        // Baked at canvas resolution: natural size matches the canvas.
+        #expect(layer?.imageConfig?.pixelSize == document.model.canvasSize)
+        #expect(abs((layer?.transform.scale ?? 0) - 1) < 0.001)
+        // The baked PNG is retrievable.
+        let key = layer?.imageConfig?.imageKey ?? ""
+        #expect(document.imageData(for: key) != nil)
+    }
+}
+
+@MainActor
+struct PaintSessionTests {
+    @Test func strokeChangesPixels() throws {
+        let session = try #require(PaintSession(target: .content(layerID: UUID()),
+                                                base: nil,
+                                                pixelSize: CGSize(width: 64, height: 64)))
+        let before = try #require(session.currentImage?.dataProvider?.data as Data?)
+        session.stroke(to: CGPoint(x: 32, y: 32), radius: 16, hardness: 0.8,
+                       opacity: 1, color: RGBAColor(hex: "#FF0000"), erase: false)
+        let after = try #require(session.currentImage?.dataProvider?.data as Data?)
+        #expect(before != after)
+    }
+
+    @Test func maskSessionIsGrayscale() throws {
+        let session = try #require(PaintSession(target: .mask(layerID: UUID()),
+                                                base: nil,
+                                                pixelSize: CGSize(width: 32, height: 32)))
+        session.stroke(to: CGPoint(x: 16, y: 16), radius: 10, hardness: 1,
+                       opacity: 1, color: .white, erase: false)
+        let image = try #require(session.currentImage)
+        #expect(image.colorSpace?.model == .monochrome)
+    }
+}

@@ -101,6 +101,20 @@ final class EffectPipeline {
         return output
     }
 
+    /// Converts a stored grayscale mask into the two forms renderers need:
+    /// luminance (for SVG masks) and alpha (for CG/Canvas clipping).
+    func maskImages(from grayscale: CGImage, inverted: Bool) -> (luminance: CGImage, alpha: CGImage)? {
+        let extent = CGRect(x: 0, y: 0, width: grayscale.width, height: grayscale.height)
+        var image = CIImage(cgImage: grayscale)
+        if inverted {
+            image = image.applyingFilter("CIColorInvert").cropped(to: extent)
+        }
+        guard let luminance = context.createCGImage(image, from: extent) else { return nil }
+        let alphaImage = image.applyingFilter("CIMaskToAlpha")
+        guard let alpha = context.createCGImage(alphaImage, from: extent) else { return nil }
+        return (luminance, alpha)
+    }
+
     private func apply(_ effect: Effect, to image: CIImage, extent: CGRect, minDim: Double, palette: Palette) -> CIImage {
         let p = effect.params
         switch effect.type {

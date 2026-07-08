@@ -8,7 +8,10 @@ struct ImageInspector: View {
 
     var body: some View {
         cropSection
-        effectsSection
+        EffectStackSection(document: document,
+                           title: "Effects",
+                           target: .layer(layerID),
+                           effects: config.effects)
     }
 
     // MARK: - Crop
@@ -64,107 +67,4 @@ struct ImageInspector: View {
         }
     }
 
-    // MARK: - Effects stack
-
-    private var effectsSection: some View {
-        Section {
-            ForEach(Array(config.effects.enumerated()), id: \.element.id) { index, effect in
-                effectRow(effect, index: index)
-            }
-
-            Menu("Add Effect") {
-                ForEach(EffectType.allCases, id: \.self) { type in
-                    Button(type.displayName) {
-                        document.update(undoManager, actionName: "Add \(type.displayName)") { model in
-                            model.modifyLayer(id: layerID) { layer in
-                                layer.modifyImage {
-                                    $0.effects.append(Effect(type: type, params: type.defaultParams))
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } header: {
-            Text("Effects")
-        } footer: {
-            if config.effects.isEmpty {
-                Text("Effects stack non-destructively, in order.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func effectRow(_ effect: Effect, index: Int) -> some View {
-        DisclosureGroup {
-            ParamControls(document: document,
-                          specs: effect.type.specs,
-                          values: effect.params) { model, key, value in
-                model.modifyLayer(id: layerID) { layer in
-                    layer.modifyImage { imageConfig in
-                        guard let i = imageConfig.effects.firstIndex(where: { $0.id == effect.id }) else { return }
-                        imageConfig.effects[i].params.set(key, value)
-                    }
-                }
-            }
-        } label: {
-            HStack {
-                Toggle("", isOn: Binding(
-                    get: { effect.isEnabled },
-                    set: { newValue in
-                        document.update(undoManager, actionName: "Toggle Effect") { model in
-                            model.modifyLayer(id: layerID) { layer in
-                                layer.modifyImage { imageConfig in
-                                    guard let i = imageConfig.effects.firstIndex(where: { $0.id == effect.id }) else { return }
-                                    imageConfig.effects[i].isEnabled = newValue
-                                }
-                            }
-                        }
-                    }
-                ))
-                .toggleStyle(.checkbox)
-                .labelsHidden()
-
-                Text(effect.type.displayName)
-
-                Spacer()
-
-                Button {
-                    moveEffect(effect.id, by: -1)
-                } label: { Image(systemName: "chevron.up") }
-                    .buttonStyle(.borderless)
-                    .disabled(index == 0)
-
-                Button {
-                    moveEffect(effect.id, by: 1)
-                } label: { Image(systemName: "chevron.down") }
-                    .buttonStyle(.borderless)
-                    .disabled(index == config.effects.count - 1)
-
-                Button {
-                    document.update(undoManager, actionName: "Remove Effect") { model in
-                        model.modifyLayer(id: layerID) { layer in
-                            layer.modifyImage { $0.effects.removeAll { $0.id == effect.id } }
-                        }
-                    }
-                } label: { Image(systemName: "trash") }
-                    .buttonStyle(.borderless)
-            }
-        }
-    }
-
-    private func moveEffect(_ effectID: UUID, by delta: Int) {
-        document.update(undoManager, actionName: "Reorder Effects") { model in
-            model.modifyLayer(id: layerID) { layer in
-                layer.modifyImage { imageConfig in
-                    guard let i = imageConfig.effects.firstIndex(where: { $0.id == effectID }) else { return }
-                    let j = i + delta
-                    guard imageConfig.effects.indices.contains(j) else { return }
-                    imageConfig.effects.swapAt(i, j)
-                }
-            }
-        }
-    }
 }

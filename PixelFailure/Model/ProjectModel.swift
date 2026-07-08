@@ -8,15 +8,33 @@ nonisolated struct ProjectModel: Codable, Hashable, Sendable {
     /// Bottom-to-top: index 0 draws first.
     var layers: [Layer]
     var palette: Palette
+    /// Global adjustment stack applied to the whole composite (PNG/preview only).
+    var canvasEffects: [Effect]
 
     init(canvasSize: CGSize = CGSize(width: 3000, height: 3000),
          background: RGBAColor = RGBAColor(hex: "#211E1B"),
          layers: [Layer] = [],
-         palette: Palette = BuiltInPalettes.default) {
+         palette: Palette = BuiltInPalettes.default,
+         canvasEffects: [Effect] = []) {
         self.canvasSize = canvasSize
         self.background = background
         self.layers = layers
         self.palette = palette
+        self.canvasEffects = canvasEffects
+    }
+
+    // Custom decoding so documents saved before canvasEffects existed still open.
+    private enum CodingKeys: String, CodingKey {
+        case canvasSize, background, layers, palette, canvasEffects
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        canvasSize = try container.decode(CGSize.self, forKey: .canvasSize)
+        background = try container.decode(RGBAColor.self, forKey: .background)
+        layers = try container.decode([Layer].self, forKey: .layers)
+        palette = try container.decode(Palette.self, forKey: .palette)
+        canvasEffects = try container.decodeIfPresent([Effect].self, forKey: .canvasEffects) ?? []
     }
 
     var canvasCenter: CGPoint { CGPoint(x: canvasSize.width / 2, y: canvasSize.height / 2) }

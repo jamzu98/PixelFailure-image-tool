@@ -14,6 +14,9 @@ struct CanvasViewport: View {
     @State private var magnifyStartZoom: CGFloat?
     @State private var dragMode: DragMode?
     @State private var hoverLocation: CGPoint = .zero
+    @State private var paintSession: PaintSession?
+    /// Bumped per stamp so the body re-renders during a stroke.
+    @State private var paintTick = 0
     @FocusState private var isFocused: Bool
 
     private enum DragMode {
@@ -21,6 +24,7 @@ struct CanvasViewport: View {
         case move(layerID: UUID, startPosition: CGPoint)
         case scale(layerID: UUID, startScale: Double, startDistance: CGFloat)
         case rotate(layerID: UUID, startRotation: Double, startAngle: Double)
+        case paint
     }
 
     var body: some View {
@@ -28,26 +32,47 @@ struct CanvasViewport: View {
             let viewSize = geo.size
             let scale = effectiveZoom(viewSize: viewSize)
             let canvasTransform = self.canvasTransform(viewSize: viewSize, scale: scale)
+            let _ = paintTick
             let items = renderStore.renderItems(model: document.model, quality: .preview)
+            let composite = renderStore.compositePreview(model: document.model, extraHash: paintTick)
 
             ZStack {
                 Color(nsColor: .underPageBackgroundColor)
 
                 Canvas { context, _ in
                     context.concatenate(canvasTransform)
-                    CanvasRenderer.draw(items: items,
-                                        background: document.model.background,
-                                        canvasSize: document.model.canvasSize,
-                                        in: context)
+                    let canvasRect = CGRect(origin: .zero, size: document.model.canvasSize)
+                    if let composite {
+                        // Global adjustment preview: draw the flattened,
+                        // effect-processed composite instead of live vectors.
+                        var clipped = context
+                        clipped.clip(to: Path(canvasRect))
+                        clipped.draw(Image(decorative: composite, scale: 1), in: canvasRect)
+                    } else {
+                        CanvasRenderer.draw(items: items,
+                                            background: document.model.background,
+                                            canvasSize: document.model.canvasSize,
+                                            in: context)
+                    }
                 }
                 .allowsHitTesting(false)
 
-                if let layer = document.model.layer(id: editorState.selectedLayerID) {
+                if editorState.activeTool == .move,
+                   let layer = document.model.layer(id: editorState.selectedLayerID) {
                     SelectionOverlay(layer: layer,
                                      naturalSize: renderStore.naturalSize(for: layer, model: document.model),
                                      canvasTransform: canvasTransform,
                                      onScaleDrag: { phase in handleScaleDrag(phase, layer: layer, canvasTransform: canvasTransform) },
                                      onRotateDrag: { phase in handleRotateDrag(phase, layer: layer, canvasTransform: canvasTransform) })
+                }
+
+                if editorState.activeTool == .crop {
+                    CropOverlay(document: document,
+                                editorState: editorState,
+                                renderStore: renderStore,
+                                canvasTransform: canvasTransform,
+                                onApply: { applyCrop() },
+                                onCancel: { cancelCrop() })
                 }
 
                 zoomControls(scale: scale)
@@ -62,21 +87,36 @@ struct CanvasViewport: View {
                 nudgeSelection(press)
             }
             .onKeyPress(.delete) {
-                guard let id = editorState.selectedLayerID else { return .ignored }
+                guard editorState.activeTool == .move, let id = editorState.selectedLayerID else { return .ignored }
                 document.deleteLayer(id: id, undoManager: undoManager)
                 editorState.selectedLayerID = nil
                 return .handled
             }
             .onKeyPress(.escape) {
+                if editorState.activeTool == .crop {
+                    cancelCrop()
+                    return .handled
+                }
+                if editorState.editingMaskLayerID != nil {
+                    editorState.editingMaskLayerID = nil
+                    editorState.activeTool = .move
+                    return .handled
+                }
                 guard editorState.selectedLayerID != nil else { return .ignored }
                 editorState.selectedLayerID = nil
                 return .handled
             }
+            .onKeyPress(.return) {
+                guard editorState.activeTool == .crop, editorState.cropDraft != nil else { return .ignored }
+                applyCrop()
+                return .handled
+            }
+            .onKeyPress(phases: .down) { press in
+                toolShortcut(press)
+            }
             .onTapGesture(count: 1) { location in
                 isFocused = true
-                // Click selects the layer under the cursor; clicking empty
-                // space (or outside the canvas) deselects.
-                selectAt(location.applying(canvasTransform.inverted()))
+                handleTap(at: location, viewSize: viewSize, scale: scale, canvasTransform: canvasTransform)
             }
             .onContinuousHover { phase in
                 if case .active(let location) = phase { hoverLocation = location }
@@ -128,6 +168,9 @@ struct CanvasViewport: View {
                 }
                 Button("Duplicate") {
                     editorState.selectedLayerID = document.duplicateLayer(id: layer.id, undoManager: undoManager)
+                }
+                Button("Rasterize") {
+                    document.rasterizeLayer(id: layer.id, renderStore: renderStore, undoManager: undoManager)
                 }
             }
         }
@@ -187,17 +230,27 @@ struct CanvasViewport: View {
             .onChanged { value in
                 if dragMode == nil {
                     isFocused = true
-                    let canvasPoint = value.startLocation.applying(canvasTransform.inverted())
-                    if let hit = hitTest(canvasPoint) {
-                        editorState.selectedLayerID = hit.id
-                        document.beginGesture()
-                        dragMode = .move(layerID: hit.id, startPosition: hit.transform.position)
-                    } else {
+                    switch editorState.activeTool {
+                    case .brush, .eraser:
+                        dragMode = .paint
+                        startPaintSession()
+                    case .hand, .zoom, .eyedropper, .crop:
                         dragMode = .pan(startPan: pan)
+                    case .move:
+                        let canvasPoint = value.startLocation.applying(canvasTransform.inverted())
+                        if let hit = hitTest(canvasPoint) {
+                            editorState.selectedLayerID = hit.id
+                            document.beginGesture()
+                            dragMode = .move(layerID: hit.id, startPosition: hit.transform.position)
+                        } else {
+                            dragMode = .pan(startPan: pan)
+                        }
                     }
                 }
                 switch dragMode {
                 case .pan(let startPan):
+                    // The crop overlay owns dragging while a draft exists.
+                    if editorState.activeTool == .crop && editorState.cropDraft != nil { break }
                     pan = CGSize(width: startPan.width + value.translation.width,
                                  height: startPan.height + value.translation.height)
                 case .move(let layerID, let startPosition):
@@ -207,6 +260,8 @@ struct CanvasViewport: View {
                     document.updateDuringGesture { model in
                         model.modifyLayer(id: layerID) { $0.transform.position = newPosition }
                     }
+                case .paint:
+                    extendPaintStroke(to: value.location, canvasTransform: canvasTransform)
                 default:
                     break
                 }
@@ -215,9 +270,12 @@ struct CanvasViewport: View {
                 switch dragMode {
                 case .move:
                     document.endGesture(undoManager, actionName: "Move Layer")
+                case .paint:
+                    commitPaintSession()
                 case .pan, .none:
                     // A drag that never moved far acts as a click-select.
-                    if value.translation.width.magnitude < 3, value.translation.height.magnitude < 3 {
+                    if editorState.activeTool == .move,
+                       value.translation.width.magnitude < 3, value.translation.height.magnitude < 3 {
                         selectAt(value.location.applying(canvasTransform.inverted()))
                     }
                 default:
@@ -225,6 +283,237 @@ struct CanvasViewport: View {
                 }
                 dragMode = nil
             }
+    }
+
+    // MARK: - Tool dispatch
+
+    private func handleTap(at location: CGPoint, viewSize: CGSize, scale: CGFloat, canvasTransform: CGAffineTransform) {
+        let canvasPoint = location.applying(canvasTransform.inverted())
+        switch editorState.activeTool {
+        case .move:
+            selectAt(canvasPoint)
+        case .zoom:
+            let zoomOut = NSEvent.modifierFlags.contains(.option)
+            let newScale = min(max(zoomOut ? scale / 1.5 : scale * 1.5, 0.02), 12)
+            // Keep the clicked canvas point stationary under the cursor.
+            let canvas = document.model.canvasSize
+            pan = CGSize(width: (location.x - canvasPoint.x * newScale) - (viewSize.width - canvas.width * newScale) / 2,
+                         height: (location.y - canvasPoint.y * newScale) - (viewSize.height - canvas.height * newScale) / 2)
+            zoomLevel = newScale
+        case .eyedropper:
+            pickColor(at: canvasPoint)
+        case .brush, .eraser:
+            // A click without a drag is a single dab.
+            startPaintSession()
+            extendPaintStroke(to: location, canvasTransform: canvasTransform)
+            commitPaintSession()
+        case .hand, .crop:
+            break
+        }
+    }
+
+    private func toolShortcut(_ press: KeyPress) -> KeyPress.Result {
+        guard press.modifiers.isEmpty else { return .ignored }
+        for tool in EditorTool.allCases where String(tool.shortcutKey) == press.characters.lowercased() {
+            editorState.activeTool = tool
+            if tool != .crop { editorState.cropDraft = nil }
+            return .handled
+        }
+        return .ignored
+    }
+
+    // MARK: - Painting
+
+    private func startPaintSession() {
+        guard paintSession == nil else { return }
+
+        // Mask editing takes priority over content painting.
+        if let maskID = editorState.editingMaskLayerID,
+           let layer = document.model.layer(id: maskID),
+           let mask = layer.mask {
+            let base = renderStore.originalImage(key: mask.imageKey)
+            paintSession = PaintSession(target: .mask(layerID: maskID), base: base, pixelSize: mask.pixelSize)
+        } else {
+            var targetID = editorState.selectedLayerID
+            let isImage = document.model.layer(id: targetID ?? UUID())?.kind.isImage ?? false
+            if !isImage {
+                targetID = document.addPaintLayer(undoManager: undoManager)
+                editorState.selectedLayerID = targetID
+            }
+            guard let id = targetID,
+                  let layer = document.model.layer(id: id),
+                  let config = layer.imageConfig else { return }
+            let base = renderStore.originalImage(key: config.imageKey)
+            paintSession = PaintSession(target: .content(layerID: id), base: base, pixelSize: config.pixelSize)
+        }
+        renderStore.activePaintSession = paintSession
+    }
+
+    private func extendPaintStroke(to viewPoint: CGPoint, canvasTransform: CGAffineTransform) {
+        guard let session = paintSession,
+              let layer = document.model.layer(id: session.targetLayerID) else { return }
+        let naturalSize = renderStore.naturalSize(for: layer, model: document.model)
+        let affine = layer.transform.affine(naturalSize: naturalSize)
+        guard affine.isInvertible, naturalSize.width > 0 else { return }
+
+        let canvasPoint = viewPoint.applying(canvasTransform.inverted())
+        let local = canvasPoint.applying(affine.inverted())
+        let brush = editorState.brush
+        let erase = editorState.activeTool == .eraser
+        let layerScale = max(layer.transform.scale, 0.0001)
+
+        var bufferPoint: CGPoint
+        var bufferPerLocal = 1.0
+        var color = brush.color
+
+        switch session.target {
+        case .content:
+            guard let config = layer.imageConfig else { return }
+            if let crop = config.crop {
+                bufferPoint = CGPoint(x: crop.minX * config.pixelSize.width + local.x,
+                                      y: crop.minY * config.pixelSize.height + local.y)
+            } else {
+                bufferPoint = local
+            }
+        case .mask:
+            guard let mask = layer.mask else { return }
+            bufferPerLocal = Double(mask.pixelSize.width) / Double(naturalSize.width)
+            bufferPoint = CGPoint(x: local.x * bufferPerLocal, y: local.y * bufferPerLocal)
+            // Brush hides or reveals per the options bar; eraser does the opposite.
+            let reveals = erase ? !editorState.maskBrushReveals : editorState.maskBrushReveals
+            color = reveals ? .white : .black
+        }
+
+        let radius = brush.size / 2 / layerScale * bufferPerLocal
+        session.stroke(to: bufferPoint,
+                       radius: radius,
+                       hardness: brush.hardness,
+                       opacity: brush.opacity,
+                       color: color,
+                       erase: erase && !session.isMask)
+        paintTick += 1
+    }
+
+    private func commitPaintSession() {
+        guard let session = paintSession else { return }
+        session.endStroke()
+        defer {
+            paintSession = nil
+            renderStore.activePaintSession = nil
+            paintTick += 1
+        }
+        guard let image = session.currentImage,
+              let data = PNGExporter.pngData(image) else { return }
+        let key = document.storeImage(data: data, fileExtension: "png")
+        switch session.target {
+        case .content(let id):
+            document.update(undoManager, actionName: "Paint") { model in
+                model.modifyLayer(id: id) { layer in
+                    layer.modifyImage { $0.imageKey = key }
+                }
+            }
+        case .mask(let id):
+            document.update(undoManager, actionName: "Paint Mask") { model in
+                model.modifyLayer(id: id) { $0.mask?.imageKey = key }
+            }
+        }
+    }
+
+    // MARK: - Eyedropper
+
+    private func pickColor(at canvasPoint: CGPoint) {
+        let model = document.model
+        guard canvasPoint.x >= 0, canvasPoint.y >= 0,
+              canvasPoint.x <= model.canvasSize.width, canvasPoint.y <= model.canvasSize.height else { return }
+
+        let items = renderStore.renderItems(model: model, quality: .preview)
+        let maxDim = 700.0
+        let sampleScale = min(1, maxDim / Double(max(model.canvasSize.width, model.canvasSize.height)))
+        let target = CGSize(width: max(8, model.canvasSize.width * sampleScale),
+                            height: max(8, model.canvasSize.height * sampleScale))
+        guard var flat = PNGExporter.render(items: items,
+                                            background: model.background,
+                                            canvasSize: model.canvasSize,
+                                            targetPixelSize: target) else { return }
+        if !model.canvasEffects.isEmpty {
+            flat = EffectPipeline.shared.apply(effects: model.canvasEffects, to: flat, palette: model.palette)
+        }
+        guard let sampler = ImageSampler(cgImage: flat, maxDimension: Int(maxDim)) else { return }
+        let picked = sampler.color(atUnitX: canvasPoint.x / model.canvasSize.width,
+                                   y: canvasPoint.y / model.canvasSize.height).withAlpha(1)
+
+        // The brush always adopts the picked color, plus a context-aware home.
+        editorState.brush.color = picked
+        if let layer = model.layer(id: editorState.selectedLayerID), layer.kind.isText {
+            document.update(undoManager, actionName: "Pick Text Color") { model in
+                model.modifyLayer(id: layer.id) { $0.modifyText { $0.color = picked } }
+            }
+        } else if editorState.selectedLayerID == nil {
+            document.update(undoManager, actionName: "Pick Background") { model in
+                model.background = picked
+            }
+        } else {
+            document.update(undoManager, actionName: "Pick Color") { model in
+                if model.palette.colors.count >= 8 {
+                    model.palette.colors[model.palette.colors.count - 1] = picked
+                } else {
+                    model.palette.colors.append(picked)
+                }
+                model.palette.name = "Custom"
+            }
+        }
+    }
+
+    // MARK: - Crop
+
+    /// The crop target: the selected, unrotated image layer, else the canvas.
+    private var cropTargetLayer: Layer? {
+        guard let layer = document.model.layer(id: editorState.selectedLayerID),
+              layer.kind.isImage,
+              abs(layer.transform.rotationDegrees).truncatingRemainder(dividingBy: 360) < 0.01 else { return nil }
+        return layer
+    }
+
+    private func applyCrop() {
+        guard let draft = editorState.cropDraft, draft.width > 4, draft.height > 4 else { return }
+        if let layer = cropTargetLayer, let config = layer.imageConfig {
+            let naturalSize = config.croppedPixelSize
+            let layerScale = max(layer.transform.scale, 0.0001)
+            let layerRect = CGRect(x: layer.transform.position.x - naturalSize.width * layerScale / 2,
+                                   y: layer.transform.position.y - naturalSize.height * layerScale / 2,
+                                   width: naturalSize.width * layerScale,
+                                   height: naturalSize.height * layerScale)
+            let clamped = draft.intersection(layerRect)
+            guard clamped.width > 1, clamped.height > 1 else { return }
+
+            let previous = config.crop ?? CGRect(x: 0, y: 0, width: 1, height: 1)
+            // Draft in canvas → fraction of the current (cropped) content →
+            // unit rect within the original image.
+            let fx = (clamped.minX - layerRect.minX) / layerRect.width
+            let fy = (clamped.minY - layerRect.minY) / layerRect.height
+            let fw = clamped.width / layerRect.width
+            let fh = clamped.height / layerRect.height
+            let newCrop = CGRect(x: previous.minX + fx * previous.width,
+                                 y: previous.minY + fy * previous.height,
+                                 width: fw * previous.width,
+                                 height: fh * previous.height)
+            let center = CGPoint(x: clamped.midX, y: clamped.midY)
+            document.update(undoManager, actionName: "Crop Image") { model in
+                model.modifyLayer(id: layer.id) { layer in
+                    layer.modifyImage { $0.crop = newCrop }
+                    layer.transform.position = center
+                }
+            }
+        } else {
+            document.cropCanvas(rect: draft, undoManager: undoManager)
+        }
+        editorState.cropDraft = nil
+        editorState.activeTool = .move
+    }
+
+    private func cancelCrop() {
+        editorState.cropDraft = nil
+        editorState.activeTool = .move
     }
 
     private func magnifyGesture(scale: CGFloat) -> some Gesture {
