@@ -1,0 +1,54 @@
+import Foundation
+
+/// Which image effect a stack entry applies. Cases only — parameter schemas
+/// and rendering live in Effects/CoreImagePipeline.
+nonisolated enum EffectType: String, Codable, CaseIterable, Hashable, Sendable {
+    case adjust
+    case pixelate
+    case hexPixelate
+    case halftone
+    case lineScreen
+    case posterize
+    case threshold
+    case duotone
+    case grain
+    case blur
+    case bloom
+    case sliceGlitch
+    case chromaticAberration
+    case scanlines
+
+    var displayName: String {
+        switch self {
+        case .adjust: "Adjust"
+        case .pixelate: "Pixelate"
+        case .hexPixelate: "Hex Pixelate"
+        case .halftone: "Halftone"
+        case .lineScreen: "Line Screen"
+        case .posterize: "Posterize"
+        case .threshold: "Threshold"
+        case .duotone: "Palette Map"
+        case .grain: "Grain"
+        case .blur: "Blur"
+        case .bloom: "Bloom"
+        case .sliceGlitch: "Slice Glitch"
+        case .chromaticAberration: "Chromatic Aberration"
+        case .scanlines: "Scanlines"
+        }
+    }
+}
+
+/// One entry in an image layer's non-destructive effect stack.
+nonisolated struct Effect: Identifiable, Codable, Hashable, Sendable {
+    var id: UUID
+    var type: EffectType
+    var isEnabled: Bool
+    var params: ParamValues
+
+    init(id: UUID = UUID(), type: EffectType, isEnabled: Bool = true, params: ParamValues = ParamValues()) {
+        self.id = id
+        self.type = type
+        self.isEnabled = isEnabled
+        self.params = params
+    }
+}

@@ -1,0 +1,47 @@
+name: PixelFailure
+options:
+  bundleIdPrefix: com.pixelfailure
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+    SWIFT_APPROACHABLE_CONCURRENCY: "YES"
+    DEAD_CODE_STRIPPING: "YES"
+
+targets:
+  PixelFailure:
+    type: application
+    platform: macOS
+    sources:
+      - PixelFailure
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pixelfailure.app
+        INFOPLIST_FILE: PixelFailure/Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
+        CODE_SIGN_ENTITLEMENTS: PixelFailure/PixelFailure.entitlements
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_HARDENED_RUNTIME: "NO"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        COMBINE_HIDPI_IMAGES: "YES"
+    scheme:
+      testTargets:
+        - PixelFailureTests
+
+  PixelFailureTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - PixelFailureTests
+    dependencies:
+      - target: PixelFailure
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pixelfailure.tests
+        GENERATE_INFOPLIST_FILE: "YES"
