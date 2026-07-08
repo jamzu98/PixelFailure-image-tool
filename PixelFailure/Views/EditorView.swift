@@ -25,6 +25,7 @@ struct EditorView: View {
                 .frame(minWidth: 280, idealWidth: 310, maxWidth: 380)
         }
         .frame(minWidth: 1080, minHeight: 640)
+        .focusedSceneValue(\.editorState, editorState)
         .toolbar { toolbarContent }
         .sheet(isPresented: Binding(get: { editorState.showExportSheet },
                                     set: { editorState.showExportSheet = $0 })) {

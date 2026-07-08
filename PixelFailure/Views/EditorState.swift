@@ -7,3 +7,8 @@ final class EditorState {
     var showExportSheet = false
     var showImageImporter = false
 }
+
+/// Lets app-level menu commands reach the focused window's editor state.
+extension FocusedValues {
+    @Entry var editorState: EditorState?
+}

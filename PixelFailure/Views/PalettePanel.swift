@@ -7,6 +7,7 @@ struct PalettePanel: View {
     @Bindable var editorState: EditorState
     let renderStore: RenderStore
     @Environment(\.undoManager) private var undoManager
+    @State private var showPicker = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -14,22 +15,28 @@ struct PalettePanel: View {
                 Text("Palette")
                     .font(.headline)
                 Spacer()
-                Menu {
-                    ForEach(BuiltInPalettes.all, id: \.name) { palette in
-                        Button {
-                            document.update(undoManager, actionName: "Palette") { model in
-                                model.palette = palette
-                            }
-                        } label: {
-                            Text(palette.name)
-                        }
-                    }
+                Button {
+                    // One gesture per browsing session: click through palettes
+                    // with the popover open, get a single undo step at the end.
+                    document.beginGesture()
+                    showPicker = true
                 } label: {
-                    Text(document.model.palette.name)
-                        .font(.caption)
+                    HStack(spacing: 3) {
+                        Text(document.model.palette.name)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 8, weight: .semibold))
+                    }
+                    .font(.caption)
                 }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
+                .buttonStyle(.borderless)
+                .popover(isPresented: $showPicker, arrowEdge: .bottom) {
+                    PalettePickerList(document: document)
+                }
+                .onChange(of: showPicker) { _, isOpen in
+                    if !isOpen {
+                        document.endGesture(undoManager, actionName: "Palette")
+                    }
+                }
             }
 
             HStack(spacing: 6) {
@@ -91,5 +98,63 @@ struct PalettePanel: View {
         document.update(undoManager, actionName: "Extract Palette") { model in
             model.palette = palette
         }
+    }
+}
+
+/// Popover listing every built-in palette with its swatches. Clicking a row
+/// applies it immediately while the popover stays open, so flipping through
+/// palettes live-previews on the canvas.
+private struct PalettePickerList: View {
+    @ObservedObject var document: PixelDocument
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(BuiltInPalettes.all, id: \.name) { palette in
+                paletteRow(palette)
+            }
+            Divider()
+                .padding(.vertical, 2)
+            Text("Click to preview — the last one you pick stays.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.bottom, 4)
+        }
+        .padding(8)
+        .frame(width: 250)
+    }
+
+    private func paletteRow(_ palette: Palette) -> some View {
+        let isCurrent = document.model.palette.name == palette.name
+        return Button {
+            document.updateDuringGesture { model in
+                model.palette = palette
+            }
+        } label: {
+            HStack(spacing: 8) {
+                HStack(spacing: 2) {
+                    ForEach(palette.colors.indices, id: \.self) { i in
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(palette.colors[i].color)
+                            .frame(width: 15, height: 15)
+                    }
+                }
+                Text(palette.name)
+                    .font(.callout)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                if isCurrent {
+                    Image(systemName: "checkmark")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color.accentColor)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .contentShape(Rectangle())
+            .background(isCurrent ? Color.accentColor.opacity(0.18) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
     }
 }
