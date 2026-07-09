@@ -17,6 +17,7 @@ struct CanvasViewport: View {
     @State private var paintSession: PaintSession?
     /// Bumped per stamp so the body re-renders during a stroke.
     @State private var paintTick = 0
+    @State private var lastCursor: NSCursor?
     @FocusState private var isFocused: Bool
 
     private enum DragMode {
@@ -119,7 +120,18 @@ struct CanvasViewport: View {
                 handleTap(at: location, viewSize: viewSize, scale: scale, canvasTransform: canvasTransform)
             }
             .onContinuousHover { phase in
-                if case .active(let location) = phase { hoverLocation = location }
+                switch phase {
+                case .active(let location):
+                    hoverLocation = location
+                    setCursor(cursor(at: location, canvasTransform: canvasTransform, scale: scale))
+                case .ended:
+                    setCursor(.arrow)
+                }
+            }
+            .onChange(of: editorState.activeTool) { _, _ in
+                // Tool switched by shortcut while hovering: update immediately
+                // instead of waiting for the next mouse move.
+                setCursor(cursor(at: hoverLocation, canvasTransform: canvasTransform, scale: scale))
             }
             .contextMenu {
                 contextMenuContent(canvasTransform: canvasTransform)
@@ -251,6 +263,7 @@ struct CanvasViewport: View {
                 case .pan(let startPan):
                     // The crop overlay owns dragging while a draft exists.
                     if editorState.activeTool == .crop && editorState.cropDraft != nil { break }
+                    if editorState.activeTool == .hand { setCursor(.closedHand) }
                     pan = CGSize(width: startPan.width + value.translation.width,
                                  height: startPan.height + value.translation.height)
                 case .move(let layerID, let startPosition):
@@ -273,6 +286,7 @@ struct CanvasViewport: View {
                 case .paint:
                     commitPaintSession()
                 case .pan, .none:
+                    if editorState.activeTool == .hand { setCursor(.openHand) }
                     // A drag that never moved far acts as a click-select.
                     if editorState.activeTool == .move,
                        value.translation.width.magnitude < 3, value.translation.height.magnitude < 3 {
@@ -283,6 +297,74 @@ struct CanvasViewport: View {
                 }
                 dragMode = nil
             }
+    }
+
+    // MARK: - Cursor
+
+    private func setCursor(_ cursor: NSCursor) {
+        guard cursor !== lastCursor else { return }
+        cursor.set()
+        lastCursor = cursor
+    }
+
+    /// The cursor for the current tool and whatever is under the pointer:
+    /// selection handles, crop handles, or plain canvas.
+    private func cursor(at location: CGPoint, canvasTransform: CGAffineTransform, scale: CGFloat) -> NSCursor {
+        switch editorState.activeTool {
+        case .hand:
+            return dragMode != nil ? .closedHand : .openHand
+        case .zoom:
+            return NSEvent.modifierFlags.contains(.option) ? .zoomOut : .zoomIn
+        case .eyedropper:
+            return Cursors.eyedropper
+        case .brush, .eraser:
+            return Cursors.brush(diameter: editorState.brush.size * scale)
+        case .crop:
+            return cropCursor(at: location, canvasTransform: canvasTransform)
+        case .move:
+            return moveCursor(at: location, canvasTransform: canvasTransform)
+        }
+    }
+
+    private func moveCursor(at location: CGPoint, canvasTransform: CGAffineTransform) -> NSCursor {
+        guard let layer = document.model.layer(id: editorState.selectedLayerID) else { return .arrow }
+        let naturalSize = renderStore.naturalSize(for: layer, model: document.model)
+        let corners = layer.transform.corners(naturalSize: naturalSize).map { $0.applying(canvasTransform) }
+
+        for (index, corner) in corners.enumerated() where hypot(location.x - corner.x, location.y - corner.y) < 9 {
+            return Cursors.resizeCorner(index)
+        }
+
+        // Rotation handle: 24pt out from the top edge's midpoint.
+        let topMid = CGPoint(x: (corners[0].x + corners[1].x) / 2, y: (corners[0].y + corners[1].y) / 2)
+        let center = layer.transform.position.applying(canvasTransform)
+        let length = max(hypot(topMid.x - center.x, topMid.y - center.y), 0.001)
+        let handle = CGPoint(x: topMid.x + (topMid.x - center.x) / length * 24,
+                             y: topMid.y + (topMid.y - center.y) / length * 24)
+        if hypot(location.x - handle.x, location.y - handle.y) < 10 {
+            return Cursors.rotate
+        }
+
+        return .arrow
+    }
+
+    private func cropCursor(at location: CGPoint, canvasTransform: CGAffineTransform) -> NSCursor {
+        guard let draft = editorState.cropDraft else { return .crosshair }
+        let rect = draft.applying(canvasTransform)
+        let handleUnits: [CGPoint] = [
+            CGPoint(x: 0, y: 0), CGPoint(x: 0.5, y: 0), CGPoint(x: 1, y: 0), CGPoint(x: 1, y: 0.5),
+            CGPoint(x: 1, y: 1), CGPoint(x: 0.5, y: 1), CGPoint(x: 0, y: 1), CGPoint(x: 0, y: 0.5),
+        ]
+        for unit in handleUnits {
+            let point = CGPoint(x: rect.minX + rect.width * unit.x, y: rect.minY + rect.height * unit.y)
+            if hypot(location.x - point.x, location.y - point.y) < 9 {
+                return Cursors.resizeForCropHandle(unit: unit)
+            }
+        }
+        if rect.insetBy(dx: 4, dy: 4).contains(location) {
+            return .openHand
+        }
+        return .crosshair
     }
 
     // MARK: - Tool dispatch
