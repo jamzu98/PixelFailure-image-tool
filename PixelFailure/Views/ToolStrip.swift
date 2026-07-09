@@ -105,9 +105,7 @@ struct ToolOptionsBar: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             case .eyedropper:
-                Text("Click to pick a color — into text color, background, or the palette depending on selection.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                eyedropperOptions
             default:
                 EmptyView()
             }
@@ -116,6 +114,32 @@ struct ToolOptionsBar: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(.bar)
+    }
+
+    @ViewBuilder
+    private var eyedropperOptions: some View {
+        Text("Click to pick a color — into text color, background, or the targeted swatch:")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+        // Which swatch the next pick replaces; advances automatically.
+        HStack(spacing: 5) {
+            ForEach(Array(document.model.palette.colors.enumerated()), id: \.offset) { i, swatch in
+                let isTarget = i == min(editorState.eyedropperSwatchIndex,
+                                        document.model.palette.colors.count - 1)
+                Button {
+                    editorState.eyedropperSwatchIndex = i
+                } label: {
+                    Circle()
+                        .fill(swatch.color)
+                        .stroke(isTarget ? Color.accentColor : .secondary.opacity(0.4),
+                                lineWidth: isTarget ? 2.5 : 1)
+                        .frame(width: 16, height: 16)
+                }
+                .buttonStyle(.plain)
+                .help(isTarget ? "Next pick replaces this swatch" : "Target this swatch")
+            }
+        }
     }
 
     @ViewBuilder

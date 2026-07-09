@@ -453,14 +453,17 @@ struct CanvasViewport: View {
                 model.background = picked
             }
         } else {
+            // Replace the targeted swatch (never grow or shrink the palette),
+            // then advance the target so successive picks fill the palette.
+            let count = model.palette.colors.count
+            guard count > 0 else { return }
+            let index = min(editorState.eyedropperSwatchIndex, count - 1)
             document.update(undoManager, actionName: "Pick Color") { model in
-                if model.palette.colors.count >= 8 {
-                    model.palette.colors[model.palette.colors.count - 1] = picked
-                } else {
-                    model.palette.colors.append(picked)
-                }
+                guard model.palette.colors.indices.contains(index) else { return }
+                model.palette.colors[index] = picked
                 model.palette.name = "Custom"
             }
+            editorState.eyedropperSwatchIndex = (index + 1) % count
         }
     }
 

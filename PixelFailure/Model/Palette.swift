@@ -39,6 +39,22 @@ nonisolated struct Palette: Codable, Hashable, Sendable {
     var sortedByLuminance: Palette {
         Palette(name: name, colors: colors.sorted { $0.luminance < $1.luminance })
     }
+
+    /// Palettes are always exactly this many colors.
+    static let swatchCount = 5
+
+    /// Truncates or pads (by sampling the existing ramp) to exactly
+    /// `Palette.swatchCount` colors.
+    var normalized: Palette {
+        if colors.count == Self.swatchCount { return self }
+        guard !colors.isEmpty else {
+            return Palette(name: name, colors: Array(repeating: .black, count: Self.swatchCount))
+        }
+        let resampled = (0..<Self.swatchCount).map { i in
+            ramp(Double(i) / Double(Self.swatchCount - 1))
+        }
+        return Palette(name: name, colors: resampled)
+    }
 }
 
 /// Curated muted/earthy palettes — the app's aesthetic default.

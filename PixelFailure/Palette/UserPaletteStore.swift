@@ -14,7 +14,8 @@ final class UserPaletteStore {
         self.defaults = defaults
         if let data = defaults.data(forKey: Self.defaultsKey),
            let decoded = try? JSONDecoder().decode([Palette].self, from: data) {
-            palettes = decoded
+            // Normalize palettes saved before the fixed swatch count existed.
+            palettes = decoded.map(\.normalized)
         } else {
             palettes = []
         }
@@ -31,7 +32,7 @@ final class UserPaletteStore {
         if BuiltInPalettes.all.contains(where: { $0.name == cleanName }) {
             cleanName += " (Custom)"
         }
-        var saved = palette
+        var saved = palette.normalized
         saved.name = cleanName
         palettes.removeAll { $0.name == cleanName }
         palettes.append(saved)

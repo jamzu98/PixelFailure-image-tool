@@ -64,6 +64,9 @@ final class EditorState {
     var activeTool: EditorTool = .move
     var brush = BrushSettings()
 
+    /// Which palette swatch the eyedropper replaces next (wraps around).
+    var eyedropperSwatchIndex = 0
+
     /// When set, brush strokes edit this layer's mask instead of its content.
     var editingMaskLayerID: UUID?
     /// While mask editing: true = brush reveals (paints white), false = hides.

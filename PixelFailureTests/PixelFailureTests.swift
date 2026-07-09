@@ -297,3 +297,21 @@ struct PaintSessionTests {
         #expect(image.colorSpace?.model == .monochrome)
     }
 }
+
+struct PaletteNormalizationTests {
+    @Test func normalizedIsAlwaysFiveColors() {
+        let seven = Palette(name: "Seven", hex: ["#111111", "#222222", "#333333",
+                                                 "#444444", "#555555", "#666666", "#777777"])
+        #expect(seven.normalized.colors.count == Palette.swatchCount)
+
+        let two = Palette(name: "Two", hex: ["#000000", "#FFFFFF"])
+        let normalized = two.normalized
+        #expect(normalized.colors.count == Palette.swatchCount)
+        // Endpoints preserved when padding via the ramp.
+        #expect(normalized.colors.first?.luminance ?? 1 < 0.01)
+        #expect(normalized.colors.last?.luminance ?? 0 > 0.99)
+
+        let five = BuiltInPalettes.default
+        #expect(five.normalized == five)
+    }
+}

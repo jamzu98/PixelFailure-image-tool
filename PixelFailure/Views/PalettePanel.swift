@@ -155,9 +155,9 @@ struct PalettePanel: View {
     }
 
     private func apply(extractedFrom image: CGImage) {
-        guard let palette = PaletteExtractor.extract(from: image, colorCount: 5) else { return }
+        guard let palette = PaletteExtractor.extract(from: image, colorCount: Palette.swatchCount) else { return }
         document.update(undoManager, actionName: "Extract Palette") { model in
-            model.palette = palette
+            model.palette = palette.normalized
         }
     }
 }
@@ -213,7 +213,7 @@ private struct PalettePickerList: View {
         return HStack(spacing: 2) {
             Button {
                 document.updateDuringGesture { model in
-                    model.palette = palette
+                    model.palette = palette.normalized
                 }
             } label: {
                 HStack(spacing: 8) {
