@@ -47,8 +47,14 @@ struct PalettePanel: View {
 
             HStack(spacing: 6) {
                 ForEach(document.model.palette.colors.indices, id: \.self) { i in
+                    // The getter guards the index: AppKit can re-query a
+                    // swatch's binding after the palette has shrunk (e.g.
+                    // eyedropper grew it, then a palette switch removed rows).
                     ColorPicker("", selection: Binding(
-                        get: { document.model.palette.colors[i].color },
+                        get: {
+                            let colors = document.model.palette.colors
+                            return colors.indices.contains(i) ? colors[i].color : Color.clear
+                        },
                         set: { newValue in
                             document.update(undoManager, actionName: "Edit Swatch") { model in
                                 guard model.palette.colors.indices.contains(i) else { return }

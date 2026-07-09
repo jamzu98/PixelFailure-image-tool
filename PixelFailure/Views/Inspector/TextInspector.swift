@@ -60,10 +60,11 @@ struct TextInspector: View {
                 }
             ))
 
-            // Quick palette swatches for the text color.
+            // Quick palette swatches for the text color. Enumerate a snapshot
+            // (capturing values, not live indices) so a shrinking palette
+            // can't produce an out-of-range subscript in a stale row.
             HStack(spacing: 6) {
-                ForEach(document.model.palette.colors.indices, id: \.self) { i in
-                    let swatch = document.model.palette.colors[i]
+                ForEach(Array(document.model.palette.colors.enumerated()), id: \.offset) { _, swatch in
                     Button {
                         document.update(undoManager, actionName: "Text Color") { model in
                             model.modifyLayer(id: layerID) { layer in

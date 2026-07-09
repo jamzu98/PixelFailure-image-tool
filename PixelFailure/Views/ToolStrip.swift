@@ -172,10 +172,10 @@ struct ToolOptionsBar: View {
             .labelsHidden()
             .frame(width: 30)
 
-            // Quick palette swatches for the brush.
+            // Quick palette swatches for the brush. Enumerated snapshot, not
+            // live indices — see PalettePanel for the crash this avoids.
             HStack(spacing: 4) {
-                ForEach(document.model.palette.colors.indices, id: \.self) { i in
-                    let swatch = document.model.palette.colors[i]
+                ForEach(Array(document.model.palette.colors.enumerated()), id: \.offset) { _, swatch in
                     Button {
                         brush.color = swatch
                     } label: {
