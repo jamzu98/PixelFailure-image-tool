@@ -106,14 +106,24 @@ struct ToolOptionsBar: View {
                     .foregroundStyle(.secondary)
             case .eyedropper:
                 eyedropperOptions
-            default:
-                EmptyView()
+            case .move:
+                Text("Click to select · drag to move · handles scale and rotate · Esc deselects.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .hand:
+                Text("Drag to pan the canvas.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        // Fixed height: the bar's contents change per tool, but the bar
+        // itself never grows, shrinks, or disappears — no layout jumps.
+        .frame(height: 34)
+        .frame(maxWidth: .infinity)
         .background(.bar)
+        .clipped()
     }
 
     @ViewBuilder

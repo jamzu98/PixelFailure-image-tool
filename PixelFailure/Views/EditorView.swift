@@ -18,10 +18,10 @@ struct EditorView: View {
                 .frame(minWidth: 200, idealWidth: 230, maxWidth: 320)
 
             VStack(spacing: 0) {
-                if showsOptionsBar {
-                    ToolOptionsBar(document: document, editorState: editorState)
-                    Divider()
-                }
+                // Always present at a fixed height so switching tools never
+                // shifts the canvas or tool strip.
+                ToolOptionsBar(document: document, editorState: editorState)
+                Divider()
                 HStack(spacing: 0) {
                     ToolStrip(document: document, editorState: editorState)
                     Divider()
@@ -51,13 +51,6 @@ struct EditorView: View {
         }
         .onDrop(of: [.fileURL, .image], isTargeted: nil) { providers in
             handleDrop(providers)
-        }
-    }
-
-    private var showsOptionsBar: Bool {
-        switch editorState.activeTool {
-        case .brush, .eraser, .crop, .zoom, .eyedropper: true
-        case .move, .hand: false
         }
     }
 
