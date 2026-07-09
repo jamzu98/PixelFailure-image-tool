@@ -17,7 +17,6 @@ struct CanvasViewport: View {
     @State private var paintSession: PaintSession?
     /// Bumped per stamp so the body re-renders during a stroke.
     @State private var paintTick = 0
-    @State private var lastCursor: NSCursor?
     @FocusState private var isFocused: Bool
 
     private enum DragMode {
@@ -301,10 +300,11 @@ struct CanvasViewport: View {
 
     // MARK: - Cursor
 
+    /// Always re-asserts the cursor: AppKit resets it behind our back when
+    /// the pointer crosses buttons or other tracking areas, so caching "what
+    /// we set last" leads to stale arrows. set() is cheap and idempotent.
     private func setCursor(_ cursor: NSCursor) {
-        guard cursor !== lastCursor else { return }
         cursor.set()
-        lastCursor = cursor
     }
 
     /// The cursor for the current tool and whatever is under the pointer:
