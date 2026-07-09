@@ -86,7 +86,8 @@ extension PixelDocument {
         let naturalSize = renderStore.naturalSize(for: layer, model: model)
         guard let transform = SelectionRasterizer.canvasToContentBuffer(layer: layer,
                                                                         naturalSize: naturalSize,
-                                                                        config: config),
+                                                                        config: config,
+                                                                        parentAffine: model.parentAffine(of: layerID)),
               let mask = SelectionRasterizer.colorMask(selection: selection,
                                                        transform: transform,
                                                        pixelSize: config.pixelSize,
@@ -126,7 +127,8 @@ extension PixelDocument {
         let bufferSize = CGSize(width: resolved.width, height: resolved.height)
         guard let transform = SelectionRasterizer.canvasToLocalBuffer(layer: layer,
                                                                       naturalSize: naturalSize,
-                                                                      bufferPixelSize: bufferSize),
+                                                                      bufferPixelSize: bufferSize,
+                                                                      parentAffine: model.parentAffine(of: layerID)),
               let mask = SelectionRasterizer.colorMask(selection: selection,
                                                        transform: transform,
                                                        pixelSize: bufferSize) else { return nil }
@@ -146,6 +148,7 @@ extension PixelDocument {
         // Crop to the selection's bounds in local buffer space (y-down local
         // → y-up buffer: cropping() addresses top-down, so re-flip the rect).
         let affine = layer.transform.affine(naturalSize: naturalSize)
+            .concatenating(model.parentAffine(of: layerID))
         guard affine.isInvertible else { return nil }
         let localBounds = selection.bounds.applying(affine.inverted())
         let scale = bufferSize.width / naturalSize.width
@@ -193,7 +196,8 @@ extension PixelDocument {
                                height: max(8, (naturalSize.height * scale).rounded()))
         guard let transform = SelectionRasterizer.canvasToLocalBuffer(layer: layer,
                                                                       naturalSize: naturalSize,
-                                                                      bufferPixelSize: pixelSize),
+                                                                      bufferPixelSize: pixelSize,
+                                                                      parentAffine: model.parentAffine(of: layerID)),
               let mask = SelectionRasterizer.grayMask(selection: selection,
                                                       transform: transform,
                                                       pixelSize: pixelSize),

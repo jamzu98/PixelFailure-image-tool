@@ -8,60 +8,47 @@ struct LayerListView: View {
     let renderStore: RenderStore
     @Environment(\.undoManager) private var undoManager
 
+    /// One sidebar row: a layer plus its nesting depth.
+    private struct RowEntry: Identifiable {
+        let layer: Layer
+        let depth: Int
+        var id: UUID { layer.id }
+    }
+
+    /// Tree flattened for display: top-of-stack first at every level, group
+    /// children shown when the group is expanded.
+    private var displayedRows: [RowEntry] {
+        func walk(_ layers: [Layer], depth: Int) -> [RowEntry] {
+            layers.reversed().flatMap { layer -> [RowEntry] in
+                var rows = [RowEntry(layer: layer, depth: depth)]
+                if let group = layer.groupConfig, editorState.expandedGroups.contains(layer.id) {
+                    rows += walk(group.children, depth: depth + 1)
+                }
+                return rows
+            }
+        }
+        return walk(document.model.layers, depth: 0)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            List(selection: selectionBinding) {
-                ForEach(displayedLayers) { layer in
-                    LayerRow(document: document, layer: layer, renderStore: renderStore)
-                        .tag(layer.id)
+            List(selection: multiSelectionBinding) {
+                ForEach(displayedRows) { entry in
+                    LayerRow(document: document,
+                             layer: entry.layer,
+                             depth: entry.depth,
+                             isExpanded: editorState.expandedGroups.contains(entry.layer.id),
+                             renderStore: renderStore,
+                             onToggleExpand: {
+                                 if editorState.expandedGroups.contains(entry.layer.id) {
+                                     editorState.expandedGroups.remove(entry.layer.id)
+                                 } else {
+                                     editorState.expandedGroups.insert(entry.layer.id)
+                                 }
+                             })
+                        .tag(entry.layer.id)
                         .contextMenu {
-                            Button("Copy") {
-                                document.copyLayer(id: layer.id, renderStore: renderStore)
-                            }
-                            Button("Cut") {
-                                document.cutLayer(id: layer.id, renderStore: renderStore, undoManager: undoManager)
-                                if editorState.selectedLayerID == layer.id {
-                                    editorState.selectedLayerID = nil
-                                }
-                            }
-                            Button("Paste") {
-                                switch LayerPasteboard.readAny() {
-                                case .layer(let transfer):
-                                    editorState.selectedLayerID = document.pasteLayer(transfer, undoManager: undoManager)
-                                case .image(let data, _):
-                                    if let id = document.addImageLayer(data: data, suggestedName: "Pasted Image",
-                                                                       undoManager: undoManager) {
-                                        editorState.selectedLayerID = id
-                                    }
-                                case nil:
-                                    break
-                                }
-                            }
-                            .disabled(!LayerPasteboard.hasPayload)
-                            Divider()
-                            Button("Duplicate") {
-                                if let newID = document.duplicateLayer(id: layer.id, undoManager: undoManager) {
-                                    editorState.selectedLayerID = newID
-                                }
-                            }
-                            Button("Rasterize") {
-                                document.rasterizeLayer(id: layer.id, renderStore: renderStore, undoManager: undoManager)
-                            }
-                            Button("Flip Horizontal") {
-                                document.flipLayer(id: layer.id, horizontally: true, undoManager: undoManager)
-                            }
-                            Button("Flip Vertical") {
-                                document.flipLayer(id: layer.id, horizontally: false, undoManager: undoManager)
-                            }
-                            Button(layer.isLocked ? "Unlock" : "Lock") {
-                                document.toggleLock(id: layer.id, undoManager: undoManager)
-                            }
-                            Button("Delete", role: .destructive) {
-                                document.deleteLayer(id: layer.id, undoManager: undoManager)
-                                if editorState.selectedLayerID == layer.id {
-                                    editorState.selectedLayerID = nil
-                                }
-                            }
+                            rowContextMenu(entry.layer)
                         }
                 }
                 .onMove { source, destination in
@@ -126,20 +113,90 @@ struct LayerListView: View {
         }
     }
 
-    /// Model stores bottom-to-top; the list shows top layer first.
-    private var displayedLayers: [Layer] {
-        document.model.layers.reversed()
+    private var multiSelectionBinding: Binding<Set<UUID>> {
+        Binding(get: { editorState.selectedLayerIDs },
+                set: { editorState.selectedLayerIDs = $0 })
     }
 
-    private var selectionBinding: Binding<UUID?> {
-        Binding(get: { editorState.selectedLayerID },
-                set: { editorState.selectedLayerID = $0 })
+    @ViewBuilder
+    private func rowContextMenu(_ layer: Layer) -> some View {
+        Button("Copy") {
+            document.copyLayer(id: layer.id, renderStore: renderStore)
+        }
+        Button("Cut") {
+            document.cutLayer(id: layer.id, renderStore: renderStore, undoManager: undoManager)
+            editorState.selectedLayerIDs.remove(layer.id)
+        }
+        Button("Paste") {
+            switch LayerPasteboard.readAny() {
+            case .layer(let transfer):
+                editorState.selectedLayerID = document.pasteLayer(transfer, undoManager: undoManager)
+            case .image(let data, _):
+                if let id = document.addImageLayer(data: data, suggestedName: "Pasted Image",
+                                                   undoManager: undoManager) {
+                    editorState.selectedLayerID = id
+                }
+            case nil:
+                break
+            }
+        }
+        .disabled(!LayerPasteboard.hasPayload)
+        Divider()
+        if editorState.selectedLayerIDs.count > 1 {
+            Button("Group \(editorState.selectedLayerIDs.count) Layers") {
+                if let id = document.groupLayers(ids: editorState.selectedLayerIDs, undoManager: undoManager) {
+                    editorState.selectedLayerID = id
+                }
+            }
+        }
+        if layer.kind.isGroup {
+            Button("Ungroup") {
+                document.ungroup(id: layer.id, undoManager: undoManager)
+                editorState.selectedLayerIDs.remove(layer.id)
+            }
+        }
+        Button("Duplicate") {
+            if let newID = document.duplicateLayer(id: layer.id, undoManager: undoManager) {
+                editorState.selectedLayerID = newID
+            }
+        }
+        Button("Rasterize") {
+            document.rasterizeLayer(id: layer.id, renderStore: renderStore, undoManager: undoManager)
+        }
+        Button("Flip Horizontal") {
+            document.flipLayer(id: layer.id, horizontally: true, undoManager: undoManager)
+        }
+        Button("Flip Vertical") {
+            document.flipLayer(id: layer.id, horizontally: false, undoManager: undoManager)
+        }
+        Button(layer.isLocked ? "Unlock" : "Lock") {
+            document.toggleLock(id: layer.id, undoManager: undoManager)
+        }
+        Button("Delete", role: .destructive) {
+            document.deleteLayer(id: layer.id, undoManager: undoManager)
+            editorState.selectedLayerIDs.remove(layer.id)
+        }
     }
 
+    /// Drag reorder: top-level rows only (nested layers reorder via the
+    /// Arrange context menu, which is container-aware).
     private func moveDisplayed(from source: IndexSet, to destination: Int) {
-        var displayed = displayedLayers
-        displayed.move(fromOffsets: source, toOffset: destination)
-        let reordered = Array(displayed.reversed())
+        let rows = displayedRows
+        guard let sourceIndex = source.first,
+              rows.indices.contains(sourceIndex),
+              rows[sourceIndex].depth == 0 else { return }
+        // Only allow drops at top-level boundaries.
+        let boundaryOK = destination == rows.count
+            || (rows.indices.contains(destination) && rows[destination].depth == 0)
+        guard boundaryOK else { return }
+
+        var topLevel = Array(document.model.layers.reversed())
+        guard let fromIndex = topLevel.firstIndex(where: { $0.id == rows[sourceIndex].layer.id }) else { return }
+        // Map the flat destination to a top-level index.
+        let before = rows[..<destination].filter { $0.depth == 0 }.count
+        var moved = topLevel
+        moved.move(fromOffsets: IndexSet(integer: fromIndex), toOffset: min(before, topLevel.count))
+        let reordered = Array(moved.reversed())
         document.update(undoManager, actionName: "Reorder Layers") { model in
             model.layers = reordered
         }
@@ -149,12 +206,30 @@ struct LayerListView: View {
 private struct LayerRow: View {
     @ObservedObject var document: PixelDocument
     let layer: Layer
+    var depth: Int = 0
+    var isExpanded: Bool = false
     let renderStore: RenderStore
+    var onToggleExpand: () -> Void = {}
     @Environment(\.undoManager) private var undoManager
     @State private var draftName: String = ""
 
     var body: some View {
         HStack(spacing: 6) {
+            if depth > 0 {
+                Spacer()
+                    .frame(width: CGFloat(depth) * 14)
+            }
+
+            if layer.kind.isGroup {
+                Button(action: onToggleExpand) {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 10)
+                }
+                .buttonStyle(.borderless)
+            }
+
             Button {
                 document.update(undoManager, actionName: layer.isVisible ? "Hide Layer" : "Show Layer") { model in
                     model.modifyLayer(id: layer.id) { $0.isVisible.toggle() }

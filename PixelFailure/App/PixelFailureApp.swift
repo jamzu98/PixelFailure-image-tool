@@ -178,6 +178,54 @@ struct LayerCommands: Commands {
 
             Divider()
 
+            Button("Group Layers") {
+                guard let focus, !focus.editorState.selectedLayerIDs.isEmpty else { return }
+                if let id = focus.document.groupLayers(ids: focus.editorState.selectedLayerIDs,
+                                                       undoManager: focus.undoManager) {
+                    focus.editorState.selectedLayerID = id
+                }
+            }
+            .keyboardShortcut("g", modifiers: .command)
+            .disabled(focus?.editorState.selectedLayerIDs.isEmpty ?? true)
+
+            Button("Ungroup") {
+                guard let focus, let id = focus.editorState.selectedLayerID else { return }
+                focus.document.ungroup(id: id, undoManager: focus.undoManager)
+                focus.editorState.selectedLayerIDs = []
+            }
+            .keyboardShortcut("g", modifiers: [.command, .shift])
+            .disabled(focus?.editorState.selectedLayerID.flatMap {
+                focus?.document.model.layer(id: $0)?.kind.isGroup
+            } != true)
+
+            Menu("Align") {
+                ForEach(PixelDocument.AlignEdge.allCases, id: \.self) { edge in
+                    Button(edge.displayName) {
+                        guard let focus else { return }
+                        focus.document.alignLayers(ids: focus.editorState.selectedLayerIDs, edge: edge,
+                                                   renderStore: focus.renderStore,
+                                                   undoManager: focus.undoManager)
+                    }
+                }
+            }
+            .disabled(focus?.editorState.selectedLayerIDs.isEmpty ?? true)
+
+            Menu("Distribute") {
+                Button("Horizontally") {
+                    guard let focus else { return }
+                    focus.document.distributeLayers(ids: focus.editorState.selectedLayerIDs, horizontally: true,
+                                                    renderStore: focus.renderStore, undoManager: focus.undoManager)
+                }
+                Button("Vertically") {
+                    guard let focus else { return }
+                    focus.document.distributeLayers(ids: focus.editorState.selectedLayerIDs, horizontally: false,
+                                                    renderStore: focus.renderStore, undoManager: focus.undoManager)
+                }
+            }
+            .disabled((focus?.editorState.selectedLayerIDs.count ?? 0) < 3)
+
+            Divider()
+
             Button("Duplicate Layer") {
                 guard let focus, let id = focus.editorState.selectedLayerID else { return }
                 focus.editorState.selectedLayerID = focus.document.duplicateLayer(id: id, undoManager: focus.undoManager)

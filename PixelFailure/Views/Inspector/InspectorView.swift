@@ -13,7 +13,9 @@ struct InspectorView: View {
     var body: some View {
         VStack(spacing: 0) {
             Form {
-                if let layer = document.model.layer(id: editorState.selectedLayerID) {
+                if editorState.selectedLayerIDs.count > 1 {
+                    multiSelectionSection
+                } else if let layer = document.model.layer(id: editorState.selectedLayerID) {
                     commonSection(layer)
                     maskSection(layer)
                     switch layer.kind {
@@ -27,6 +29,14 @@ struct InspectorView: View {
                         FillInspector(document: document, layerID: layer.id, config: config)
                     case .shape(let config):
                         ShapeInspector(document: document, layerID: layer.id, config: config)
+                    case .group(let config):
+                        Section("Group") {
+                            Text("\(config.children.count) layer\(config.children.count == 1 ? "" : "s") inside")
+                                .foregroundStyle(.secondary)
+                            Text("Opacity, blend mode, transform, and mask apply to the whole group. Ungroup with ⇧⌘G.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 } else {
                     canvasSection
@@ -75,6 +85,58 @@ struct InspectorView: View {
                 Label("Layer is locked — transform and painting are disabled.", systemImage: "lock.fill")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            // Numeric transform: position and on-canvas size (size edits scale).
+            LabeledContent("Position") {
+                HStack(spacing: 4) {
+                    numericField("X", value: Binding(
+                        get: { Double(document.model.layer(id: layer.id)?.transform.position.x ?? 0) },
+                        set: { newValue in
+                            document.update(undoManager, actionName: "Position") { model in
+                                model.modifyLayer(id: layer.id) { $0.transform.position.x = newValue }
+                            }
+                        }))
+                    numericField("Y", value: Binding(
+                        get: { Double(document.model.layer(id: layer.id)?.transform.position.y ?? 0) },
+                        set: { newValue in
+                            document.update(undoManager, actionName: "Position") { model in
+                                model.modifyLayer(id: layer.id) { $0.transform.position.y = newValue }
+                            }
+                        }))
+                }
+            }
+
+            LabeledContent("Size") {
+                let naturalSize = renderStore.naturalSize(for: layer, model: document.model)
+                HStack(spacing: 4) {
+                    numericField("W", value: Binding(
+                        get: {
+                            let current = document.model.layer(id: layer.id) ?? layer
+                            return Double(naturalSize.width) * current.transform.scale
+                        },
+                        set: { newValue in
+                            guard naturalSize.width > 0, newValue > 1 else { return }
+                            document.update(undoManager, actionName: "Resize") { model in
+                                model.modifyLayer(id: layer.id) {
+                                    $0.transform.scale = newValue / Double(naturalSize.width)
+                                }
+                            }
+                        }))
+                    numericField("H", value: Binding(
+                        get: {
+                            let current = document.model.layer(id: layer.id) ?? layer
+                            return Double(naturalSize.height) * current.transform.scale
+                        },
+                        set: { newValue in
+                            guard naturalSize.height > 0, newValue > 1 else { return }
+                            document.update(undoManager, actionName: "Resize") { model in
+                                model.modifyLayer(id: layer.id) {
+                                    $0.transform.scale = newValue / Double(naturalSize.height)
+                                }
+                            }
+                        }))
+                }
             }
 
             LabeledContent("Scale") {
@@ -127,6 +189,70 @@ struct InspectorView: View {
             }
         }
         .disabled(layer.isLocked)
+    }
+
+    // MARK: - Multiple selection
+
+    @ViewBuilder
+    private var multiSelectionSection: some View {
+        Section("\(editorState.selectedLayerIDs.count) Layers Selected") {
+            Button("Group Layers  ⌘G") {
+                if let id = document.groupLayers(ids: editorState.selectedLayerIDs, undoManager: undoManager) {
+                    editorState.selectedLayerID = id
+                }
+            }
+        }
+
+        Section("Align") {
+            HStack {
+                ForEach([PixelDocument.AlignEdge.left, .centerH, .right], id: \.self) { edge in
+                    alignButton(edge)
+                }
+            }
+            HStack {
+                ForEach([PixelDocument.AlignEdge.top, .centerV, .bottom], id: \.self) { edge in
+                    alignButton(edge)
+                }
+            }
+        }
+
+        Section("Distribute") {
+            HStack {
+                Button("Horizontally") {
+                    document.distributeLayers(ids: editorState.selectedLayerIDs, horizontally: true,
+                                              renderStore: renderStore, undoManager: undoManager)
+                }
+                Button("Vertically") {
+                    document.distributeLayers(ids: editorState.selectedLayerIDs, horizontally: false,
+                                              renderStore: renderStore, undoManager: undoManager)
+                }
+            }
+            .disabled(editorState.selectedLayerIDs.count < 3)
+            if editorState.selectedLayerIDs.count < 3 {
+                Text("Select three or more layers to distribute.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func numericField(_ label: String, value: Binding<Double>) -> some View {
+        HStack(spacing: 2) {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            TextField(label, value: value, format: .number.precision(.fractionLength(0...1)))
+                .textFieldStyle(.roundedBorder)
+                .multilineTextAlignment(.trailing)
+                .frame(width: 62)
+        }
+    }
+
+    private func alignButton(_ edge: PixelDocument.AlignEdge) -> some View {
+        Button(edge.displayName) {
+            document.alignLayers(ids: editorState.selectedLayerIDs, edge: edge,
+                                 renderStore: renderStore, undoManager: undoManager)
+        }
     }
 
     // MARK: - Mask

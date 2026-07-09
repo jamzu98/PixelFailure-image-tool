@@ -1,7 +1,7 @@
 import Foundation
 
 /// Typed access to a layer's kind-specific config, used by inspectors and renderers.
-extension Layer {
+nonisolated extension Layer {
     var patternConfig: PatternConfig? {
         if case .pattern(let config) = kind { config } else { nil }
     }
@@ -50,5 +50,56 @@ extension Layer {
         guard case .shape(var config) = kind else { return }
         change(&config)
         kind = .shape(config)
+    }
+
+    var groupConfig: GroupConfig? {
+        if case .group(let config) = kind { config } else { nil }
+    }
+
+    mutating func modifyGroup(_ change: (inout GroupConfig) -> Void) {
+        guard case .group(var config) = kind else { return }
+        change(&config)
+        kind = .group(config)
+    }
+
+    /// This layer with every id in its subtree regenerated — required when
+    /// duplicating or pasting so ids stay unique.
+    func withFreshIDs() -> Layer {
+        var copy = self
+        copy.id = UUID()
+        if case .group(var group) = copy.kind {
+            group.children = group.children.map { $0.withFreshIDs() }
+            copy.kind = .group(group)
+        }
+        return copy
+    }
+
+    /// All image-store keys referenced in this layer's subtree (content
+    /// images and masks).
+    var referencedImageKeys: [String] {
+        var keys: [String] = []
+        if let config = imageConfig { keys.append(config.imageKey) }
+        if let mask { keys.append(mask.imageKey) }
+        if case .group(let group) = kind {
+            keys += group.children.flatMap(\.referencedImageKeys)
+        }
+        return keys
+    }
+
+    /// Rewrites image-store keys throughout the subtree (used on paste).
+    mutating func remapImageKeys(_ map: [String: String]) {
+        if var config = imageConfig, let newKey = map[config.imageKey] {
+            config.imageKey = newKey
+            kind = .image(config)
+        }
+        if let mask, let newKey = map[mask.imageKey] {
+            self.mask?.imageKey = newKey
+        }
+        if case .group(var group) = kind {
+            for i in group.children.indices {
+                group.children[i].remapImageKeys(map)
+            }
+            kind = .group(group)
+        }
     }
 }

@@ -6,23 +6,43 @@ extension UTType {
     nonisolated static var pixelFailureLayer: UTType { UTType(exportedAs: "com.pixelfailure.layer") }
 }
 
-/// A layer on the pasteboard: the layer itself, the source image bytes for
-/// image layers (so pasting across documents works), and a flattened PNG so
-/// other apps (Preview, Finder, browsers) can paste the pixels.
+/// A layer (possibly a whole group subtree) on the pasteboard: the layer
+/// model, every image it references keyed by store key (so pasting across
+/// documents works), and a flattened PNG so other apps can paste the pixels.
 nonisolated struct LayerTransfer: Codable, Sendable, Transferable {
     var layer: Layer
-    var imageData: Data?
+    /// Image-store bytes for every key referenced in the subtree.
+    var images: [String: Data]?
     /// Not persisted in the JSON representation — only offered to other apps.
     var flattenedPNG: Data?
 
-    init(layer: Layer, imageData: Data? = nil, flattenedPNG: Data? = nil) {
+    init(layer: Layer, images: [String: Data]? = nil, flattenedPNG: Data? = nil) {
         self.layer = layer
-        self.imageData = imageData
+        self.images = images
         self.flattenedPNG = flattenedPNG
     }
 
     private enum CodingKeys: String, CodingKey {
-        case layer, imageData
+        case layer, images, imageData
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        layer = try container.decode(Layer.self, forKey: .layer)
+        images = try container.decodeIfPresent([String: Data].self, forKey: .images)
+        // Payloads from before groups carried a single image's bytes.
+        if images == nil,
+           let legacy = try container.decodeIfPresent(Data.self, forKey: .imageData),
+           let key = layer.imageConfig?.imageKey {
+            images = [key: legacy]
+        }
+        flattenedPNG = nil
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(layer, forKey: .layer)
+        try container.encodeIfPresent(images, forKey: .images)
     }
 
     static var transferRepresentation: some TransferRepresentation {

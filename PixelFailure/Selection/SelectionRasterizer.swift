@@ -86,8 +86,10 @@ enum SelectionRasterizer {
 
     /// The canvas→buffer transform for a layer's content pixels (matches the
     /// coordinate mapping painting uses), including the buffer's y-flip.
-    static func canvasToContentBuffer(layer: Layer, naturalSize: CGSize, config: ImageConfig) -> CGAffineTransform? {
-        let affine = layer.transform.affine(naturalSize: naturalSize)
+    /// `parentAffine` accounts for enclosing groups.
+    static func canvasToContentBuffer(layer: Layer, naturalSize: CGSize, config: ImageConfig,
+                                      parentAffine: CGAffineTransform = .identity) -> CGAffineTransform? {
+        let affine = layer.transform.affine(naturalSize: naturalSize).concatenating(parentAffine)
         guard affine.isInvertible else { return nil }
         var t = affine.inverted()
         if let crop = config.crop {
@@ -101,8 +103,9 @@ enum SelectionRasterizer {
 
     /// Canvas→buffer transform for an arbitrary local-space bitmap (masks,
     /// resolved layer images) of `bufferPixelSize` covering `naturalSize`.
-    static func canvasToLocalBuffer(layer: Layer, naturalSize: CGSize, bufferPixelSize: CGSize) -> CGAffineTransform? {
-        let affine = layer.transform.affine(naturalSize: naturalSize)
+    static func canvasToLocalBuffer(layer: Layer, naturalSize: CGSize, bufferPixelSize: CGSize,
+                                    parentAffine: CGAffineTransform = .identity) -> CGAffineTransform? {
+        let affine = layer.transform.affine(naturalSize: naturalSize).concatenating(parentAffine)
         guard affine.isInvertible, naturalSize.width > 0 else { return nil }
         let scale = bufferPixelSize.width / naturalSize.width
         return affine.inverted()

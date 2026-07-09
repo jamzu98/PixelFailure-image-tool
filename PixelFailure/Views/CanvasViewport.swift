@@ -23,13 +23,24 @@ struct CanvasViewport: View {
     @FocusState private var isFocused: Bool
 
     private enum DragMode {
+        /// Moves every entry: start position plus the inverse linear part of
+        /// each layer's parent transform (canvas delta → parent-local delta).
+        case move(entries: [(id: UUID, start: CGPoint, parentInverse: CGAffineTransform)])
         case pan(startPan: CGSize)
-        case move(layerID: UUID, startPosition: CGPoint)
         case scale(layerID: UUID, startScale: Double, startDistance: CGFloat)
         case rotate(layerID: UUID, startRotation: Double, startAngle: Double)
         case paint
         case marquee(startCanvasPoint: CGPoint)
         case lassoFreehand(points: [CGPoint])
+    }
+
+    private func moveEntries(for ids: Set<UUID>) -> [(id: UUID, start: CGPoint, parentInverse: CGAffineTransform)] {
+        ids.compactMap { id in
+            guard let layer = document.model.layer(id: id), !layer.isLocked else { return nil }
+            let parent = document.model.parentAffine(of: id)
+            let inverse = parent.isInvertible ? parent.inverted() : .identity
+            return (id, layer.transform.position, inverse)
+        }
     }
 
     var body: some View {
@@ -64,11 +75,13 @@ struct CanvasViewport: View {
 
                 if editorState.activeTool == .move,
                    let layer = document.model.layer(id: editorState.selectedLayerID) {
+                    let parentAffine = document.model.parentAffine(of: layer.id)
                     SelectionOverlay(layer: layer,
                                      naturalSize: renderStore.naturalSize(for: layer, model: document.model),
+                                     parentAffine: parentAffine,
                                      canvasTransform: canvasTransform,
-                                     onScaleDrag: { phase in handleScaleDrag(phase, layer: layer, canvasTransform: canvasTransform) },
-                                     onRotateDrag: { phase in handleRotateDrag(phase, layer: layer, canvasTransform: canvasTransform) })
+                                     onScaleDrag: { phase in handleScaleDrag(phase, layer: layer, parentAffine: parentAffine, canvasTransform: canvasTransform) },
+                                     onRotateDrag: { phase in handleRotateDrag(phase, layer: layer, parentAffine: parentAffine, canvasTransform: canvasTransform) })
                         .allowsHitTesting(!layer.isLocked)
                         .opacity(layer.isLocked ? 0.4 : 1)
                 }
@@ -108,9 +121,9 @@ struct CanvasViewport: View {
                                           renderStore: renderStore, undoManager: undoManager)
                     return .handled
                 }
-                guard editorState.activeTool == .move, let id = editorState.selectedLayerID else { return .ignored }
-                document.deleteLayer(id: id, undoManager: undoManager)
-                editorState.selectedLayerID = nil
+                guard editorState.activeTool == .move, !editorState.selectedLayerIDs.isEmpty else { return .ignored }
+                document.deleteLayers(ids: editorState.selectedLayerIDs, undoManager: undoManager)
+                editorState.selectedLayerIDs = []
                 return .handled
             }
             .onKeyPress(.escape) {
@@ -131,8 +144,8 @@ struct CanvasViewport: View {
                     editorState.selection = nil
                     return .handled
                 }
-                guard editorState.selectedLayerID != nil else { return .ignored }
-                editorState.selectedLayerID = nil
+                guard !editorState.selectedLayerIDs.isEmpty else { return .ignored }
+                editorState.selectedLayerIDs = []
                 return .handled
             }
             .onKeyPress(.return) {
@@ -363,9 +376,13 @@ struct CanvasViewport: View {
                     case .move:
                         let canvasPoint = value.startLocation.applying(canvasTransform.inverted())
                         if let hit = hitTest(canvasPoint) {
-                            editorState.selectedLayerID = hit.id
+                            // Dragging a layer that's part of the current
+                            // multi-selection moves the whole selection.
+                            if !editorState.selectedLayerIDs.contains(hit.id) {
+                                editorState.selectedLayerID = hit.id
+                            }
                             document.beginGesture()
-                            dragMode = .move(layerID: hit.id, startPosition: hit.transform.position)
+                            dragMode = .move(entries: moveEntries(for: editorState.selectedLayerIDs))
                         } else {
                             dragMode = .pan(startPan: pan)
                         }
@@ -378,12 +395,23 @@ struct CanvasViewport: View {
                     if editorState.activeTool == .hand { setCursor(.closedHand) }
                     pan = CGSize(width: startPan.width + value.translation.width,
                                  height: startPan.height + value.translation.height)
-                case .move(let layerID, let startPosition):
-                    var newPosition = CGPoint(x: startPosition.x + value.translation.width / scale,
-                                              y: startPosition.y + value.translation.height / scale)
-                    newPosition = snapped(newPosition, tolerance: 8 / scale)
+                case .move(let entries):
+                    let canvasDelta = CGVector(dx: value.translation.width / scale,
+                                               dy: value.translation.height / scale)
                     document.updateDuringGesture { model in
-                        model.modifyLayer(id: layerID) { $0.transform.position = newPosition }
+                        for entry in entries {
+                            // Map the canvas-space delta into the layer's
+                            // parent space (linear part only).
+                            let inverse = entry.parentInverse
+                            let local = CGVector(dx: canvasDelta.dx * inverse.a + canvasDelta.dy * inverse.c,
+                                                 dy: canvasDelta.dx * inverse.b + canvasDelta.dy * inverse.d)
+                            var newPosition = CGPoint(x: entry.start.x + local.dx,
+                                                      y: entry.start.y + local.dy)
+                            if entries.count == 1 {
+                                newPosition = snapped(newPosition, tolerance: 8 / scale)
+                            }
+                            model.modifyLayer(id: entry.id) { $0.transform.position = newPosition }
+                        }
                     }
                 case .paint:
                     extendPaintStroke(to: value.location, canvasTransform: canvasTransform)
@@ -538,7 +566,9 @@ struct CanvasViewport: View {
         guard let layer = document.model.layer(id: editorState.selectedLayerID),
               !layer.isLocked else { return .arrow }
         let naturalSize = renderStore.naturalSize(for: layer, model: document.model)
-        let corners = layer.transform.corners(naturalSize: naturalSize).map { $0.applying(canvasTransform) }
+        let parentAffine = document.model.parentAffine(of: layer.id)
+        let corners = layer.transform.corners(naturalSize: naturalSize)
+            .map { $0.applying(parentAffine).applying(canvasTransform) }
 
         for (index, corner) in corners.enumerated() where hypot(location.x - corner.x, location.y - corner.y) < 9 {
             return Cursors.resizeCorner(index)
@@ -546,7 +576,7 @@ struct CanvasViewport: View {
 
         // Rotation handle: 24pt out from the top edge's midpoint.
         let topMid = CGPoint(x: (corners[0].x + corners[1].x) / 2, y: (corners[0].y + corners[1].y) / 2)
-        let center = layer.transform.position.applying(canvasTransform)
+        let center = layer.transform.position.applying(parentAffine).applying(canvasTransform)
         let length = max(hypot(topMid.x - center.x, topMid.y - center.y), 0.001)
         let handle = CGPoint(x: topMid.x + (topMid.x - center.x) / length * 24,
                              y: topMid.y + (topMid.y - center.y) / length * 24)
@@ -632,7 +662,8 @@ struct CanvasViewport: View {
                 let naturalSize = renderStore.naturalSize(for: layer, model: document.model)
                 if var t = SelectionRasterizer.canvasToLocalBuffer(layer: layer,
                                                                    naturalSize: naturalSize,
-                                                                   bufferPixelSize: mask.pixelSize) {
+                                                                   bufferPixelSize: mask.pixelSize,
+                                                                   parentAffine: document.model.parentAffine(of: maskID)) {
                     clip = selection.path.cgPath.copy(using: &t)
                 }
             }
@@ -655,7 +686,8 @@ struct CanvasViewport: View {
                 let naturalSize = renderStore.naturalSize(for: layer, model: document.model)
                 if var t = SelectionRasterizer.canvasToContentBuffer(layer: layer,
                                                                      naturalSize: naturalSize,
-                                                                     config: config) {
+                                                                     config: config,
+                                                                     parentAffine: document.model.parentAffine(of: id)) {
                     clip = selection.path.cgPath.copy(using: &t)
                 }
             }
@@ -670,6 +702,7 @@ struct CanvasViewport: View {
               let layer = document.model.layer(id: session.targetLayerID) else { return }
         let naturalSize = renderStore.naturalSize(for: layer, model: document.model)
         let affine = layer.transform.affine(naturalSize: naturalSize)
+            .concatenating(document.model.parentAffine(of: layer.id))
         guard affine.isInvertible, naturalSize.width > 0 else { return }
 
         let canvasPoint = viewPoint.applying(canvasTransform.inverted())
@@ -846,8 +879,9 @@ struct CanvasViewport: View {
             .onEnded { _ in magnifyStartZoom = nil }
     }
 
-    private func handleScaleDrag(_ phase: HandleDragPhase, layer: Layer, canvasTransform: CGAffineTransform) {
-        let center = layer.transform.position.applying(canvasTransform)
+    private func handleScaleDrag(_ phase: HandleDragPhase, layer: Layer,
+                                 parentAffine: CGAffineTransform, canvasTransform: CGAffineTransform) {
+        let center = layer.transform.position.applying(parentAffine).applying(canvasTransform)
         switch phase {
         case .changed(let value):
             let startDistance = hypot(value.startLocation.x - center.x, value.startLocation.y - center.y)
@@ -869,8 +903,9 @@ struct CanvasViewport: View {
         }
     }
 
-    private func handleRotateDrag(_ phase: HandleDragPhase, layer: Layer, canvasTransform: CGAffineTransform) {
-        let center = layer.transform.position.applying(canvasTransform)
+    private func handleRotateDrag(_ phase: HandleDragPhase, layer: Layer,
+                                  parentAffine: CGAffineTransform, canvasTransform: CGAffineTransform) {
+        let center = layer.transform.position.applying(parentAffine).applying(canvasTransform)
         switch phase {
         case .changed(let value):
             let startAngle = atan2(Double(value.startLocation.y - center.y), Double(value.startLocation.x - center.x))
@@ -895,11 +930,26 @@ struct CanvasViewport: View {
 
     // MARK: - Selection & snapping
 
+    /// Returns the top-level layer under the point. Groups hit when any of
+    /// their (recursively transformed) children do, so dragging a group's
+    /// artwork moves the whole group.
     private func hitTest(_ canvasPoint: CGPoint) -> Layer? {
-        for layer in document.model.layers.reversed() where layer.isVisible && !layer.isLocked {
-            let naturalSize = renderStore.naturalSize(for: layer, model: document.model)
-            if layer.transform.contains(canvasPoint, naturalSize: naturalSize) {
-                return layer
+        hitTest(canvasPoint, in: document.model.layers)
+    }
+
+    private func hitTest(_ point: CGPoint, in layers: [Layer]) -> Layer? {
+        for layer in layers.reversed() where layer.isVisible && !layer.isLocked {
+            if case .group(let group) = layer.kind {
+                let affine = layer.transform.affine(naturalSize: document.model.canvasSize)
+                guard affine.isInvertible else { continue }
+                if hitTest(point.applying(affine.inverted()), in: group.children) != nil {
+                    return layer
+                }
+            } else {
+                let naturalSize = renderStore.naturalSize(for: layer, model: document.model)
+                if layer.transform.contains(point, naturalSize: naturalSize) {
+                    return layer
+                }
             }
         }
         return nil
@@ -926,8 +976,8 @@ struct CanvasViewport: View {
     }
 
     private func nudgeSelection(_ press: KeyPress) -> KeyPress.Result {
-        guard let id = editorState.selectedLayerID,
-              document.model.layer(id: id)?.isLocked != true else { return .ignored }
+        let entries = moveEntries(for: editorState.selectedLayerIDs)
+        guard !entries.isEmpty else { return .ignored }
         let step: CGFloat = press.modifiers.contains(.shift)
             ? document.model.canvasSize.width * 0.01
             : document.model.canvasSize.width * 0.001
@@ -940,9 +990,12 @@ struct CanvasViewport: View {
         default: return .ignored
         }
         document.update(undoManager, actionName: "Nudge") { model in
-            model.modifyLayer(id: id) {
-                $0.transform.position.x += dx
-                $0.transform.position.y += dy
+            for entry in entries {
+                let inverse = entry.parentInverse
+                model.modifyLayer(id: entry.id) {
+                    $0.transform.position.x += dx * inverse.a + dy * inverse.c
+                    $0.transform.position.y += dx * inverse.b + dy * inverse.d
+                }
             }
         }
         return .handled
@@ -992,14 +1045,16 @@ enum HandleDragPhase {
 struct SelectionOverlay: View {
     let layer: Layer
     let naturalSize: CGSize
+    var parentAffine: CGAffineTransform = .identity
     let canvasTransform: CGAffineTransform
     let onScaleDrag: (HandleDragPhase) -> Void
     let onRotateDrag: (HandleDragPhase) -> Void
 
     var body: some View {
-        let corners = layer.transform.corners(naturalSize: naturalSize).map { $0.applying(canvasTransform) }
+        let corners = layer.transform.corners(naturalSize: naturalSize)
+            .map { $0.applying(parentAffine).applying(canvasTransform) }
         let topMid = CGPoint(x: (corners[0].x + corners[1].x) / 2, y: (corners[0].y + corners[1].y) / 2)
-        let center = layer.transform.position.applying(canvasTransform)
+        let center = layer.transform.position.applying(parentAffine).applying(canvasTransform)
         let up = normalize(CGPoint(x: topMid.x - center.x, y: topMid.y - center.y))
         let rotateHandle = CGPoint(x: topMid.x + up.x * 24, y: topMid.y + up.y * 24)
 

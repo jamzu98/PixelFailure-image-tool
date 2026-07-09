@@ -70,7 +70,18 @@ final class BrushSettings {
 /// Per-window UI state that isn't part of the document.
 @Observable
 final class EditorState {
-    var selectedLayerID: UUID?
+    /// Multi-selection. Most single-layer flows use `selectedLayerID`, which
+    /// is non-nil exactly when one layer is selected.
+    var selectedLayerIDs: Set<UUID> = []
+
+    var selectedLayerID: UUID? {
+        get { selectedLayerIDs.count == 1 ? selectedLayerIDs.first : nil }
+        set { selectedLayerIDs = newValue.map { [$0] } ?? [] }
+    }
+
+    /// Groups whose children are shown in the sidebar.
+    var expandedGroups: Set<UUID> = []
+
     var showExportSheet = false
     var showImageImporter = false
 

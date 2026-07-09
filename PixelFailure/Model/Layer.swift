@@ -59,12 +59,14 @@ nonisolated enum LayerKind: Codable, Hashable, Sendable {
     case text(TextConfig)
     case fill(FillConfig)
     case shape(ShapeConfig)
+    case group(GroupConfig)
 
     var isPattern: Bool { if case .pattern = self { true } else { false } }
     var isImage: Bool { if case .image = self { true } else { false } }
     var isText: Bool { if case .text = self { true } else { false } }
     var isFill: Bool { if case .fill = self { true } else { false } }
     var isShape: Bool { if case .shape = self { true } else { false } }
+    var isGroup: Bool { if case .group = self { true } else { false } }
 
     var iconName: String {
         switch self {
@@ -73,7 +75,22 @@ nonisolated enum LayerKind: Codable, Hashable, Sendable {
         case .text: "textformat"
         case .fill: "rectangle.fill"
         case .shape: "square.on.circle"
+        case .group: "folder"
         }
+    }
+}
+
+// MARK: - Group
+
+/// A group of layers. Children live in the same coordinate space as root
+/// layers (a group is a nested canvas); the group's own transform, opacity,
+/// blend mode, and mask apply on top of the composited children.
+nonisolated struct GroupConfig: Codable, Hashable, Sendable {
+    /// Bottom-to-top, like the root list.
+    var children: [Layer]
+
+    init(children: [Layer] = []) {
+        self.children = children
     }
 }
 

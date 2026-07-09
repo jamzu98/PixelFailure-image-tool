@@ -59,6 +59,22 @@ nonisolated struct LayerTransform: Codable, Hashable, Sendable {
         ].map { $0.applying(t) }
     }
 
+    /// Composes this (child) transform with a parent group's transform so
+    /// the layer looks identical after being pulled out of the group.
+    /// Both are similarity transforms (uniform scale · rotation · flips), so
+    /// the composition stays representable.
+    func composed(withParent parent: LayerTransform, parentNaturalSize: CGSize) -> LayerTransform {
+        let parentAffine = parent.affine(naturalSize: parentNaturalSize)
+        // A single mirror in the parent reverses the child's rotation sense.
+        let parentMirrors = parent.flippedHorizontally != parent.flippedVertically
+        return LayerTransform(
+            position: position.applying(parentAffine),
+            scale: parent.scale * scale,
+            rotationDegrees: parent.rotationDegrees + (parentMirrors ? -rotationDegrees : rotationDegrees),
+            flippedHorizontally: parent.flippedHorizontally != flippedHorizontally,
+            flippedVertically: parent.flippedVertically != flippedVertically)
+    }
+
     /// Whether a canvas-space point falls inside the transformed content rect.
     func contains(_ point: CGPoint, naturalSize: CGSize) -> Bool {
         let t = affine(naturalSize: naturalSize)

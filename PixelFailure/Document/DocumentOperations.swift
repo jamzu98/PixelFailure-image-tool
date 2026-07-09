@@ -64,9 +64,8 @@ extension PixelDocument {
     @MainActor
     @discardableResult
     func duplicateLayer(id: UUID, undoManager: UndoManager?) -> UUID? {
-        guard let index = model.layerIndex(id: id) else { return nil }
-        var copy = model.layers[index]
-        copy.id = UUID()
+        guard let original = model.layer(id: id) else { return nil }
+        var copy = original.withFreshIDs()
         copy.name += " Copy"
         copy.transform.position.x += model.canvasSize.width * 0.02
         copy.transform.position.y += model.canvasSize.height * 0.02
@@ -75,8 +74,12 @@ extension PixelDocument {
             copy.kind = .pattern(config)
         }
         let newID = copy.id
+        let inserted = copy
         update(undoManager, actionName: "Duplicate Layer") { model in
-            model.layers.insert(copy, at: index + 1)
+            model.modifyContainer(of: id) { container in
+                guard let index = container.firstIndex(where: { $0.id == id }) else { return }
+                container.insert(inserted, at: index + 1)
+            }
         }
         return newID
     }
@@ -244,6 +247,174 @@ extension PixelDocument {
         }
     }
 
+    // MARK: - Groups
+
+    /// Wraps the given layers in a new group, inserted where the topmost
+    /// selected top-level layer was. Children keep their canvas-space
+    /// transforms; the group starts with an identity transform, so nothing
+    /// moves visually.
+    @MainActor
+    @discardableResult
+    func groupLayers(ids: Set<UUID>, undoManager: UndoManager?) -> UUID? {
+        guard !ids.isEmpty else { return nil }
+        var newModel = model
+        let insertionIndex = newModel.layers.lastIndex { ids.contains($0.id) }
+        let removed = newModel.removeLayers(ids: ids)
+        guard !removed.isEmpty else { return nil }
+
+        let group = Layer(name: "Group",
+                          transform: LayerTransform(position: newModel.canvasCenter),
+                          kind: .group(GroupConfig(children: removed)))
+        let index = min(insertionIndex ?? newModel.layers.count, newModel.layers.count)
+        newModel.layers.insert(group, at: index)
+
+        update(undoManager, actionName: "Group Layers") { model in
+            model = newModel
+        }
+        return group.id
+    }
+
+    /// Splices a group's children back into its container, composing the
+    /// group's transform/opacity into each child so nothing moves visually.
+    @MainActor
+    func ungroup(id: UUID, undoManager: UndoManager?) {
+        guard let group = model.layer(id: id), let config = group.groupConfig else { return }
+        let canvasSize = model.canvasSize
+        let children = config.children.map { child -> Layer in
+            var freed = child
+            freed.transform = child.transform.composed(withParent: group.transform,
+                                                       parentNaturalSize: canvasSize)
+            freed.opacity = child.opacity * group.opacity
+            return freed
+        }
+        update(undoManager, actionName: "Ungroup") { model in
+            model.modifyContainer(of: id) { container in
+                guard let index = container.firstIndex(where: { $0.id == id }) else { return }
+                container.replaceSubrange(index...index, with: children)
+            }
+        }
+    }
+
+    // MARK: - Multi-layer operations
+
+    @MainActor
+    func deleteLayers(ids: Set<UUID>, undoManager: UndoManager?) {
+        guard !ids.isEmpty else { return }
+        update(undoManager, actionName: "Delete Layers") { model in
+            _ = model.removeLayers(ids: ids)
+        }
+    }
+
+    /// Canvas-space bounding box of a layer (through any parent groups).
+    @MainActor
+    func worldBounds(of layer: Layer, renderStore: RenderStore) -> CGRect {
+        let naturalSize = renderStore.naturalSize(for: layer, model: model)
+        let parent = model.parentAffine(of: layer.id)
+        let corners = layer.transform.corners(naturalSize: naturalSize).map { $0.applying(parent) }
+        let xs = corners.map(\.x)
+        let ys = corners.map(\.y)
+        return CGRect(x: xs.min() ?? 0, y: ys.min() ?? 0,
+                      width: (xs.max() ?? 0) - (xs.min() ?? 0),
+                      height: (ys.max() ?? 0) - (ys.min() ?? 0))
+    }
+
+    /// Moves a layer by a canvas-space delta, mapped through its parent
+    /// group's transform so nested layers move correctly.
+    @MainActor
+    private func canvasDelta(_ delta: CGVector, intoParentOf id: UUID) -> CGVector {
+        let parent = model.parentAffine(of: id)
+        guard parent != .identity, parent.isInvertible else { return delta }
+        let inverse = parent.inverted()
+        // Linear part only (deltas have no translation).
+        return CGVector(dx: delta.dx * inverse.a + delta.dy * inverse.c,
+                        dy: delta.dx * inverse.b + delta.dy * inverse.d)
+    }
+
+    enum AlignEdge: String, CaseIterable {
+        case left, centerH, right, top, centerV, bottom
+
+        var displayName: String {
+            switch self {
+            case .left: "Left"
+            case .centerH: "Horizontal Centers"
+            case .right: "Right"
+            case .top: "Top"
+            case .centerV: "Vertical Centers"
+            case .bottom: "Bottom"
+            }
+        }
+    }
+
+    /// Aligns layers to each other (2+ selected) or to the canvas (1).
+    @MainActor
+    func alignLayers(ids: Set<UUID>, edge: AlignEdge, renderStore: RenderStore, undoManager: UndoManager?) {
+        let layers = ids.compactMap { model.layer(id: $0) }.filter { !$0.isLocked }
+        guard !layers.isEmpty else { return }
+        let boundsByID = Dictionary(uniqueKeysWithValues: layers.map {
+            ($0.id, worldBounds(of: $0, renderStore: renderStore))
+        })
+        let reference: CGRect = layers.count > 1
+            ? boundsByID.values.reduce(CGRect.null) { $0.union($1) }
+            : CGRect(origin: .zero, size: model.canvasSize)
+
+        var deltas: [UUID: CGVector] = [:]
+        for layer in layers {
+            guard let bounds = boundsByID[layer.id] else { continue }
+            var delta = CGVector.zero
+            switch edge {
+            case .left: delta.dx = reference.minX - bounds.minX
+            case .centerH: delta.dx = reference.midX - bounds.midX
+            case .right: delta.dx = reference.maxX - bounds.maxX
+            case .top: delta.dy = reference.minY - bounds.minY
+            case .centerV: delta.dy = reference.midY - bounds.midY
+            case .bottom: delta.dy = reference.maxY - bounds.maxY
+            }
+            deltas[layer.id] = canvasDelta(delta, intoParentOf: layer.id)
+        }
+
+        update(undoManager, actionName: "Align Layers") { model in
+            for (id, delta) in deltas {
+                model.modifyLayer(id: id) { layer in
+                    layer.transform.position.x += delta.dx
+                    layer.transform.position.y += delta.dy
+                }
+            }
+        }
+    }
+
+    /// Distributes 3+ layers so their centers are evenly spaced.
+    @MainActor
+    func distributeLayers(ids: Set<UUID>, horizontally: Bool, renderStore: RenderStore, undoManager: UndoManager?) {
+        let layers = ids.compactMap { model.layer(id: $0) }.filter { !$0.isLocked }
+        guard layers.count >= 3 else { return }
+        let entries = layers.map { layer -> (id: UUID, center: CGPoint) in
+            let bounds = worldBounds(of: layer, renderStore: renderStore)
+            return (layer.id, CGPoint(x: bounds.midX, y: bounds.midY))
+        }.sorted { horizontally ? $0.center.x < $1.center.x : $0.center.y < $1.center.y }
+
+        guard let first = entries.first, let last = entries.last else { return }
+        let span = horizontally ? last.center.x - first.center.x : last.center.y - first.center.y
+        let step = span / CGFloat(entries.count - 1)
+
+        var deltas: [UUID: CGVector] = [:]
+        for (index, entry) in entries.enumerated() {
+            let target = (horizontally ? first.center.x : first.center.y) + step * CGFloat(index)
+            let delta = horizontally
+                ? CGVector(dx: target - entry.center.x, dy: 0)
+                : CGVector(dx: 0, dy: target - entry.center.y)
+            deltas[entry.id] = canvasDelta(delta, intoParentOf: entry.id)
+        }
+
+        update(undoManager, actionName: "Distribute Layers") { model in
+            for (id, delta) in deltas {
+                model.modifyLayer(id: id) { layer in
+                    layer.transform.position.x += delta.dx
+                    layer.transform.position.y += delta.dy
+                }
+            }
+        }
+    }
+
     // MARK: - Flip / lock
 
     @MainActor
@@ -268,15 +439,20 @@ extension PixelDocument {
 
     // MARK: - Copy / cut / paste
 
-    /// Pasteboard payload for a layer: the model + image bytes for image
-    /// layers + a flattened PNG so other apps can paste the pixels.
+    /// Pasteboard payload for a layer: the model + every image referenced in
+    /// its subtree (content and masks) + a flattened PNG for other apps.
     @MainActor
     func transferPayload(for layerID: UUID, renderStore: RenderStore) -> LayerTransfer? {
         guard let layer = model.layer(id: layerID) else { return nil }
-        let data = layer.imageConfig.flatMap { imageData(for: $0.imageKey) }
+        var images: [String: Data] = [:]
+        for key in layer.referencedImageKeys {
+            if let data = imageData(for: key) {
+                images[key] = data
+            }
+        }
         let png = layerBitmap(id: layerID, renderStore: renderStore, maxDimension: 4096)
             .flatMap { PNGExporter.pngData($0) }
-        return LayerTransfer(layer: layer, imageData: data, flattenedPNG: png)
+        return LayerTransfer(layer: layer, images: images, flattenedPNG: png)
     }
 
     @MainActor
@@ -292,30 +468,30 @@ extension PixelDocument {
         deleteLayer(id: id, undoManager: undoManager)
     }
 
-    /// Pastes a transferred layer on top of the stack; returns the new id.
+    /// Pastes a transferred layer (or group subtree) on top of the stack;
+    /// returns the new id.
     @MainActor
     @discardableResult
     func pasteLayer(_ transfer: LayerTransfer, undoManager: UndoManager?) -> UUID {
-        var layer = transfer.layer
-        layer.id = UUID()
+        var layer = transfer.layer.withFreshIDs()
         // Nudge so a paste-in-place is visibly a new layer.
         layer.transform.position.x += model.canvasSize.width * 0.02
         layer.transform.position.y += model.canvasSize.height * 0.02
 
-        if var config = layer.imageConfig {
-            // Re-store the image bytes: the key from the source document
-            // means nothing here (and pasting within one document is
-            // harmless — the store is append-only).
-            if let data = transfer.imageData {
-                let ext = (config.imageKey as NSString).pathExtension
-                config.imageKey = storeImage(data: data, fileExtension: ext.isEmpty ? "png" : ext)
-                layer.kind = .image(config)
-            } else if imageData(for: config.imageKey) == nil {
-                // No bytes and unknown key: drop the paste rather than add a broken layer.
-                return layer.id
-            }
+        // Re-store every transferred image under new keys and rewrite the
+        // subtree's references (source-document keys mean nothing here).
+        var keyMap: [String: String] = [:]
+        for (oldKey, data) in transfer.images ?? [:] {
+            let ext = (oldKey as NSString).pathExtension
+            keyMap[oldKey] = storeImage(data: data, fileExtension: ext.isEmpty ? "png" : ext)
         }
+        layer.remapImageKeys(keyMap)
 
+        // Drop references to keys we can't resolve (e.g. a bare image layer
+        // pasted into a different document with no bytes attached).
+        if let config = layer.imageConfig, imageData(for: config.imageKey) == nil {
+            return layer.id
+        }
         if var config = layer.patternConfig,
            let sourceID = config.sourceImageLayerID,
            model.layer(id: sourceID) == nil {
@@ -330,17 +506,19 @@ extension PixelDocument {
         return pasted.id
     }
 
-    /// Move a layer within the stack: +1 = one step toward the front,
-    /// -1 = one step toward the back, .max/.min = all the way.
+    /// Move a layer within its container (root or group): +1 = one step
+    /// toward the front, -1 = one step toward the back, .max/.min = ends.
     @MainActor
     func reorderLayer(id: UUID, offset: Int, undoManager: UndoManager?) {
         update(undoManager, actionName: "Reorder Layer") { model in
-            guard let index = model.layerIndex(id: id) else { return }
-            let layer = model.layers.remove(at: index)
-            let target = offset == Int.max ? model.layers.count
-                : offset == Int.min ? 0
-                : min(max(index + offset, 0), model.layers.count)
-            model.layers.insert(layer, at: target)
+            model.modifyContainer(of: id) { container in
+                guard let index = container.firstIndex(where: { $0.id == id }) else { return }
+                let layer = container.remove(at: index)
+                let target = offset == Int.max ? container.count
+                    : offset == Int.min ? 0
+                    : min(max(index + offset, 0), container.count)
+                container.insert(layer, at: target)
+            }
         }
     }
 

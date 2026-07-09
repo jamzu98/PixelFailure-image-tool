@@ -37,53 +37,63 @@ enum PNGExporter {
         ctx.fill(CGRect(origin: .zero, size: canvasSize))
 
         for item in items {
-            ctx.saveGState()
-            ctx.setAlpha(CGFloat(item.opacity))
-            ctx.setBlendMode(item.blendMode.cgBlendMode)
-            ctx.beginTransparencyLayer(auxiliaryInfo: nil)
-            ctx.concatenate(item.transform)
-
-            let naturalRect = CGRect(origin: .zero, size: item.naturalSize)
-
-            switch item.content {
-            case .primitives(let primitives):
-                for primitive in primitives {
-                    let cgPath = primitive.path.cgPath
-                    if let fill = primitive.fill {
-                        ctx.addPath(cgPath)
-                        ctx.setFillColor(fill.cgColor)
-                        ctx.fillPath()
-                    }
-                    if let stroke = primitive.stroke {
-                        ctx.addPath(cgPath)
-                        ctx.setStrokeColor(stroke.cgColor)
-                        ctx.setLineWidth(CGFloat(primitive.lineWidth))
-                        ctx.setLineCap(primitive.lineCap)
-                        ctx.setLineJoin(primitive.lineJoin)
-                        ctx.setLineDash(phase: 0, lengths: primitive.dash)
-                        ctx.strokePath()
-                    }
-                }
-            case .raster(let image):
-                drawUpright(image, in: naturalRect, context: ctx)
-            case .fill(let config):
-                drawFill(config, in: naturalRect, context: ctx)
-            }
-
-            // Mask inside the layer's transparency layer: keep only the pixels
-            // where the mask's alpha is set.
-            if let mask = item.mask {
-                ctx.saveGState()
-                ctx.setBlendMode(.destinationIn)
-                drawUpright(mask.alpha, in: naturalRect, context: ctx)
-                ctx.restoreGState()
-            }
-
-            ctx.endTransparencyLayer()
-            ctx.restoreGState()
+            drawItem(item, context: ctx)
         }
 
         return ctx.makeImage()
+    }
+
+    /// Draws one item (recursively for groups) with opacity, blend mode,
+    /// transform, and mask.
+    private static func drawItem(_ item: RenderItem, context ctx: CGContext) {
+        ctx.saveGState()
+        ctx.setAlpha(CGFloat(item.opacity))
+        ctx.setBlendMode(item.blendMode.cgBlendMode)
+        ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+        ctx.concatenate(item.transform)
+
+        let naturalRect = CGRect(origin: .zero, size: item.naturalSize)
+
+        switch item.content {
+        case .primitives(let primitives):
+            for primitive in primitives {
+                let cgPath = primitive.path.cgPath
+                if let fill = primitive.fill {
+                    ctx.addPath(cgPath)
+                    ctx.setFillColor(fill.cgColor)
+                    ctx.fillPath()
+                }
+                if let stroke = primitive.stroke {
+                    ctx.addPath(cgPath)
+                    ctx.setStrokeColor(stroke.cgColor)
+                    ctx.setLineWidth(CGFloat(primitive.lineWidth))
+                    ctx.setLineCap(primitive.lineCap)
+                    ctx.setLineJoin(primitive.lineJoin)
+                    ctx.setLineDash(phase: 0, lengths: primitive.dash)
+                    ctx.strokePath()
+                }
+            }
+        case .raster(let image):
+            drawUpright(image, in: naturalRect, context: ctx)
+        case .fill(let config):
+            drawFill(config, in: naturalRect, context: ctx)
+        case .group(let children):
+            for child in children {
+                drawItem(child, context: ctx)
+            }
+        }
+
+        // Mask inside the layer's transparency layer: keep only the pixels
+        // where the mask's alpha is set.
+        if let mask = item.mask {
+            ctx.saveGState()
+            ctx.setBlendMode(.destinationIn)
+            drawUpright(mask.alpha, in: naturalRect, context: ctx)
+            ctx.restoreGState()
+        }
+
+        ctx.endTransparencyLayer()
+        ctx.restoreGState()
     }
 
     /// Draws a CGImage upright inside our y-down coordinate space.

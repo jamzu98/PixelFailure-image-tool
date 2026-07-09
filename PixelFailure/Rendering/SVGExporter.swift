@@ -12,48 +12,10 @@ enum SVGExporter {
         let h = Int(canvasSize.height)
         var defs = ""
         var body = ""
+        var idCounter = 0
 
-        for (index, item) in items.enumerated() {
-            let t = item.transform
-            let transform = "matrix(\(fmt(t.a)),\(fmt(t.b)),\(fmt(t.c)),\(fmt(t.d)),\(fmt(t.tx)),\(fmt(t.ty)))"
-            var style = ""
-            if item.blendMode != .normal {
-                style = " style=\"mix-blend-mode:\(item.blendMode.svgName)\""
-            }
-            let opacity = item.opacity < 0.999 ? " opacity=\"\(fmt(item.opacity))\"" : ""
-            body += "<g transform=\"\(transform)\"\(opacity)\(style)>\n"
-
-            // Masks live on an untransformed inner group so their coordinates
-            // are the layer's local space.
-            if let mask = item.mask, let maskPNG = PNGExporter.pngData(mask.luminance) {
-                let maskID = "mask\(index)"
-                let mw = fmt(Double(item.naturalSize.width))
-                let mh = fmt(Double(item.naturalSize.height))
-                defs += "<mask id=\"\(maskID)\" maskUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"\(mw)\" height=\"\(mh)\">\n"
-                defs += "<image width=\"\(mw)\" height=\"\(mh)\" preserveAspectRatio=\"none\" "
-                defs += "xlink:href=\"data:image/png;base64,\(maskPNG.base64EncodedString())\"/>\n</mask>\n"
-                body += "<g mask=\"url(#\(maskID))\">\n"
-            }
-
-            switch item.content {
-            case .primitives(let primitives):
-                for primitive in primitives {
-                    body += pathElement(primitive)
-                }
-            case .raster(let image):
-                if let png = PNGExporter.pngData(image) {
-                    let base64 = png.base64EncodedString()
-                    body += "<image width=\"\(fmt(Double(item.naturalSize.width)))\" height=\"\(fmt(Double(item.naturalSize.height)))\" "
-                    body += "preserveAspectRatio=\"none\" xlink:href=\"data:image/png;base64,\(base64)\"/>\n"
-                }
-            case .fill(let config):
-                body += fillElement(config, size: item.naturalSize, index: index, defs: &defs)
-            }
-
-            if item.mask != nil {
-                body += "</g>\n"
-            }
-            body += "</g>\n"
+        for item in items {
+            body += element(for: item, defs: &defs, idCounter: &idCounter)
         }
 
         var out = """
@@ -72,6 +34,59 @@ enum SVGExporter {
         out += body
         out += "</svg>\n"
         return out
+    }
+
+    /// One item (recursively for groups) as a transformed, masked <g>.
+    private static func element(for item: RenderItem, defs: inout String, idCounter: inout Int) -> String {
+        idCounter += 1
+        let index = idCounter
+        var body = ""
+
+        let t = item.transform
+        let transform = "matrix(\(fmt(t.a)),\(fmt(t.b)),\(fmt(t.c)),\(fmt(t.d)),\(fmt(t.tx)),\(fmt(t.ty)))"
+        var style = ""
+        if item.blendMode != .normal {
+            style = " style=\"mix-blend-mode:\(item.blendMode.svgName)\""
+        }
+        let opacity = item.opacity < 0.999 ? " opacity=\"\(fmt(item.opacity))\"" : ""
+        body += "<g transform=\"\(transform)\"\(opacity)\(style)>\n"
+
+        // Masks live on an untransformed inner group so their coordinates
+        // are the layer's local space.
+        if let mask = item.mask, let maskPNG = PNGExporter.pngData(mask.luminance) {
+            let maskID = "mask\(index)"
+            let mw = fmt(Double(item.naturalSize.width))
+            let mh = fmt(Double(item.naturalSize.height))
+            defs += "<mask id=\"\(maskID)\" maskUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"\(mw)\" height=\"\(mh)\">\n"
+            defs += "<image width=\"\(mw)\" height=\"\(mh)\" preserveAspectRatio=\"none\" "
+            defs += "xlink:href=\"data:image/png;base64,\(maskPNG.base64EncodedString())\"/>\n</mask>\n"
+            body += "<g mask=\"url(#\(maskID))\">\n"
+        }
+
+        switch item.content {
+        case .primitives(let primitives):
+            for primitive in primitives {
+                body += pathElement(primitive)
+            }
+        case .raster(let image):
+            if let png = PNGExporter.pngData(image) {
+                let base64 = png.base64EncodedString()
+                body += "<image width=\"\(fmt(Double(item.naturalSize.width)))\" height=\"\(fmt(Double(item.naturalSize.height)))\" "
+                body += "preserveAspectRatio=\"none\" xlink:href=\"data:image/png;base64,\(base64)\"/>\n"
+            }
+        case .fill(let config):
+            body += fillElement(config, size: item.naturalSize, index: index, defs: &defs)
+        case .group(let children):
+            for child in children {
+                body += element(for: child, defs: &defs, idCounter: &idCounter)
+            }
+        }
+
+        if item.mask != nil {
+            body += "</g>\n"
+        }
+        body += "</g>\n"
+        return body
     }
 
     private static func fillElement(_ config: FillConfig, size: CGSize, index: Int, defs: inout String) -> String {

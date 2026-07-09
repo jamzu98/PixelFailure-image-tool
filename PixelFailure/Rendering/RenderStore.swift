@@ -16,6 +16,9 @@ struct RenderItem: Identifiable {
         case primitives([VectorPrimitive])
         case raster(CGImage)
         case fill(FillConfig)
+        /// Composited children (already resolved), drawn inside the group's
+        /// transparency layer so group opacity/blend/mask apply once.
+        case group([RenderItem])
     }
 
     let id: UUID
@@ -74,7 +77,7 @@ final class RenderStore {
 
     func naturalSize(for layer: Layer, model: ProjectModel) -> CGSize {
         switch layer.kind {
-        case .pattern, .fill: model.canvasSize
+        case .pattern, .fill, .group: model.canvasSize
         case .image(let config): config.croppedPixelSize
         case .text: primitivesResult(for: layer, model: model).naturalSize
         case .shape(let config): config.size
@@ -198,6 +201,18 @@ final class RenderStore {
                               naturalSize: model.canvasSize,
                               content: .fill(config),
                               mask: mask)
+        case .group(let config):
+            let children = config.children.compactMap { child -> RenderItem? in
+                guard child.isVisible else { return nil }
+                return renderItem(for: child, model: model, quality: quality)
+            }
+            return RenderItem(id: layer.id,
+                              opacity: layer.opacity,
+                              blendMode: layer.blendMode,
+                              transform: layer.transform.affine(naturalSize: model.canvasSize),
+                              naturalSize: model.canvasSize,
+                              content: .group(children),
+                              mask: mask)
         }
     }
 
@@ -270,7 +285,7 @@ final class RenderStore {
             primitives[layer.id] = (hash, prims, config.size)
             return (prims, config.size)
 
-        case .image, .fill:
+        case .image, .fill, .group:
             return ([], .zero)
         }
     }

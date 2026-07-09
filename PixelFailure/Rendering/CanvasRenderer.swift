@@ -11,19 +11,25 @@ enum CanvasRenderer {
         clipped.fill(Path(CGRect(origin: .zero, size: canvasSize)), with: .color(background.color))
 
         for item in items {
-            var layerContext = clipped
-            layerContext.opacity = item.opacity
-            layerContext.blendMode = item.blendMode.graphicsContextMode
-            layerContext.drawLayer { inner in
-                inner.concatenate(item.transform)
-                let naturalRect = CGRect(origin: .zero, size: item.naturalSize)
-                if let mask = item.mask {
-                    inner.clipToLayer { maskContext in
-                        maskContext.draw(Image(decorative: mask.alpha, scale: 1), in: naturalRect)
-                    }
+            drawItem(item, in: clipped)
+        }
+    }
+
+    /// Draws one item (recursively for groups) with its opacity, blend mode,
+    /// transform, and mask.
+    static func drawItem(_ item: RenderItem, in context: GraphicsContext) {
+        var layerContext = context
+        layerContext.opacity = item.opacity
+        layerContext.blendMode = item.blendMode.graphicsContextMode
+        layerContext.drawLayer { inner in
+            inner.concatenate(item.transform)
+            let naturalRect = CGRect(origin: .zero, size: item.naturalSize)
+            if let mask = item.mask {
+                inner.clipToLayer { maskContext in
+                    maskContext.draw(Image(decorative: mask.alpha, scale: 1), in: naturalRect)
                 }
-                draw(item.content, naturalRect: naturalRect, in: inner)
             }
+            draw(item.content, naturalRect: naturalRect, in: inner)
         }
     }
 
@@ -42,6 +48,10 @@ enum CanvasRenderer {
             context.draw(Image(decorative: image, scale: 1), in: naturalRect)
         case .fill(let config):
             context.fill(Path(naturalRect), with: shading(for: config, in: naturalRect.size))
+        case .group(let children):
+            for child in children {
+                drawItem(child, in: context)
+            }
         }
     }
 

@@ -229,7 +229,7 @@ struct FillShapeSVGTests {
         let svg = SVGExporter.svg(items: [item], background: .black,
                                   canvasSize: CGSize(width: 100, height: 100))
         #expect(svg.contains("<linearGradient"))
-        #expect(svg.contains("url(#grad0)"))
+        #expect(svg.contains("url(#grad"))
     }
 
     @Test func shapeStaysVector() {
@@ -393,7 +393,7 @@ struct LayerTransferEncodingTests {
     @Test func flattenedPNGIsNotPersisted() throws {
         let transfer = LayerTransfer(layer: Layer(name: "T", transform: LayerTransform(position: .zero),
                                                   kind: .text(TextConfig())),
-                                     imageData: nil,
+                                     images: nil,
                                      flattenedPNG: Data([1, 2, 3]))
         let data = try JSONEncoder().encode(transfer)
         let json = String(decoding: data, as: UTF8.self)
@@ -576,5 +576,121 @@ struct SelectionFlippedLayerTests {
                 "buffer right half (canvas left) should be cleared")
         #expect(sampler.color(atUnitX: 0.25, y: 0.5).a > 0.9,
                 "buffer left half (canvas right) should stay")
+    }
+}
+
+// MARK: - Stage 3 (groups & multi-select) tests
+
+@MainActor
+struct GroupTests {
+    private func starShapeLayer(at position: CGPoint) -> Layer {
+        Layer(name: "Star",
+              transform: LayerTransform(position: position),
+              kind: .shape(ShapeConfig(kind: .star, size: CGSize(width: 100, height: 100),
+                                       fill: RGBAColor(hex: "#FF0000"))))
+    }
+
+    /// Grouping must not change a single rendered pixel.
+    @Test func groupingIsVisuallyLossless() throws {
+        let document = PixelDocument()
+        let store = RenderStore(document: document)
+        let a = starShapeLayer(at: CGPoint(x: 120, y: 150))
+        let b = starShapeLayer(at: CGPoint(x: 300, y: 320))
+        document.update(nil) { model in
+            model.canvasSize = CGSize(width: 400, height: 400)
+            model.layers = [a, b]
+        }
+
+        func flat() -> Data? {
+            let items = store.renderItems(model: document.model, quality: .full)
+            return PNGExporter.render(items: items, background: .black,
+                                      canvasSize: document.model.canvasSize,
+                                      targetPixelSize: CGSize(width: 200, height: 200))
+                .flatMap { PNGExporter.pngData($0) }
+        }
+        let before = try #require(flat())
+
+        let groupID = try #require(document.groupLayers(ids: [a.id, b.id], undoManager: nil))
+        #expect(document.model.layers.count == 1)
+        #expect(document.model.layer(id: groupID)?.groupConfig?.children.count == 2)
+        // Children remain findable through recursion.
+        #expect(document.model.layer(id: a.id) != nil)
+        let afterGroup = try #require(flat())
+        #expect(before == afterGroup, "grouping changed the render")
+
+        // Move + scale the group, then ungroup: children must compose the
+        // group transform and the render must stay identical.
+        document.update(nil) { model in
+            model.modifyLayer(id: groupID) {
+                $0.transform.position.x += 40
+                $0.transform.scale = 1.5
+                $0.transform.rotationDegrees = 30
+            }
+        }
+        let movedGroup = try #require(flat())
+        document.ungroup(id: groupID, undoManager: nil)
+        #expect(document.model.layers.count == 2)
+        #expect(document.model.layer(id: groupID) == nil)
+        let afterUngroup = try #require(flat())
+        #expect(movedGroup == afterUngroup, "ungrouping changed the render")
+    }
+
+    @Test func duplicateOfGroupRegeneratesAllIDs() throws {
+        let document = PixelDocument()
+        let a = starShapeLayer(at: CGPoint(x: 100, y: 100))
+        document.update(nil) { model in
+            model.layers = [a]
+        }
+        let groupID = try #require(document.groupLayers(ids: [a.id], undoManager: nil))
+        let copyID = try #require(document.duplicateLayer(id: groupID, undoManager: nil))
+        let copy = try #require(document.model.layer(id: copyID))
+        let copiedChild = try #require(copy.groupConfig?.children.first)
+        #expect(copyID != groupID)
+        #expect(copiedChild.id != a.id)
+    }
+
+    @Test func parentAffineComposesForNestedLayers() throws {
+        let document = PixelDocument()
+        let a = starShapeLayer(at: CGPoint(x: 100, y: 100))
+        document.update(nil) { model in
+            model.canvasSize = CGSize(width: 400, height: 400)
+            model.layers = [a]
+        }
+        let groupID = try #require(document.groupLayers(ids: [a.id], undoManager: nil))
+        document.update(nil) { model in
+            model.modifyLayer(id: groupID) { $0.transform.position.x += 50 }
+        }
+        let parent = document.model.parentAffine(of: a.id)
+        let world = CGPoint(x: 100, y: 100).applying(parent)
+        #expect(abs(world.x - 150) < 0.01)
+        #expect(abs(world.y - 100) < 0.01)
+    }
+
+    @Test func alignAndDistribute() throws {
+        let document = PixelDocument()
+        let store = RenderStore(document: document)
+        let a = starShapeLayer(at: CGPoint(x: 100, y: 100))
+        let b = starShapeLayer(at: CGPoint(x: 250, y: 200))
+        let c = starShapeLayer(at: CGPoint(x: 260, y: 350))
+        document.update(nil) { model in
+            model.canvasSize = CGSize(width: 400, height: 400)
+            model.layers = [a, b, c]
+        }
+
+        document.alignLayers(ids: [a.id, b.id, c.id], edge: .left, renderStore: store, undoManager: nil)
+        let minXs = [a.id, b.id, c.id].map {
+            document.worldBounds(of: document.model.layer(id: $0)!, renderStore: store).minX
+        }
+        #expect(abs(minXs[0] - minXs[1]) < 0.01)
+        #expect(abs(minXs[1] - minXs[2]) < 0.01)
+
+        document.distributeLayers(ids: [a.id, b.id, c.id], horizontally: false,
+                                  renderStore: store, undoManager: nil)
+        let centers = [a.id, b.id, c.id].map {
+            document.worldBounds(of: document.model.layer(id: $0)!, renderStore: store).midY
+        }.sorted()
+        let gap1 = centers[1] - centers[0]
+        let gap2 = centers[2] - centers[1]
+        #expect(abs(gap1 - gap2) < 0.5)
     }
 }
