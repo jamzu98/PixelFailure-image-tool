@@ -53,6 +53,7 @@ final class RenderStore {
     private var samplers: [UUID: (hash: Int, sampler: ImageSampler)] = [:]
     private var masks: [UUID: (hash: Int, mask: RenderMask)] = [:]
     private var composite: (hash: Int, image: CGImage)?
+    private var thumbnails: [UUID: (hash: Int, image: CGImage)] = [:]
 
     /// While a brush stroke is in flight, this session's buffer overrides the
     /// target layer's content (or mask) so painting previews live.
@@ -98,6 +99,46 @@ final class RenderStore {
         samplers.removeAll()
         masks.removeAll()
         composite = nil
+        thumbnails.removeAll()
+    }
+
+    /// Small sidebar thumbnail of one layer's content (mask applied,
+    /// transform ignored), cached by content hash. Cheap after the first
+    /// render: primitives/effect caches are shared with the main viewport.
+    func thumbnail(for layer: Layer, model: ProjectModel) -> CGImage? {
+        var hasher = Hasher()
+        hasher.combine(layer.kind)
+        hasher.combine(layer.mask)
+        hasher.combine(model.palette)
+        hasher.combine(model.canvasSize.width)
+        hasher.combine(model.canvasSize.height)
+        let hash = hasher.finalize()
+        if let cached = thumbnails[layer.id], cached.hash == hash { return cached.image }
+
+        let naturalSize = naturalSize(for: layer, model: model)
+        guard naturalSize.width > 0, naturalSize.height > 0 else { return nil }
+
+        var flat = layer
+        flat.isVisible = true
+        flat.opacity = 1
+        flat.blendMode = .normal
+        flat.transform = LayerTransform(position: CGPoint(x: naturalSize.width / 2,
+                                                          y: naturalSize.height / 2))
+        var solo = model
+        solo.layers = [flat]
+        solo.background = .clear
+        solo.canvasSize = naturalSize
+
+        let scale = 56 / Double(max(naturalSize.width, naturalSize.height))
+        let target = CGSize(width: max(8, (naturalSize.width * scale).rounded()),
+                            height: max(8, (naturalSize.height * scale).rounded()))
+        let items = renderItems(model: solo, quality: .preview)
+        guard let image = PNGExporter.render(items: items,
+                                             background: .clear,
+                                             canvasSize: naturalSize,
+                                             targetPixelSize: target) else { return nil }
+        thumbnails[layer.id] = (hash, image)
+        return image
     }
 
     /// Flattened composite with the canvas-level effect stack applied, at

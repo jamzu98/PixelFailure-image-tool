@@ -8,11 +8,30 @@ nonisolated struct LayerTransform: Codable, Hashable, Sendable {
     var position: CGPoint
     var scale: Double
     var rotationDegrees: Double
+    var flippedHorizontally: Bool
+    var flippedVertically: Bool
 
-    init(position: CGPoint, scale: Double = 1, rotationDegrees: Double = 0) {
+    init(position: CGPoint, scale: Double = 1, rotationDegrees: Double = 0,
+         flippedHorizontally: Bool = false, flippedVertically: Bool = false) {
         self.position = position
         self.scale = scale
         self.rotationDegrees = rotationDegrees
+        self.flippedHorizontally = flippedHorizontally
+        self.flippedVertically = flippedVertically
+    }
+
+    // Custom decoding so documents saved before flips existed still open.
+    private enum CodingKeys: String, CodingKey {
+        case position, scale, rotationDegrees, flippedHorizontally, flippedVertically
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        position = try container.decode(CGPoint.self, forKey: .position)
+        scale = try container.decode(Double.self, forKey: .scale)
+        rotationDegrees = try container.decode(Double.self, forKey: .rotationDegrees)
+        flippedHorizontally = try container.decodeIfPresent(Bool.self, forKey: .flippedHorizontally) ?? false
+        flippedVertically = try container.decodeIfPresent(Bool.self, forKey: .flippedVertically) ?? false
     }
 
     var rotationRadians: Double { rotationDegrees * .pi / 180 }
@@ -23,6 +42,9 @@ nonisolated struct LayerTransform: Codable, Hashable, Sendable {
             .translatedBy(x: position.x, y: position.y)
             .rotated(by: CGFloat(rotationRadians))
             .scaledBy(x: CGFloat(scale), y: CGFloat(scale))
+            // Mirror within the content box (applied around its center
+            // because the centering translation comes after).
+            .scaledBy(x: flippedHorizontally ? -1 : 1, y: flippedVertically ? -1 : 1)
             .translatedBy(x: -naturalSize.width / 2, y: -naturalSize.height / 2)
     }
 

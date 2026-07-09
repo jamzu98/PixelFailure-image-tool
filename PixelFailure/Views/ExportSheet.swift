@@ -24,9 +24,22 @@ struct ExportSheet: View {
     let renderStore: RenderStore
     @Environment(\.dismiss) private var dismiss
 
-    private enum Format: String, CaseIterable { case png = "PNG", svg = "SVG" }
+    private enum Format: String, CaseIterable {
+        case png = "PNG", jpeg = "JPEG", tiff = "TIFF", heic = "HEIC", svg = "SVG"
+
+        var raster: ImageEncoder.Format? {
+            switch self {
+            case .png: .png
+            case .jpeg: .jpeg
+            case .tiff: .tiff
+            case .heic: .heic
+            case .svg: nil
+            }
+        }
+    }
 
     @State private var format: Format = .png
+    @State private var quality = 0.9
     @State private var presetIndex = 0
     @State private var customWidth = 3000
     @State private var customHeight = 3000
@@ -45,7 +58,7 @@ struct ExportSheet: View {
             }
             .pickerStyle(.segmented)
 
-            if format == .png {
+            if format != .svg {
                 Picker("Size", selection: $presetIndex) {
                     ForEach(SizePreset.exportPresets.indices, id: \.self) { i in
                         Text(SizePreset.exportPresets[i].name).tag(i)
@@ -60,6 +73,22 @@ struct ExportSheet: View {
                         Text("px")
                     }
                     .textFieldStyle(.roundedBorder)
+                }
+
+                if format.raster?.isLossy == true {
+                    LabeledContent("Quality") {
+                        HStack {
+                            Slider(value: $quality, in: 0.5...1)
+                            Text("\(Int((quality * 100).rounded()))%")
+                                .font(.caption.monospacedDigit())
+                                .frame(width: 36, alignment: .trailing)
+                        }
+                    }
+                }
+                if format == .jpeg {
+                    Text("JPEG has no transparency — the artwork is flattened onto the background color.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 if targetSize() != document.model.canvasSize {
@@ -98,7 +127,7 @@ struct ExportSheet: View {
     }
 
     private func targetSize() -> CGSize {
-        guard format == .png else { return document.model.canvasSize }
+        guard format != .svg else { return document.model.canvasSize }
         let preset = SizePreset.exportPresets[presetIndex]
         if preset.size == .zero {
             return CGSize(width: max(16, customWidth), height: max(16, customHeight))
@@ -108,8 +137,8 @@ struct ExportSheet: View {
 
     private func export() {
         let panel = NSSavePanel()
-        let ext = format == .png ? "png" : "svg"
-        panel.allowedContentTypes = [format == .png ? .png : .svg]
+        let ext = format.raster?.fileExtension ?? "svg"
+        panel.allowedContentTypes = [format.raster?.utType ?? .svg]
         panel.nameFieldStringValue = "Artwork.\(ext)"
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
@@ -122,8 +151,7 @@ struct ExportSheet: View {
         let model = document.model
 
         do {
-            switch format {
-            case .png:
+            if let rasterFormat = format.raster {
                 guard var image = PNGExporter.render(items: items,
                                                      background: model.background,
                                                      canvasSize: model.canvasSize,
@@ -136,12 +164,14 @@ struct ExportSheet: View {
                                                         to: image,
                                                         palette: model.palette)
                 }
-                guard let data = PNGExporter.pngData(image) else {
+                guard let data = ImageEncoder.encode(image, format: rasterFormat,
+                                                     quality: quality,
+                                                     background: model.background) else {
                     errorMessage = "Encoding failed."
                     return
                 }
                 try data.write(to: url)
-            case .svg:
+            } else {
                 let svg = SVGExporter.svg(items: items,
                                           background: model.background,
                                           canvasSize: model.canvasSize,

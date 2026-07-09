@@ -71,6 +71,12 @@ struct InspectorView: View {
                 }
             }
 
+            if layer.isLocked {
+                Label("Layer is locked — transform and painting are disabled.", systemImage: "lock.fill")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             LabeledContent("Scale") {
                 Slider(value: Binding(
                     get: { log2(document.model.layer(id: layer.id)?.transform.scale ?? 1) },
@@ -112,8 +118,15 @@ struct InspectorView: View {
                         }
                     }
                 }
+                Button("Flip H") {
+                    document.flipLayer(id: layer.id, horizontally: true, undoManager: undoManager)
+                }
+                Button("Flip V") {
+                    document.flipLayer(id: layer.id, horizontally: false, undoManager: undoManager)
+                }
             }
         }
+        .disabled(layer.isLocked)
     }
 
     // MARK: - Mask

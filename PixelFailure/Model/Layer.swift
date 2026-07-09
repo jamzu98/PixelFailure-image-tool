@@ -11,6 +11,8 @@ nonisolated struct Layer: Identifiable, Codable, Hashable, Sendable {
     var kind: LayerKind
     /// Optional so documents from before masks existed keep decoding.
     var mask: LayerMask?
+    /// Locked layers can't be moved, transformed, or painted on.
+    var isLocked: Bool
 
     init(id: UUID = UUID(),
          name: String,
@@ -19,7 +21,8 @@ nonisolated struct Layer: Identifiable, Codable, Hashable, Sendable {
          blendMode: LayerBlendMode = .normal,
          transform: LayerTransform,
          kind: LayerKind,
-         mask: LayerMask? = nil) {
+         mask: LayerMask? = nil,
+         isLocked: Bool = false) {
         self.id = id
         self.name = name
         self.isVisible = isVisible
@@ -28,6 +31,25 @@ nonisolated struct Layer: Identifiable, Codable, Hashable, Sendable {
         self.transform = transform
         self.kind = kind
         self.mask = mask
+        self.isLocked = isLocked
+    }
+
+    // Custom decoding so documents saved before isLocked existed still open.
+    private enum CodingKeys: String, CodingKey {
+        case id, name, isVisible, opacity, blendMode, transform, kind, mask, isLocked
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        isVisible = try container.decode(Bool.self, forKey: .isVisible)
+        opacity = try container.decode(Double.self, forKey: .opacity)
+        blendMode = try container.decode(LayerBlendMode.self, forKey: .blendMode)
+        transform = try container.decode(LayerTransform.self, forKey: .transform)
+        kind = try container.decode(LayerKind.self, forKey: .kind)
+        mask = try container.decodeIfPresent(LayerMask.self, forKey: .mask)
+        isLocked = try container.decodeIfPresent(Bool.self, forKey: .isLocked) ?? false
     }
 }
 

@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import ImageIO
 import Testing
 @testable import PixelFailure
 
@@ -313,5 +314,90 @@ struct PaletteNormalizationTests {
 
         let five = BuiltInPalettes.default
         #expect(five.normalized == five)
+    }
+}
+
+// MARK: - Stage 1 (interop) tests
+
+struct ImageEncoderTests {
+    private func sampleImage() -> CGImage? {
+        guard let ctx = CGContext(data: nil, width: 32, height: 32,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.setFillColor(CGColor(srgbRed: 0.8, green: 0.4, blue: 0.2, alpha: 0.5))
+        ctx.fill(CGRect(x: 0, y: 0, width: 32, height: 32))
+        return ctx.makeImage()
+    }
+
+    @Test func encodesAllFormatsDecodably() throws {
+        let image = try #require(sampleImage())
+        for format in ImageEncoder.Format.allCases {
+            let data = try #require(ImageEncoder.encode(image, format: format, quality: 0.8),
+                                    "\(format) failed to encode")
+            let source = try #require(CGImageSourceCreateWithData(data as CFData, nil))
+            let decoded = CGImageSourceCreateImageAtIndex(source, 0, nil)
+            #expect(decoded != nil, "\(format) failed to decode")
+        }
+    }
+
+    @Test func jpegHasNoAlpha() throws {
+        let image = try #require(sampleImage())
+        let data = try #require(ImageEncoder.encode(image, format: .jpeg, quality: 0.9))
+        let source = try #require(CGImageSourceCreateWithData(data as CFData, nil))
+        let decoded = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        #expect(decoded.alphaInfo == .none || decoded.alphaInfo == .noneSkipLast
+                || decoded.alphaInfo == .noneSkipFirst)
+    }
+}
+
+struct FlipAndLockTests {
+    @Test func transformWithoutFlipKeysDecodesToFalse() throws {
+        let json = #"{"position": [10, 20], "scale": 1.5, "rotationDegrees": 30}"#
+        let transform = try JSONDecoder().decode(LayerTransform.self, from: Data(json.utf8))
+        #expect(!transform.flippedHorizontally)
+        #expect(!transform.flippedVertically)
+        #expect(transform.scale == 1.5)
+    }
+
+    @Test func horizontalFlipMirrorsWithinContentBox() {
+        let size = CGSize(width: 100, height: 60)
+        var transform = LayerTransform(position: CGPoint(x: 50, y: 30))
+        transform.flippedHorizontally = true
+        // Local left edge midpoint should land on the right edge.
+        let mapped = CGPoint(x: 0, y: 30).applying(transform.affine(naturalSize: size))
+        #expect(abs(mapped.x - 100) < 0.001)
+        #expect(abs(mapped.y - 30) < 0.001)
+    }
+
+    @Test func layerWithoutLockKeyDecodesUnlocked() throws {
+        var layer = Layer(name: "L", transform: LayerTransform(position: .zero),
+                          kind: .text(TextConfig()))
+        layer.isLocked = true
+        let data = try JSONEncoder().encode(layer)
+        // Round-trip keeps the flag.
+        #expect(try JSONDecoder().decode(Layer.self, from: data).isLocked)
+
+        // A pre-lock manifest (key stripped) decodes to unlocked.
+        var dict = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        dict.removeValue(forKey: "isLocked")
+        let stripped = try JSONSerialization.data(withJSONObject: dict)
+        #expect(try JSONDecoder().decode(Layer.self, from: stripped).isLocked == false)
+    }
+}
+
+struct LayerTransferEncodingTests {
+    /// flattenedPNG is a pasteboard-only representation; it must not bloat
+    /// the persisted JSON payload.
+    @Test func flattenedPNGIsNotPersisted() throws {
+        let transfer = LayerTransfer(layer: Layer(name: "T", transform: LayerTransform(position: .zero),
+                                                  kind: .text(TextConfig())),
+                                     imageData: nil,
+                                     flattenedPNG: Data([1, 2, 3]))
+        let data = try JSONEncoder().encode(transfer)
+        let json = String(decoding: data, as: UTF8.self)
+        #expect(!json.contains("flattenedPNG"))
+        let decoded = try JSONDecoder().decode(LayerTransfer.self, from: data)
+        #expect(decoded.flattenedPNG == nil)
     }
 }

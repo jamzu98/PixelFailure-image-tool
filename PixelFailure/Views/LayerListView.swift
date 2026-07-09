@@ -12,24 +12,32 @@ struct LayerListView: View {
         VStack(spacing: 0) {
             List(selection: selectionBinding) {
                 ForEach(displayedLayers) { layer in
-                    LayerRow(document: document, layer: layer)
+                    LayerRow(document: document, layer: layer, renderStore: renderStore)
                         .tag(layer.id)
                         .contextMenu {
                             Button("Copy") {
-                                document.copyLayer(id: layer.id)
+                                document.copyLayer(id: layer.id, renderStore: renderStore)
                             }
                             Button("Cut") {
-                                document.cutLayer(id: layer.id, undoManager: undoManager)
+                                document.cutLayer(id: layer.id, renderStore: renderStore, undoManager: undoManager)
                                 if editorState.selectedLayerID == layer.id {
                                     editorState.selectedLayerID = nil
                                 }
                             }
                             Button("Paste") {
-                                if let transfer = LayerPasteboard.read() {
+                                switch LayerPasteboard.readAny() {
+                                case .layer(let transfer):
                                     editorState.selectedLayerID = document.pasteLayer(transfer, undoManager: undoManager)
+                                case .image(let data, _):
+                                    if let id = document.addImageLayer(data: data, suggestedName: "Pasted Image",
+                                                                       undoManager: undoManager) {
+                                        editorState.selectedLayerID = id
+                                    }
+                                case nil:
+                                    break
                                 }
                             }
-                            .disabled(!LayerPasteboard.hasLayer)
+                            .disabled(!LayerPasteboard.hasPayload)
                             Divider()
                             Button("Duplicate") {
                                 if let newID = document.duplicateLayer(id: layer.id, undoManager: undoManager) {
@@ -38,6 +46,15 @@ struct LayerListView: View {
                             }
                             Button("Rasterize") {
                                 document.rasterizeLayer(id: layer.id, renderStore: renderStore, undoManager: undoManager)
+                            }
+                            Button("Flip Horizontal") {
+                                document.flipLayer(id: layer.id, horizontally: true, undoManager: undoManager)
+                            }
+                            Button("Flip Vertical") {
+                                document.flipLayer(id: layer.id, horizontally: false, undoManager: undoManager)
+                            }
+                            Button(layer.isLocked ? "Unlock" : "Lock") {
+                                document.toggleLock(id: layer.id, undoManager: undoManager)
                             }
                             Button("Delete", role: .destructive) {
                                 document.deleteLayer(id: layer.id, undoManager: undoManager)
@@ -132,6 +149,7 @@ struct LayerListView: View {
 private struct LayerRow: View {
     @ObservedObject var document: PixelDocument
     let layer: Layer
+    let renderStore: RenderStore
     @Environment(\.undoManager) private var undoManager
     @State private var draftName: String = ""
 
@@ -147,9 +165,20 @@ private struct LayerRow: View {
             }
             .buttonStyle(.borderless)
 
-            Image(systemName: layer.kind.iconName)
-                .foregroundStyle(.secondary)
-                .frame(width: 16)
+            // Content thumbnail with the kind icon as fallback.
+            Group {
+                if let thumbnail = renderStore.thumbnail(for: layer, model: document.model) {
+                    Image(decorative: thumbnail, scale: 1)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                } else {
+                    Image(systemName: layer.kind.iconName)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(width: 28, height: 28)
+            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 4))
+            .overlay(RoundedRectangle(cornerRadius: 4).stroke(.separator, lineWidth: 0.5))
 
             TextField("Layer", text: $draftName)
                 .textFieldStyle(.plain)
@@ -167,6 +196,16 @@ private struct LayerRow: View {
                     .foregroundStyle(.secondary)
                     .help("Has a mask")
             }
+
+            Button {
+                document.toggleLock(id: layer.id, undoManager: undoManager)
+            } label: {
+                Image(systemName: layer.isLocked ? "lock.fill" : "lock.open")
+                    .font(.caption)
+                    .foregroundStyle(layer.isLocked ? .primary : .quaternary)
+            }
+            .buttonStyle(.borderless)
+            .help(layer.isLocked ? "Unlock layer" : "Lock layer")
         }
         .opacity(layer.isVisible ? 1 : 0.55)
         .onAppear { draftName = layer.name }

@@ -189,23 +189,21 @@ extension PixelDocument {
 
     // MARK: - Rasterize
 
-    /// Bakes a layer into pixels: vector layers (pattern/text/fill/shape)
-    /// render at natural size × scale; image layers bake crop + effects.
-    /// Position, rotation, opacity, blend mode, and mask stay live.
+    /// Renders one layer's content, untransformed, into a bitmap at the
+    /// effective on-canvas resolution (capped). Used by rasterize, the
+    /// pasteboard's flattened-PNG representation, and layer thumbnails.
     @MainActor
-    func rasterizeLayer(id: UUID, renderStore: RenderStore, undoManager: UndoManager?) {
-        guard let layer = model.layer(id: id) else { return }
-
+    func layerBitmap(id: UUID, renderStore: RenderStore, maxDimension: Double = 8192,
+                     quality: RenderQuality = .full) -> CGImage? {
+        guard let layer = model.layer(id: id) else { return nil }
         let naturalSize = renderStore.naturalSize(for: layer, model: model)
-        guard naturalSize.width > 0, naturalSize.height > 0 else { return }
+        guard naturalSize.width > 0, naturalSize.height > 0 else { return nil }
 
-        // Bake at the effective on-canvas resolution, capped for sanity.
         let bakeScale = min(max(layer.transform.scale, 0.01),
-                            8192 / Double(max(naturalSize.width, naturalSize.height)))
+                            maxDimension / Double(max(naturalSize.width, naturalSize.height)))
         let pixelSize = CGSize(width: max(1, (naturalSize.width * bakeScale).rounded()),
                                height: max(1, (naturalSize.height * bakeScale).rounded()))
 
-        // Render just this layer's content, untransformed, into a bitmap.
         var flat = layer
         flat.isVisible = true
         flat.opacity = 1
@@ -218,13 +216,24 @@ extension PixelDocument {
         soloModel.background = .clear
         soloModel.canvasSize = naturalSize
 
-        let items = renderStore.renderItems(model: soloModel, quality: .full)
-        guard let baked = PNGExporter.render(items: items,
-                                             background: .clear,
-                                             canvasSize: naturalSize,
-                                             targetPixelSize: pixelSize),
+        let items = renderStore.renderItems(model: soloModel, quality: quality)
+        return PNGExporter.render(items: items,
+                                  background: .clear,
+                                  canvasSize: naturalSize,
+                                  targetPixelSize: pixelSize)
+    }
+
+    /// Bakes a layer into pixels: vector layers (pattern/text/fill/shape)
+    /// render at natural size × scale; image layers bake crop + effects.
+    /// Position, rotation, opacity, blend mode, and mask stay live.
+    @MainActor
+    func rasterizeLayer(id: UUID, renderStore: RenderStore, undoManager: UndoManager?) {
+        guard let layer = model.layer(id: id),
+              let baked = layerBitmap(id: id, renderStore: renderStore),
               let data = PNGExporter.pngData(baked) else { return }
 
+        let pixelSize = CGSize(width: baked.width, height: baked.height)
+        let naturalSize = renderStore.naturalSize(for: layer, model: model)
         let key = storeImage(data: data, fileExtension: "png")
         let newScale = layer.transform.scale * Double(naturalSize.width) / Double(pixelSize.width)
         update(undoManager, actionName: "Rasterize Layer") { model in
@@ -235,25 +244,50 @@ extension PixelDocument {
         }
     }
 
-    // MARK: - Copy / cut / paste
+    // MARK: - Flip / lock
 
-    /// Pasteboard payload for a layer, bundling image bytes for image layers.
     @MainActor
-    func transferPayload(for layerID: UUID) -> LayerTransfer? {
-        guard let layer = model.layer(id: layerID) else { return nil }
-        let data = layer.imageConfig.flatMap { imageData(for: $0.imageKey) }
-        return LayerTransfer(layer: layer, imageData: data)
+    func flipLayer(id: UUID, horizontally: Bool, undoManager: UndoManager?) {
+        update(undoManager, actionName: horizontally ? "Flip Horizontal" : "Flip Vertical") { model in
+            model.modifyLayer(id: id) { layer in
+                if horizontally {
+                    layer.transform.flippedHorizontally.toggle()
+                } else {
+                    layer.transform.flippedVertically.toggle()
+                }
+            }
+        }
     }
 
     @MainActor
-    func copyLayer(id: UUID) {
-        guard let payload = transferPayload(for: id) else { return }
+    func toggleLock(id: UUID, undoManager: UndoManager?) {
+        update(undoManager, actionName: "Lock Layer") { model in
+            model.modifyLayer(id: id) { $0.isLocked.toggle() }
+        }
+    }
+
+    // MARK: - Copy / cut / paste
+
+    /// Pasteboard payload for a layer: the model + image bytes for image
+    /// layers + a flattened PNG so other apps can paste the pixels.
+    @MainActor
+    func transferPayload(for layerID: UUID, renderStore: RenderStore) -> LayerTransfer? {
+        guard let layer = model.layer(id: layerID) else { return nil }
+        let data = layer.imageConfig.flatMap { imageData(for: $0.imageKey) }
+        let png = layerBitmap(id: layerID, renderStore: renderStore, maxDimension: 4096)
+            .flatMap { PNGExporter.pngData($0) }
+        return LayerTransfer(layer: layer, imageData: data, flattenedPNG: png)
+    }
+
+    @MainActor
+    func copyLayer(id: UUID, renderStore: RenderStore) {
+        guard let payload = transferPayload(for: id, renderStore: renderStore) else { return }
         LayerPasteboard.write(payload)
     }
 
     @MainActor
-    func cutLayer(id: UUID, undoManager: UndoManager?) {
-        guard let payload = transferPayload(for: id) else { return }
+    func cutLayer(id: UUID, renderStore: RenderStore, undoManager: UndoManager?) {
+        guard let payload = transferPayload(for: id, renderStore: renderStore) else { return }
         LayerPasteboard.write(payload)
         deleteLayer(id: id, undoManager: undoManager)
     }

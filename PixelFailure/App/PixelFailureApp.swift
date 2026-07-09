@@ -81,6 +81,26 @@ struct LayerCommands: Commands {
             }
             .disabled(focus?.editorState.selectedLayerID == nil)
 
+            Button("Flip Horizontal") {
+                guard let focus, let id = focus.editorState.selectedLayerID else { return }
+                focus.document.flipLayer(id: id, horizontally: true, undoManager: focus.undoManager)
+            }
+            .keyboardShortcut("h", modifiers: [.command, .shift])
+            .disabled(focus?.editorState.selectedLayerID == nil)
+
+            Button("Flip Vertical") {
+                guard let focus, let id = focus.editorState.selectedLayerID else { return }
+                focus.document.flipLayer(id: id, horizontally: false, undoManager: focus.undoManager)
+            }
+            .disabled(focus?.editorState.selectedLayerID == nil)
+
+            Button("Lock/Unlock Layer") {
+                guard let focus, let id = focus.editorState.selectedLayerID else { return }
+                focus.document.toggleLock(id: id, undoManager: focus.undoManager)
+            }
+            .keyboardShortcut("l", modifiers: [.command, .shift])
+            .disabled(focus?.editorState.selectedLayerID == nil)
+
             Menu("Add Mask") {
                 Button("Reveal All") {
                     guard let focus, let id = focus.editorState.selectedLayerID else { return }

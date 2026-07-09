@@ -18,6 +18,8 @@ struct CanvasViewport: View {
     /// Bumped per stamp so the body re-renders during a stroke.
     @State private var paintTick = 0
     @State private var isHoveringViewport = false
+    @State private var viewportSize: CGSize = .zero
+    @State private var scrollMonitor: Any?
     @FocusState private var isFocused: Bool
 
     private enum DragMode {
@@ -65,6 +67,8 @@ struct CanvasViewport: View {
                                      canvasTransform: canvasTransform,
                                      onScaleDrag: { phase in handleScaleDrag(phase, layer: layer, canvasTransform: canvasTransform) },
                                      onRotateDrag: { phase in handleRotateDrag(phase, layer: layer, canvasTransform: canvasTransform) })
+                        .allowsHitTesting(!layer.isLocked)
+                        .opacity(layer.isLocked ? 0.4 : 1)
                 }
 
                 if editorState.activeTool == .crop {
@@ -147,25 +151,82 @@ struct CanvasViewport: View {
             .copyable(copyableItems())
             .cuttable(for: LayerTransfer.self) {
                 guard let id = editorState.selectedLayerID,
-                      let payload = document.transferPayload(for: id) else { return [] }
+                      let payload = document.transferPayload(for: id, renderStore: renderStore) else { return [] }
                 document.deleteLayer(id: id, undoManager: undoManager)
                 editorState.selectedLayerID = nil
                 return [payload]
             }
-            .pasteDestination(for: LayerTransfer.self) { items in
-                for item in items {
-                    editorState.selectedLayerID = document.pasteLayer(item, undoManager: undoManager)
-                }
+            .onPasteCommand(of: [.pixelFailureLayer, .png, .tiff, .fileURL, .image]) { _ in
+                pasteAny()
+            }
+            .onGeometryChange(for: CGSize.self) { proxy in
+                proxy.size
+            } action: { newSize in
+                viewportSize = newSize
             }
         }
         .clipped()
+        .onAppear { installScrollMonitor() }
+        .onDisappear { removeScrollMonitor() }
+    }
+
+    /// Pastes whatever the pasteboard holds: one of our layers, or any
+    /// system image (screenshot, browser copy, Finder file).
+    private func pasteAny() {
+        switch LayerPasteboard.readAny() {
+        case .layer(let transfer):
+            editorState.selectedLayerID = document.pasteLayer(transfer, undoManager: undoManager)
+        case .image(let data, _):
+            if let id = document.addImageLayer(data: data, suggestedName: "Pasted Image", undoManager: undoManager) {
+                editorState.selectedLayerID = id
+            }
+        case nil:
+            break
+        }
+    }
+
+    // MARK: - Scroll navigation
+
+    /// Two-finger scroll pans; ⌥- or ⌘-scroll zooms anchored at the pointer.
+    private func installScrollMonitor() {
+        guard scrollMonitor == nil else { return }
+        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
+            guard isHoveringViewport else { return event }
+            // Read the live keyboard state too: some event streams (and
+            // synthetic events) don't stamp flags on every scroll tick.
+            let modifiers = event.modifierFlags.union(NSEvent.modifierFlags)
+            if modifiers.contains(.option) || modifiers.contains(.command) {
+                let currentScale = effectiveZoom(viewSize: viewportSize)
+                let factor = 1 + event.scrollingDeltaY * 0.01
+                let newScale = min(max(currentScale * factor, 0.02), 12)
+                // Keep the canvas point under the pointer stationary.
+                let canvas = document.model.canvasSize
+                let transform = canvasTransform(viewSize: viewportSize, scale: currentScale)
+                guard transform.isInvertible else { return nil }
+                let canvasPoint = hoverLocation.applying(transform.inverted())
+                pan = CGSize(width: (hoverLocation.x - canvasPoint.x * newScale) - (viewportSize.width - canvas.width * newScale) / 2,
+                             height: (hoverLocation.y - canvasPoint.y * newScale) - (viewportSize.height - canvas.height * newScale) / 2)
+                zoomLevel = newScale
+            } else {
+                pan = CGSize(width: pan.width + event.scrollingDeltaX,
+                             height: pan.height + event.scrollingDeltaY)
+            }
+            return nil
+        }
+    }
+
+    private func removeScrollMonitor() {
+        if let scrollMonitor {
+            NSEvent.removeMonitor(scrollMonitor)
+        }
+        scrollMonitor = nil
     }
 
     // MARK: - Copy / paste / context menu
 
     private func copyableItems() -> [LayerTransfer] {
         guard let id = editorState.selectedLayerID,
-              let payload = document.transferPayload(for: id) else { return [] }
+              let payload = document.transferPayload(for: id, renderStore: renderStore) else { return [] }
         return [payload]
     }
 
@@ -180,10 +241,10 @@ struct CanvasViewport: View {
             Section(layer.name) {
                 Button("Copy") {
                     editorState.selectedLayerID = layer.id
-                    document.copyLayer(id: layer.id)
+                    document.copyLayer(id: layer.id, renderStore: renderStore)
                 }
                 Button("Cut") {
-                    document.cutLayer(id: layer.id, undoManager: undoManager)
+                    document.cutLayer(id: layer.id, renderStore: renderStore, undoManager: undoManager)
                     if editorState.selectedLayerID == layer.id { editorState.selectedLayerID = nil }
                 }
                 Button("Duplicate") {
@@ -196,11 +257,9 @@ struct CanvasViewport: View {
         }
 
         Button("Paste") {
-            if let transfer = LayerPasteboard.read() {
-                editorState.selectedLayerID = document.pasteLayer(transfer, undoManager: undoManager)
-            }
+            pasteAny()
         }
-        .disabled(!LayerPasteboard.hasLayer)
+        .disabled(!LayerPasteboard.hasPayload)
 
         if let layer = target {
             Divider()
@@ -209,6 +268,15 @@ struct CanvasViewport: View {
                 Button("Bring Forward") { document.reorderLayer(id: layer.id, offset: 1, undoManager: undoManager) }
                 Button("Send Backward") { document.reorderLayer(id: layer.id, offset: -1, undoManager: undoManager) }
                 Button("Send to Back") { document.reorderLayer(id: layer.id, offset: .min, undoManager: undoManager) }
+            }
+            Button("Flip Horizontal") {
+                document.flipLayer(id: layer.id, horizontally: true, undoManager: undoManager)
+            }
+            Button("Flip Vertical") {
+                document.flipLayer(id: layer.id, horizontally: false, undoManager: undoManager)
+            }
+            Button(layer.isLocked ? "Unlock" : "Lock") {
+                document.toggleLock(id: layer.id, undoManager: undoManager)
             }
             Button(layer.isVisible ? "Hide" : "Show") {
                 document.update(undoManager, actionName: layer.isVisible ? "Hide Layer" : "Show Layer") { model in
@@ -336,7 +404,8 @@ struct CanvasViewport: View {
     }
 
     private func moveCursor(at location: CGPoint, canvasTransform: CGAffineTransform) -> NSCursor {
-        guard let layer = document.model.layer(id: editorState.selectedLayerID) else { return .arrow }
+        guard let layer = document.model.layer(id: editorState.selectedLayerID),
+              !layer.isLocked else { return .arrow }
         let naturalSize = renderStore.naturalSize(for: layer, model: document.model)
         let corners = layer.transform.corners(naturalSize: naturalSize).map { $0.applying(canvasTransform) }
 
@@ -426,8 +495,9 @@ struct CanvasViewport: View {
             paintSession = PaintSession(target: .mask(layerID: maskID), base: base, pixelSize: mask.pixelSize)
         } else {
             var targetID = editorState.selectedLayerID
-            let isImage = document.model.layer(id: targetID ?? UUID())?.kind.isImage ?? false
-            if !isImage {
+            let targetLayer = document.model.layer(id: targetID ?? UUID())
+            let paintable = (targetLayer?.kind.isImage ?? false) && targetLayer?.isLocked != true
+            if !paintable {
                 targetID = document.addPaintLayer(undoManager: undoManager)
                 editorState.selectedLayerID = targetID
             }
@@ -671,7 +741,7 @@ struct CanvasViewport: View {
     // MARK: - Selection & snapping
 
     private func hitTest(_ canvasPoint: CGPoint) -> Layer? {
-        for layer in document.model.layers.reversed() where layer.isVisible {
+        for layer in document.model.layers.reversed() where layer.isVisible && !layer.isLocked {
             let naturalSize = renderStore.naturalSize(for: layer, model: document.model)
             if layer.transform.contains(canvasPoint, naturalSize: naturalSize) {
                 return layer
@@ -701,7 +771,8 @@ struct CanvasViewport: View {
     }
 
     private func nudgeSelection(_ press: KeyPress) -> KeyPress.Result {
-        guard let id = editorState.selectedLayerID else { return .ignored }
+        guard let id = editorState.selectedLayerID,
+              document.model.layer(id: id)?.isLocked != true else { return .ignored }
         let step: CGFloat = press.modifiers.contains(.shift)
             ? document.model.canvasSize.width * 0.01
             : document.model.canvasSize.width * 0.001
