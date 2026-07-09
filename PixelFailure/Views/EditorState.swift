@@ -2,13 +2,16 @@ import SwiftUI
 
 /// The viewport tools, Photoshop-style.
 enum EditorTool: String, CaseIterable, Identifiable {
-    case move, hand, zoom, eyedropper, brush, eraser, crop
+    case move, marquee, lasso, wand, hand, zoom, eyedropper, brush, eraser, crop
 
     var id: String { rawValue }
 
     var displayName: String {
         switch self {
         case .move: "Move"
+        case .marquee: "Marquee Select"
+        case .lasso: "Lasso Select"
+        case .wand: "Magic Wand"
         case .hand: "Hand"
         case .zoom: "Zoom"
         case .eyedropper: "Eyedropper"
@@ -21,6 +24,9 @@ enum EditorTool: String, CaseIterable, Identifiable {
     var systemImage: String {
         switch self {
         case .move: "cursorarrow"
+        case .marquee: "rectangle.dashed"
+        case .lasso: "lasso"
+        case .wand: "wand.and.rays"
         case .hand: "hand.raised"
         case .zoom: "magnifyingglass"
         case .eyedropper: "eyedropper"
@@ -33,6 +39,9 @@ enum EditorTool: String, CaseIterable, Identifiable {
     var shortcutKey: Character {
         switch self {
         case .move: "v"
+        case .marquee: "m"
+        case .lasso: "l"
+        case .wand: "w"
         case .hand: "h"
         case .zoom: "z"
         case .eyedropper: "i"
@@ -40,6 +49,10 @@ enum EditorTool: String, CaseIterable, Identifiable {
         case .eraser: "e"
         case .crop: "c"
         }
+    }
+
+    var isSelectionTool: Bool {
+        self == .marquee || self == .lasso || self == .wand
     }
 }
 
@@ -74,6 +87,24 @@ final class EditorState {
 
     /// In-flight crop rectangle in canvas coordinates (crop tool).
     var cropDraft: CGRect?
+
+    // MARK: Selections
+
+    /// The active selection (canvas space). Session state, like in most
+    /// editors — not part of the document.
+    var selection: CanvasSelection?
+    /// Live preview path while a marquee/lasso gesture is in flight.
+    var selectionDraft: Path?
+    /// Vertices collected by the polygonal lasso (nil = not building one).
+    var lassoVertices: [CGPoint]?
+    /// Marquee shape: false = rectangle, true = ellipse.
+    var marqueeEllipse = false
+    /// Lasso mode: false = freehand, true = polygonal (click to add points).
+    var lassoPolygonal = false
+    /// Magic wand color tolerance (0...1).
+    var wandTolerance = 0.25
+    /// Feather (canvas px) applied to newly created selections.
+    var featherDefault = 0.0
 }
 
 /// Lets app-level menu commands reach the focused window's editor context.

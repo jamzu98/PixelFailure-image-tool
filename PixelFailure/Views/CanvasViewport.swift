@@ -28,6 +28,8 @@ struct CanvasViewport: View {
         case scale(layerID: UUID, startScale: Double, startDistance: CGFloat)
         case rotate(layerID: UUID, startRotation: Double, startAngle: Double)
         case paint
+        case marquee(startCanvasPoint: CGPoint)
+        case lassoFreehand(points: [CGPoint])
     }
 
     var body: some View {
@@ -71,6 +73,11 @@ struct CanvasViewport: View {
                         .opacity(layer.isLocked ? 0.4 : 1)
                 }
 
+                SelectionAntsView(editorState: editorState,
+                                  canvasTransform: canvasTransform,
+                                  scale: scale,
+                                  hoverCanvasPoint: hoverLocation.applying(canvasTransform.inverted()))
+
                 if editorState.activeTool == .crop {
                     CropOverlay(document: document,
                                 editorState: editorState,
@@ -92,12 +99,25 @@ struct CanvasViewport: View {
                 nudgeSelection(press)
             }
             .onKeyPress(.delete) {
+                // With a selection over an image layer, delete clears pixels;
+                // otherwise it deletes the layer (move tool only).
+                if let selection = editorState.selection,
+                   let layer = document.model.layer(id: editorState.selectedLayerID),
+                   layer.kind.isImage, !layer.isLocked {
+                    document.deletePixels(selection: selection, layerID: layer.id,
+                                          renderStore: renderStore, undoManager: undoManager)
+                    return .handled
+                }
                 guard editorState.activeTool == .move, let id = editorState.selectedLayerID else { return .ignored }
                 document.deleteLayer(id: id, undoManager: undoManager)
                 editorState.selectedLayerID = nil
                 return .handled
             }
             .onKeyPress(.escape) {
+                if editorState.lassoVertices != nil {
+                    editorState.lassoVertices = nil
+                    return .handled
+                }
                 if editorState.activeTool == .crop {
                     cancelCrop()
                     return .handled
@@ -107,11 +127,19 @@ struct CanvasViewport: View {
                     editorState.activeTool = .move
                     return .handled
                 }
+                if editorState.selection != nil {
+                    editorState.selection = nil
+                    return .handled
+                }
                 guard editorState.selectedLayerID != nil else { return .ignored }
                 editorState.selectedLayerID = nil
                 return .handled
             }
             .onKeyPress(.return) {
+                if editorState.lassoVertices != nil {
+                    closePolygonalLasso()
+                    return .handled
+                }
                 guard editorState.activeTool == .crop, editorState.cropDraft != nil else { return .ignored }
                 applyCrop()
                 return .handled
@@ -322,8 +350,16 @@ struct CanvasViewport: View {
                     case .brush, .eraser:
                         dragMode = .paint
                         startPaintSession()
-                    case .hand, .zoom, .eyedropper, .crop:
+                    case .hand, .zoom, .eyedropper, .crop, .wand:
                         dragMode = .pan(startPan: pan)
+                    case .marquee:
+                        dragMode = .marquee(startCanvasPoint: value.startLocation.applying(canvasTransform.inverted()))
+                    case .lasso:
+                        if editorState.lassoPolygonal {
+                            dragMode = .pan(startPan: pan)
+                        } else {
+                            dragMode = .lassoFreehand(points: [value.startLocation.applying(canvasTransform.inverted())])
+                        }
                     case .move:
                         let canvasPoint = value.startLocation.applying(canvasTransform.inverted())
                         if let hit = hitTest(canvasPoint) {
@@ -351,6 +387,22 @@ struct CanvasViewport: View {
                     }
                 case .paint:
                     extendPaintStroke(to: value.location, canvasTransform: canvasTransform)
+                case .marquee(let start):
+                    let current = value.location.applying(canvasTransform.inverted())
+                    editorState.selectionDraft = marqueePath(from: start, to: current)
+                case .lassoFreehand(var points):
+                    let current = value.location.applying(canvasTransform.inverted())
+                    if let last = points.last, hypot(current.x - last.x, current.y - last.y) > 2 / scale {
+                        points.append(current)
+                        dragMode = .lassoFreehand(points: points)
+                    }
+                    var preview = Path()
+                    if let first = points.first {
+                        preview.move(to: first)
+                        for point in points.dropFirst() { preview.addLine(to: point) }
+                        preview.closeSubpath()
+                    }
+                    editorState.selectionDraft = preview
                 default:
                     break
                 }
@@ -361,6 +413,19 @@ struct CanvasViewport: View {
                     document.endGesture(undoManager, actionName: "Move Layer")
                 case .paint:
                     commitPaintSession()
+                case .marquee(let start):
+                    let end = value.location.applying(canvasTransform.inverted())
+                    editorState.selectionDraft = nil
+                    commitSelectionPath(marqueePath(from: start, to: end))
+                case .lassoFreehand(let points):
+                    editorState.selectionDraft = nil
+                    if points.count >= 3 {
+                        var path = Path()
+                        path.move(to: points[0])
+                        for point in points.dropFirst() { path.addLine(to: point) }
+                        path.closeSubpath()
+                        commitSelectionPath(path)
+                    }
                 case .pan, .none:
                     if editorState.activeTool == .hand { setCursor(.openHand) }
                     // A drag that never moved far acts as a click-select.
@@ -373,6 +438,70 @@ struct CanvasViewport: View {
                 }
                 dragMode = nil
             }
+    }
+
+    // MARK: - Selection gestures
+
+    private func marqueePath(from start: CGPoint, to end: CGPoint) -> Path {
+        let rect = CGRect(x: min(start.x, end.x), y: min(start.y, end.y),
+                          width: abs(end.x - start.x), height: abs(end.y - start.y))
+        return editorState.marqueeEllipse ? Path(ellipseIn: rect) : Path(rect)
+    }
+
+    private func commitSelectionPath(_ path: Path) {
+        editorState.selection = CanvasSelection.combine(existing: editorState.selection,
+                                                        new: path,
+                                                        modifiers: NSEvent.modifierFlags,
+                                                        feather: editorState.featherDefault)
+    }
+
+    /// Polygonal lasso: click adds vertices; clicking near the first vertex
+    /// or pressing Return closes; Esc cancels.
+    private func polygonalLassoClick(at canvasPoint: CGPoint, scale: CGFloat) {
+        if var vertices = editorState.lassoVertices {
+            if let first = vertices.first, vertices.count >= 3,
+               hypot(canvasPoint.x - first.x, canvasPoint.y - first.y) < 8 / scale {
+                closePolygonalLasso()
+                return
+            }
+            vertices.append(canvasPoint)
+            editorState.lassoVertices = vertices
+        } else {
+            editorState.lassoVertices = [canvasPoint]
+        }
+    }
+
+    private func closePolygonalLasso() {
+        guard let vertices = editorState.lassoVertices, vertices.count >= 3 else {
+            editorState.lassoVertices = nil
+            return
+        }
+        var path = Path()
+        path.move(to: vertices[0])
+        for point in vertices.dropFirst() { path.addLine(to: point) }
+        path.closeSubpath()
+        editorState.lassoVertices = nil
+        commitSelectionPath(path)
+    }
+
+    private func wandClick(at canvasPoint: CGPoint) {
+        let model = document.model
+        guard canvasPoint.x >= 0, canvasPoint.y >= 0,
+              canvasPoint.x <= model.canvasSize.width, canvasPoint.y <= model.canvasSize.height else { return }
+        let items = renderStore.renderItems(model: model, quality: .preview)
+        let maxDim = 1024.0
+        let sampleScale = min(1, maxDim / Double(max(model.canvasSize.width, model.canvasSize.height)))
+        let target = CGSize(width: max(8, model.canvasSize.width * sampleScale),
+                            height: max(8, model.canvasSize.height * sampleScale))
+        guard let flat = PNGExporter.render(items: items,
+                                            background: model.background,
+                                            canvasSize: model.canvasSize,
+                                            targetPixelSize: target),
+              let path = MagicWand.select(at: canvasPoint,
+                                          tolerance: editorState.wandTolerance,
+                                          composite: flat,
+                                          canvasSize: model.canvasSize) else { return }
+        commitSelectionPath(path)
     }
 
     // MARK: - Cursor
@@ -394,6 +523,8 @@ struct CanvasViewport: View {
             return NSEvent.modifierFlags.contains(.option) ? .zoomOut : .zoomIn
         case .eyedropper:
             return Cursors.eyedropper
+        case .marquee, .lasso, .wand:
+            return .crosshair
         case .brush, .eraser:
             return Cursors.brush(diameter: editorState.brush.size * scale)
         case .crop:
@@ -467,7 +598,11 @@ struct CanvasViewport: View {
             startPaintSession()
             extendPaintStroke(to: location, canvasTransform: canvasTransform)
             commitPaintSession()
-        case .hand, .crop:
+        case .lasso where editorState.lassoPolygonal:
+            polygonalLassoClick(at: canvasPoint, scale: scale)
+        case .wand:
+            wandClick(at: canvasPoint)
+        case .hand, .crop, .marquee, .lasso:
             break
         }
     }
@@ -492,7 +627,17 @@ struct CanvasViewport: View {
            let layer = document.model.layer(id: maskID),
            let mask = layer.mask {
             let base = renderStore.originalImage(key: mask.imageKey)
-            paintSession = PaintSession(target: .mask(layerID: maskID), base: base, pixelSize: mask.pixelSize)
+            var clip: CGPath?
+            if let selection = editorState.selection {
+                let naturalSize = renderStore.naturalSize(for: layer, model: document.model)
+                if var t = SelectionRasterizer.canvasToLocalBuffer(layer: layer,
+                                                                   naturalSize: naturalSize,
+                                                                   bufferPixelSize: mask.pixelSize) {
+                    clip = selection.path.cgPath.copy(using: &t)
+                }
+            }
+            paintSession = PaintSession(target: .mask(layerID: maskID), base: base,
+                                        pixelSize: mask.pixelSize, clipPath: clip)
         } else {
             var targetID = editorState.selectedLayerID
             let targetLayer = document.model.layer(id: targetID ?? UUID())
@@ -505,7 +650,17 @@ struct CanvasViewport: View {
                   let layer = document.model.layer(id: id),
                   let config = layer.imageConfig else { return }
             let base = renderStore.originalImage(key: config.imageKey)
-            paintSession = PaintSession(target: .content(layerID: id), base: base, pixelSize: config.pixelSize)
+            var clip: CGPath?
+            if let selection = editorState.selection {
+                let naturalSize = renderStore.naturalSize(for: layer, model: document.model)
+                if var t = SelectionRasterizer.canvasToContentBuffer(layer: layer,
+                                                                     naturalSize: naturalSize,
+                                                                     config: config) {
+                    clip = selection.path.cgPath.copy(using: &t)
+                }
+            }
+            paintSession = PaintSession(target: .content(layerID: id), base: base,
+                                        pixelSize: config.pixelSize, clipPath: clip)
         }
         renderStore.activePaintSession = paintSession
     }

@@ -106,6 +106,48 @@ struct ToolOptionsBar: View {
                     .foregroundStyle(.secondary)
             case .eyedropper:
                 eyedropperOptions
+            case .marquee:
+                Picker("", selection: Binding(
+                    get: { editorState.marqueeEllipse },
+                    set: { editorState.marqueeEllipse = $0 }
+                )) {
+                    Text("Rectangle").tag(false)
+                    Text("Ellipse").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 160)
+                featherControl
+                selectionHint
+            case .lasso:
+                Picker("", selection: Binding(
+                    get: { editorState.lassoPolygonal },
+                    set: { editorState.lassoPolygonal = $0 }
+                )) {
+                    Text("Freehand").tag(false)
+                    Text("Polygonal").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 160)
+                featherControl
+                if editorState.lassoPolygonal {
+                    Text("Click to add points · Return or click the start to close · Esc cancels.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    selectionHint
+                }
+            case .wand:
+                HStack(spacing: 4) {
+                    Text("Tolerance")
+                        .font(.caption)
+                    Slider(value: Binding(
+                        get: { editorState.wandTolerance },
+                        set: { editorState.wandTolerance = $0 }
+                    ), in: 0.02...0.9)
+                    .frame(width: 110)
+                }
+                featherControl
+                selectionHint
             case .move:
                 Text("Click to select · drag to move · handles scale and rotate · Esc deselects.")
                     .font(.caption)
@@ -124,6 +166,32 @@ struct ToolOptionsBar: View {
         .frame(maxWidth: .infinity)
         .background(.bar)
         .clipped()
+    }
+
+    /// Feather applies to the current selection immediately and becomes the
+    /// default for the next one.
+    private var featherControl: some View {
+        HStack(spacing: 4) {
+            Text("Feather")
+                .font(.caption)
+            Slider(value: Binding(
+                get: { editorState.selection?.feather ?? editorState.featherDefault },
+                set: { newValue in
+                    editorState.featherDefault = newValue
+                    editorState.selection?.feather = newValue
+                }
+            ), in: 0...80)
+            .frame(width: 100)
+            Text("\(Int((editorState.selection?.feather ?? editorState.featherDefault).rounded()))")
+                .font(.caption.monospacedDigit())
+                .frame(width: 24, alignment: .leading)
+        }
+    }
+
+    private var selectionHint: some View {
+        Text("⇧ adds · ⌥ subtracts · Esc deselects.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
     }
 
     @ViewBuilder

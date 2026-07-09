@@ -9,6 +9,7 @@ struct PixelFailureApp: App {
         .commands {
             EditorCommands()
             LayerCommands()
+            SelectCommands()
         }
     }
 }
@@ -23,6 +24,115 @@ struct EditorCommands: Commands {
             }
             .keyboardShortcut("a", modifiers: [.command, .shift])
             .disabled(focus?.editorState.selectedLayerID == nil)
+        }
+    }
+}
+
+struct SelectCommands: Commands {
+    @FocusedValue(\.editorFocus) private var focus
+
+    private var hasSelection: Bool { focus?.editorState.selection != nil }
+    private var selectedImageLayer: Layer? {
+        guard let focus,
+              let layer = focus.document.model.layer(id: focus.editorState.selectedLayerID),
+              layer.kind.isImage, !layer.isLocked else { return nil }
+        return layer
+    }
+
+    var body: some Commands {
+        CommandMenu("Select") {
+            Button("Select All") {
+                guard let focus else { return }
+                focus.editorState.selection = .all(canvasSize: focus.document.model.canvasSize)
+            }
+            .disabled(focus == nil)
+
+            Button("Deselect") {
+                focus?.editorState.selection = nil
+            }
+            .disabled(!hasSelection)
+
+            Button("Invert Selection") {
+                guard let focus, let selection = focus.editorState.selection else { return }
+                focus.editorState.selection = selection.inverted(canvasSize: focus.document.model.canvasSize)
+            }
+            .keyboardShortcut("i", modifiers: [.command, .shift])
+            .disabled(!hasSelection)
+
+            Divider()
+
+            Menu("Feather") {
+                ForEach([0.0, 2, 5, 10, 25, 50], id: \.self) { radius in
+                    Button(radius == 0 ? "None" : "\(Int(radius)) px") {
+                        focus?.editorState.selection?.feather = radius
+                        focus?.editorState.featherDefault = radius
+                    }
+                }
+            }
+            .disabled(!hasSelection)
+
+            Menu("Expand") {
+                ForEach([2.0, 5, 10, 25, 50], id: \.self) { amount in
+                    Button("\(Int(amount)) px") {
+                        guard let focus, let selection = focus.editorState.selection else { return }
+                        focus.editorState.selection = SelectionTransforms.offset(
+                            selection, by: amount, canvasSize: focus.document.model.canvasSize)
+                    }
+                }
+            }
+            .disabled(!hasSelection)
+
+            Menu("Contract") {
+                ForEach([2.0, 5, 10, 25, 50], id: \.self) { amount in
+                    Button("\(Int(amount)) px") {
+                        guard let focus, let selection = focus.editorState.selection else { return }
+                        focus.editorState.selection = SelectionTransforms.offset(
+                            selection, by: -amount, canvasSize: focus.document.model.canvasSize)
+                    }
+                }
+            }
+            .disabled(!hasSelection)
+
+            Divider()
+
+            Button("New Layer from Selection") {
+                guard let focus, let selection = focus.editorState.selection,
+                      let layer = selectedImageLayer else { return }
+                if let id = focus.document.layerFromSelection(selection, layerID: layer.id,
+                                                              renderStore: focus.renderStore,
+                                                              undoManager: focus.undoManager) {
+                    focus.editorState.selectedLayerID = id
+                }
+            }
+            .disabled(!hasSelection || selectedImageLayer == nil)
+
+            Button("Mask from Selection") {
+                guard let focus, let selection = focus.editorState.selection,
+                      let id = focus.editorState.selectedLayerID else { return }
+                focus.document.maskFromSelection(selection, layerID: id,
+                                                 renderStore: focus.renderStore,
+                                                 undoManager: focus.undoManager)
+            }
+            .disabled(!hasSelection || focus?.editorState.selectedLayerID == nil)
+
+            Button("Fill Selection with Brush Color") {
+                guard let focus, let selection = focus.editorState.selection,
+                      let layer = selectedImageLayer else { return }
+                focus.document.fillPixels(selection: selection, layerID: layer.id,
+                                          color: focus.editorState.brush.color,
+                                          renderStore: focus.renderStore,
+                                          undoManager: focus.undoManager)
+            }
+            .disabled(!hasSelection || selectedImageLayer == nil)
+
+            Button("Delete Selected Pixels") {
+                guard let focus, let selection = focus.editorState.selection,
+                      let layer = selectedImageLayer else { return }
+                focus.document.deletePixels(selection: selection, layerID: layer.id,
+                                            renderStore: focus.renderStore,
+                                            undoManager: focus.undoManager)
+            }
+            .disabled(!hasSelection || selectedImageLayer == nil)
         }
     }
 }

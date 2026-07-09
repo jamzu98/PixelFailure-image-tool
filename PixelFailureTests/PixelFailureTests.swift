@@ -1,6 +1,7 @@
 import CoreGraphics
 import Foundation
 import ImageIO
+import SwiftUI
 import Testing
 @testable import PixelFailure
 
@@ -399,5 +400,181 @@ struct LayerTransferEncodingTests {
         #expect(!json.contains("flattenedPNG"))
         let decoded = try JSONDecoder().decode(LayerTransfer.self, from: data)
         #expect(decoded.flattenedPNG == nil)
+    }
+}
+
+// MARK: - Stage 2 (selections) tests
+
+@MainActor
+struct SelectionTests {
+    @Test func booleanCombineAndInvert() {
+        let a = CanvasSelection(path: Path(CGRect(x: 0, y: 0, width: 100, height: 100)))
+        let union = a.union(Path(CGRect(x: 50, y: 0, width: 100, height: 100)))
+        #expect(abs(union.bounds.width - 150) < 1)
+
+        let subtracted = a.subtracting(Path(CGRect(x: -10, y: -10, width: 200, height: 200)))
+        #expect(subtracted.isEmpty)
+
+        let inverted = a.inverted(canvasSize: CGSize(width: 400, height: 400))
+        #expect(!inverted.contains(CGPoint(x: 50, y: 50)))
+        #expect(inverted.contains(CGPoint(x: 300, y: 300)))
+    }
+
+    @Test func grayMaskIsWhiteInsideBlackOutside() throws {
+        let selection = CanvasSelection(path: Path(CGRect(x: 0, y: 0, width: 50, height: 100)))
+        let mask = try #require(SelectionRasterizer.grayMask(
+            selection: selection,
+            transform: .identity,
+            pixelSize: CGSize(width: 100, height: 100)))
+        let sampler = try #require(ImageSampler(cgImage: mask, maxDimension: 100))
+        // Left half selected (transform has no flip, but left/right is
+        // unaffected by vertical orientation).
+        #expect(sampler.luminance(atUnitX: 0.25, y: 0.5) > 0.9)
+        #expect(sampler.luminance(atUnitX: 0.75, y: 0.5) < 0.1)
+    }
+
+    @Test func contourTracerRoundTripsARectangle() throws {
+        let width = 20, height = 20
+        var grid = [Bool](repeating: false, count: width * height)
+        for y in 5..<15 {
+            for x in 3..<12 {
+                grid[y * width + x] = true
+            }
+        }
+        let path = try #require(ContourTracer.trace(grid: grid, width: width, height: height,
+                                                    scale: CGPoint(x: 10, y: 10)))
+        let bounds = path.boundingRect
+        #expect(abs(bounds.minX - 30) < 0.01)
+        #expect(abs(bounds.minY - 50) < 0.01)
+        #expect(abs(bounds.width - 90) < 0.01)
+        #expect(abs(bounds.height - 100) < 0.01)
+        #expect(path.contains(CGPoint(x: 70, y: 100), eoFill: true))
+        #expect(!path.contains(CGPoint(x: 10, y: 10), eoFill: true))
+    }
+
+    @Test func magicWandSelectsAContiguousColorRegion() throws {
+        // Left half red, right half blue.
+        let size = 100
+        let ctx = try #require(CGContext(data: nil, width: size, height: size,
+                                         bitsPerComponent: 8, bytesPerRow: 0,
+                                         space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        ctx.setFillColor(CGColor(srgbRed: 1, green: 0, blue: 0, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: size / 2, height: size))
+        ctx.setFillColor(CGColor(srgbRed: 0, green: 0, blue: 1, alpha: 1))
+        ctx.fill(CGRect(x: size / 2, y: 0, width: size / 2, height: size))
+        let image = try #require(ctx.makeImage())
+
+        let canvasSize = CGSize(width: 1000, height: 1000)
+        let path = try #require(MagicWand.select(at: CGPoint(x: 250, y: 500),
+                                                 tolerance: 0.2,
+                                                 composite: image,
+                                                 canvasSize: canvasSize))
+        let bounds = path.boundingRect
+        #expect(bounds.width < 520)   // roughly the left half only
+        #expect(bounds.height > 950)  // full height
+        #expect(path.contains(CGPoint(x: 100, y: 500), eoFill: true))
+        #expect(!path.contains(CGPoint(x: 800, y: 500), eoFill: true))
+    }
+
+    @Test func expandGrowsAndContractShrinks() throws {
+        let selection = CanvasSelection(path: Path(CGRect(x: 400, y: 400, width: 200, height: 200)))
+        let canvasSize = CGSize(width: 1000, height: 1000)
+        let expanded = try #require(SelectionTransforms.offset(selection, by: 50, canvasSize: canvasSize))
+        #expect(expanded.bounds.width > 260)
+        let contracted = try #require(SelectionTransforms.offset(selection, by: -50, canvasSize: canvasSize))
+        #expect(contracted.bounds.width < 140)
+    }
+}
+
+@MainActor
+struct SelectionPixelOpsTests {
+    @Test func deletePixelsClearsSelectedRegion() throws {
+        let document = PixelDocument()
+        let store = RenderStore(document: document)
+
+        // A solid red 100x100 image layer centered on a 1000x1000 canvas at 2x.
+        let ctx = try #require(CGContext(data: nil, width: 100, height: 100,
+                                         bitsPerComponent: 8, bytesPerRow: 0,
+                                         space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        ctx.setFillColor(CGColor(srgbRed: 1, green: 0, blue: 0, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: 100, height: 100))
+        let red = try #require(ctx.makeImage())
+        let png = try #require(PNGExporter.pngData(red))
+        let key = document.storeImage(data: png, fileExtension: "png")
+
+        let layer = Layer(name: "Red",
+                          transform: LayerTransform(position: CGPoint(x: 500, y: 500), scale: 2),
+                          kind: .image(ImageConfig(imageKey: key,
+                                                   pixelSize: CGSize(width: 100, height: 100))))
+        document.update(nil) { model in
+            model.canvasSize = CGSize(width: 1000, height: 1000)
+            model.layers = [layer]
+        }
+
+        // Select the layer's left half in canvas coords: x 400...500.
+        let selection = CanvasSelection(path: Path(CGRect(x: 400, y: 400, width: 100, height: 200)))
+        document.deletePixels(selection: selection, layerID: layer.id,
+                              renderStore: store, undoManager: nil)
+
+        let newKey = try #require(document.model.layer(id: layer.id)?.imageConfig?.imageKey)
+        #expect(newKey != key, "imageKey should change after delete")
+        let newData = try #require(document.imageData(for: newKey))
+        let source = try #require(CGImageSourceCreateWithData(newData as CFData, nil))
+        let result = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        let sampler = try #require(ImageSampler(cgImage: result, maxDimension: 100))
+        // Left half cleared, right half still red.
+        #expect(sampler.color(atUnitX: 0.25, y: 0.5).a < 0.1,
+                "left half should be transparent, got \(sampler.color(atUnitX: 0.25, y: 0.5))")
+        #expect(sampler.color(atUnitX: 0.75, y: 0.5).a > 0.9,
+                "right half should stay opaque")
+    }
+}
+
+@MainActor
+struct SelectionFlippedLayerTests {
+    @Test func deletePixelsRespectsFlippedLayers() throws {
+        let document = PixelDocument()
+        let store = RenderStore(document: document)
+
+        // Left half red, right half green, so we can verify mirroring.
+        let ctx = try #require(CGContext(data: nil, width: 100, height: 100,
+                                         bitsPerComponent: 8, bytesPerRow: 0,
+                                         space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        ctx.setFillColor(CGColor(srgbRed: 1, green: 0, blue: 0, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: 50, height: 100))
+        ctx.setFillColor(CGColor(srgbRed: 0, green: 1, blue: 0, alpha: 1))
+        ctx.fill(CGRect(x: 50, y: 0, width: 50, height: 100))
+        let image = try #require(ctx.makeImage())
+        let png = try #require(PNGExporter.pngData(image))
+        let key = document.storeImage(data: png, fileExtension: "png")
+
+        var transform = LayerTransform(position: CGPoint(x: 500, y: 500), scale: 2)
+        transform.flippedHorizontally = true
+        let layer = Layer(name: "Two-tone", transform: transform,
+                          kind: .image(ImageConfig(imageKey: key,
+                                                   pixelSize: CGSize(width: 100, height: 100))))
+        document.update(nil) { model in
+            model.canvasSize = CGSize(width: 1000, height: 1000)
+            model.layers = [layer]
+        }
+
+        // On canvas, the flipped layer shows GREEN on the left (400...500).
+        // Deleting the canvas-left half must clear the buffer's RIGHT half.
+        let selection = CanvasSelection(path: Path(CGRect(x: 400, y: 400, width: 100, height: 200)))
+        document.deletePixels(selection: selection, layerID: layer.id,
+                              renderStore: store, undoManager: nil)
+
+        let newKey = try #require(document.model.layer(id: layer.id)?.imageConfig?.imageKey)
+        let newData = try #require(document.imageData(for: newKey))
+        let source = try #require(CGImageSourceCreateWithData(newData as CFData, nil))
+        let result = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        let sampler = try #require(ImageSampler(cgImage: result, maxDimension: 100))
+        #expect(sampler.color(atUnitX: 0.75, y: 0.5).a < 0.1,
+                "buffer right half (canvas left) should be cleared")
+        #expect(sampler.color(atUnitX: 0.25, y: 0.5).a > 0.9,
+                "buffer left half (canvas right) should stay")
     }
 }

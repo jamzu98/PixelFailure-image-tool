@@ -29,7 +29,8 @@ final class PaintSession {
     }
 
     /// `base` seeds the buffer (existing pixels / existing mask).
-    init?(target: Target, base: CGImage?, pixelSize: CGSize) {
+    /// `clipPath` (buffer space, even-odd) confines strokes to a selection.
+    init?(target: Target, base: CGImage?, pixelSize: CGSize, clipPath: CGPath? = nil) {
         self.target = target
         self.pixelSize = pixelSize
         let width = max(1, Int(pixelSize.width))
@@ -55,6 +56,10 @@ final class PaintSession {
             // Buffers are in CG (y-up) space; strokes flip their y instead, so
             // the base image draws directly.
             ctx.draw(base, in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        if let clipPath {
+            ctx.addPath(clipPath)
+            ctx.clip(using: .evenOdd)
         }
         currentImage = ctx.makeImage()
     }
