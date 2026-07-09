@@ -17,6 +17,7 @@ struct CanvasViewport: View {
     @State private var paintSession: PaintSession?
     /// Bumped per stamp so the body re-renders during a stroke.
     @State private var paintTick = 0
+    @State private var isHoveringViewport = false
     @FocusState private var isFocused: Bool
 
     private enum DragMode {
@@ -122,14 +123,22 @@ struct CanvasViewport: View {
                 switch phase {
                 case .active(let location):
                     hoverLocation = location
+                    isHoveringViewport = true
                     setCursor(cursor(at: location, canvasTransform: canvasTransform, scale: scale))
                 case .ended:
+                    isHoveringViewport = false
                     setCursor(.arrow)
                 }
             }
             .onChange(of: editorState.activeTool) { _, _ in
                 // Tool switched by shortcut while hovering: update immediately
                 // instead of waiting for the next mouse move.
+                setCursor(cursor(at: hoverLocation, canvasTransform: canvasTransform, scale: scale))
+            }
+            .onModifierKeysChanged(mask: .option) { _, _ in
+                // Modifier presses don't produce hover events; refresh so the
+                // zoom cursor flips between +/- the moment option changes.
+                guard isHoveringViewport else { return }
                 setCursor(cursor(at: hoverLocation, canvasTransform: canvasTransform, scale: scale))
             }
             .contextMenu {
