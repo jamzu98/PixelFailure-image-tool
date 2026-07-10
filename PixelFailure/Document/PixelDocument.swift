@@ -12,12 +12,27 @@ extension UTType {
 /// Sendable and may serialize on a background queue; all mutation happens on
 /// the main actor via the explicitly annotated methods below.
 final class PixelDocument: ReferenceFileDocument, @unchecked Sendable {
+    nonisolated struct Checkpoint: Identifiable, Codable, Hashable, Sendable {
+        var id = UUID()
+        var name: String
+        var createdAt = Date()
+        var model: ProjectModel
+    }
+
     struct Snapshot {
         var model: ProjectModel
         var images: [String: Data]
+        var checkpoints: [Checkpoint]
     }
 
     @Published var model: ProjectModel
+    @Published private(set) var history: [Checkpoint] = []
+    @Published private(set) var checkpoints: [Checkpoint] = []
+    @MainActor lazy var actionRecorder = ActionRecorder()
+    /// True only while a continuous editor gesture is changing the model.
+    /// The viewport uses this transient state to render a lightweight proxy,
+    /// then restores native-resolution content after the gesture settles.
+    @Published private(set) var isContinuousEditing = false
     /// Raw data of imported images, keyed by file name inside images/.
     /// Append-only within a session so undo can always resolve references.
     private(set) var images: [String: Data]
@@ -31,6 +46,7 @@ final class PixelDocument: ReferenceFileDocument, @unchecked Sendable {
     init() {
         model = .starter()
         images = [:]
+        history = [Checkpoint(name: "Opened", model: model)]
     }
 
     init(configuration: ReadConfiguration) throws {
@@ -46,10 +62,14 @@ final class PixelDocument: ReferenceFileDocument, @unchecked Sendable {
             }
         }
         images = loaded
+        if let data = root.fileWrappers?["snapshots.json"]?.regularFileContents {
+            checkpoints = (try? JSONDecoder().decode([Checkpoint].self, from: data)) ?? []
+        }
+        history = [Checkpoint(name: "Opened", model: model)]
     }
 
     func snapshot(contentType: UTType) throws -> Snapshot {
-        Snapshot(model: model, images: images)
+        Snapshot(model: model, images: images, checkpoints: checkpoints)
     }
 
     func fileWrapper(snapshot: Snapshot, configuration: WriteConfiguration) throws -> FileWrapper {
@@ -66,6 +86,12 @@ final class PixelDocument: ReferenceFileDocument, @unchecked Sendable {
             snapshot.images.mapValues { FileWrapper(regularFileWithContents: $0) })
         imagesDir.preferredFilename = "images"
         root.addFileWrapper(imagesDir)
+        if !snapshot.checkpoints.isEmpty {
+            let data = try encoder.encode(snapshot.checkpoints)
+            let wrapper = FileWrapper(regularFileWithContents: data)
+            wrapper.preferredFilename = "snapshots.json"
+            root.addFileWrapper(wrapper)
+        }
         return root
     }
 
@@ -79,12 +105,15 @@ final class PixelDocument: ReferenceFileDocument, @unchecked Sendable {
         guard model != previous else { return }
         if let actionName { undoManager?.setActionName(actionName) }
         registerUndo(undoManager, previous: previous)
+        recordAutomation(from: previous, to: model)
+        recordHistory(actionName ?? "Edit")
     }
 
     /// Call when a continuous edit (slider drag, canvas drag) starts.
     @MainActor
     func beginGesture() {
         if gestureSnapshot == nil { gestureSnapshot = model }
+        isContinuousEditing = true
     }
 
     /// Mutate freely during a gesture; no undo registration per tick.
@@ -96,11 +125,14 @@ final class PixelDocument: ReferenceFileDocument, @unchecked Sendable {
     /// Call when the continuous edit ends; registers a single undo step.
     @MainActor
     func endGesture(_ undoManager: UndoManager?, actionName: String? = nil) {
+        isContinuousEditing = false
         guard let previous = gestureSnapshot else { return }
         gestureSnapshot = nil
         guard model != previous else { return }
         if let actionName { undoManager?.setActionName(actionName) }
         registerUndo(undoManager, previous: previous)
+        recordAutomation(from: previous, to: model)
+        recordHistory(actionName ?? "Edit")
     }
 
     @MainActor
@@ -112,6 +144,55 @@ final class PixelDocument: ReferenceFileDocument, @unchecked Sendable {
                 document.registerUndo(undoManager, previous: current)
             }
         }
+    }
+
+    @MainActor
+    private func recordHistory(_ name: String) {
+        history.append(Checkpoint(name: name, model: model))
+        if history.count > 200 { history.removeFirst(history.count - 200) }
+    }
+
+    @MainActor
+    private func recordAutomation(from old: ProjectModel, to new: ProjectModel) {
+        guard actionRecorder.isRecording else { return }
+        if old.canvasSize != new.canvasSize {
+            actionRecorder.capture(.resize(width: new.canvasSize.width, height: new.canvasSize.height))
+        }
+        if old.background != new.background { actionRecorder.capture(.setBackground(new.background)) }
+        if old.printSettings.dpi != new.printSettings.dpi {
+            actionRecorder.capture(.setDPI(new.printSettings.dpi))
+        }
+        if new.canvasEffects.count > old.canvasEffects.count,
+           Array(new.canvasEffects.prefix(old.canvasEffects.count)) == old.canvasEffects {
+            for effect in new.canvasEffects.dropFirst(old.canvasEffects.count) {
+                actionRecorder.capture(.addCanvasEffect(effect))
+            }
+        }
+    }
+
+    @MainActor
+    func jumpToHistory(_ id: UUID, undoManager: UndoManager?) {
+        guard let state = history.first(where: { $0.id == id }) else { return }
+        update(undoManager, actionName: "Jump to \(state.name)") { $0 = state.model }
+    }
+
+    @MainActor
+    func createCheckpoint(name: String) {
+        checkpoints.append(Checkpoint(name: name, model: model))
+    }
+
+    @MainActor
+    func restoreCheckpoint(_ id: UUID, undoManager: UndoManager?) {
+        guard let state = checkpoints.first(where: { $0.id == id }) else { return }
+        update(undoManager, actionName: "Restore Snapshot") { $0 = state.model }
+    }
+
+    @MainActor
+    func restoreRecovery(_ archive: RecoveryArchive) {
+        model = archive.model
+        for (key, data) in archive.images where images[key] == nil { images[key] = data }
+        checkpoints = archive.checkpoints
+        history = [Checkpoint(name: "Recovered", model: model)]
     }
 
     // MARK: - Image store

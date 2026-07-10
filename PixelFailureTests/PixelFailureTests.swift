@@ -1547,3 +1547,324 @@ struct LayerSourceTests {
         #expect(transfer?.images?[originalKey] != nil)
     }
 }
+
+@Suite("Stage 3 tiled viewport")
+@MainActor
+struct TiledViewportTests {
+    @Test func renderQualityDefinesDistinctMipTiers() {
+        #expect(RenderQuality.proxy.maxRasterDimension == 512)
+        #expect(RenderQuality.preview.maxRasterDimension == 1600)
+        #expect(RenderQuality.full.maxRasterDimension == nil)
+    }
+
+    @Test func continuousGesturePublishesProxyLifetime() {
+        let document = PixelDocument()
+        #expect(!document.isContinuousEditing)
+        document.beginGesture()
+        #expect(document.isContinuousEditing)
+        document.updateDuringGesture { $0.background = RGBAColor(hex: "#123456") }
+        document.endGesture(nil, actionName: "Background")
+        #expect(!document.isContinuousEditing)
+    }
+
+    @Test func isolatedLayerMoveInvalidatesOnlyUnionOfOldAndNewBounds() {
+        let layer = Layer(name: "Small shape",
+                          transform: LayerTransform(position: CGPoint(x: 200, y: 240)),
+                          kind: .shape(ShapeConfig(size: CGSize(width: 100, height: 80))))
+        let old = ProjectModel(canvasSize: CGSize(width: 1000, height: 800), layers: [layer])
+        var new = old
+        new.modifyLayer(id: layer.id) { $0.transform.position.x += 60 }
+
+        let region = RenderInvalidationPlanner.region(from: old, to: new) { item, model in
+            let size = item.shapeConfig?.size ?? model.canvasSize
+            let transform = item.transform.affine(naturalSize: size)
+                .concatenating(model.parentAffine(of: item.id))
+            return CGRect(origin: .zero, size: size).applying(transform).standardized
+        }
+        guard case .rect(let dirty) = region else {
+            Issue.record("Expected a local dirty rectangle, got \(region)")
+            return
+        }
+        #expect(dirty.width == 160)
+        #expect(dirty.height == 80)
+        #expect(dirty.width < new.canvasSize.width)
+        #expect(dirty.height < new.canvasSize.height)
+    }
+
+    @Test func globalRenderChangesInvalidateTheFullCanvas() {
+        let old = ProjectModel.starter()
+        var changed = old
+        changed.background = RGBAColor(hex: "#102030")
+        let backgroundRegion = RenderInvalidationPlanner.region(from: old, to: changed) { _, _ in .zero }
+        #expect(backgroundRegion == .full)
+
+        changed = old
+        changed.palette = BuiltInPalettes.all[1]
+        let paletteRegion = RenderInvalidationPlanner.region(from: old, to: changed) { _, _ in .zero }
+        #expect(paletteRegion == .full)
+
+        changed = old
+        changed.animation.duration += 1
+        let animationRegion = RenderInvalidationPlanner.region(from: old, to: changed) { _, _ in .zero }
+        #expect(animationRegion == .full)
+    }
+
+    @Test func proxyAndFullRasterCachesKeepTheirOwnResolution() throws {
+        let document = PixelDocument()
+        let width = 900, height = 300
+        let context = try #require(ColorSettings.default.makeRGBAContext(width: width, height: height))
+        context.setFillColor(RGBAColor(hex: "#D07050").cgColor)
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        let image = try #require(context.makeImage())
+        let data = try #require(PNGExporter.pngData(image))
+        let key = document.storeImage(data: data, fileExtension: "png")
+        let layer = Layer(name: "Large image", transform: LayerTransform(position: .zero),
+                          kind: .image(ImageConfig(imageKey: key,
+                                                   pixelSize: CGSize(width: width, height: height))))
+        let model = ProjectModel(canvasSize: CGSize(width: width, height: height), layers: [layer])
+        let store = RenderStore(document: document)
+        let config = try #require(layer.imageConfig)
+
+        let proxy = try #require(store.resolvedImage(for: layer,
+                                                     config: config,
+                                                     model: model, quality: .proxy))
+        let full = try #require(store.resolvedImage(for: layer,
+                                                    config: config,
+                                                    model: model, quality: .full))
+        #expect(max(proxy.width, proxy.height) == 512)
+        #expect(full.width == width)
+        #expect(full.height == height)
+    }
+
+    @Test func viewportUsesRetainedLayersAndPanDoesNotRender() {
+        let view = RetainedTileCanvasNSView(frame: CGRect(x: 0, y: 0, width: 800, height: 600))
+        #expect(!(view.layer is CATiledLayer))
+        #expect(view.layer?.isGeometryFlipped == true)
+        let transform = CGAffineTransform(translationX: 120, y: 80).scaledBy(x: 0.5, y: 0.5)
+        view.updateCanvasTransform(transform)
+        view.displayFrameForTesting()
+        #expect(view.currentAppliedTransform == transform)
+        #expect(view.currentMetrics.requested == 0)
+    }
+
+    @Test func retainedTileRasterizerUsesCoreGraphicsGroundTruth() throws {
+        let size = CGSize(width: 32, height: 32)
+        let snapshot = ViewportRenderSnapshot(items: [], background: RGBAColor(hex: "#D04020"),
+                                              canvasSize: size, workingSpace: .sRGB)
+        let spec = TileSpec(key: TileKey(level: 0, x: 0, y: 0),
+                            canvasRect: CGRect(origin: .zero, size: size), rasterScale: 1)
+        let image = try #require(TileRasterizer.render(spec: spec, snapshot: snapshot)?.image)
+        let sample = try #require(ImageSampler(cgImage: image)).color(atUnitX: 0.5, y: 0.5)
+        #expect(sample.r > 0.75)
+        #expect(sample.g < 0.35)
+        #expect(sample.b < 0.25)
+    }
+
+    @Test func paddedTilesMatchTheMonolithicRenderAcrossASeam() throws {
+        let size = CGSize(width: 128, height: 64)
+        let fill = FillConfig(style: .linearGradient,
+                              colors: [RGBAColor(hex: "#E04020"), RGBAColor(hex: "#2040E0")],
+                              angle: 0)
+        let item = RenderItem(id: UUID(), opacity: 0.72, blendMode: .normal,
+                              transform: .identity, naturalSize: size,
+                              content: .fill(fill), mask: nil)
+        let snapshot = ViewportRenderSnapshot(items: [item], background: .clear,
+                                              canvasSize: size, workingSpace: .sRGB)
+        let left = TileSpec(key: TileKey(level: 0, x: 0, y: 0),
+                            canvasRect: CGRect(x: 0, y: 0, width: 64, height: 64),
+                            rasterScale: 1,
+                            renderRect: CGRect(x: 0, y: 0, width: 66, height: 64))
+        let right = TileSpec(key: TileKey(level: 0, x: 1, y: 0),
+                             canvasRect: CGRect(x: 64, y: 0, width: 64, height: 64),
+                             rasterScale: 1,
+                             renderRect: CGRect(x: 62, y: 0, width: 66, height: 64))
+        let leftImage = try #require(TileRasterizer.render(spec: left, snapshot: snapshot)?.image)
+        let rightImage = try #require(TileRasterizer.render(spec: right, snapshot: snapshot)?.image)
+        let fullImage = try #require(PNGExporter.render(items: [item], background: .clear,
+                                                        canvasSize: size, targetPixelSize: size))
+        let leftSample = try #require(ImageSampler(cgImage: leftImage))
+            .color(atUnitX: 63.5 / 66, y: 0.5)
+        let rightSample = try #require(ImageSampler(cgImage: rightImage))
+            .color(atUnitX: 2.5 / 66, y: 0.5)
+        let fullSampler = try #require(ImageSampler(cgImage: fullImage))
+        let fullLeft = fullSampler.color(atUnitX: 63.5 / 128, y: 0.5)
+        let fullRight = fullSampler.color(atUnitX: 64.5 / 128, y: 0.5)
+
+        #expect(abs(leftSample.r - fullLeft.r) < 0.02)
+        #expect(abs(leftSample.b - fullLeft.b) < 0.02)
+        #expect(abs(rightSample.r - fullRight.r) < 0.02)
+        #expect(abs(rightSample.b - fullRight.b) < 0.02)
+        #expect(left.contentsRect.maxX < 1)
+        #expect(right.contentsRect.minX > 0)
+    }
+
+    @Test func displayedTileSurvivesUntilReplacementBatchCompletes() throws {
+        let size = CGSize(width: 32, height: 32)
+        let view = RetainedTileCanvasNSView(frame: CGRect(origin: .zero, size: size))
+        let spec = TileSpec(key: TileKey(level: 0, x: 0, y: 0),
+                            canvasRect: CGRect(origin: .zero, size: size), rasterScale: 1)
+        let red = ViewportRenderSnapshot(items: [], background: RGBAColor(hex: "#D04020"),
+                                         canvasSize: size, workingSpace: .sRGB)
+        let redImage = try #require(TileRasterizer.render(spec: spec, snapshot: red)?.image)
+        view.updateContent(snapshot: red, quality: .full, invalidation: .initial,
+                           transientInvalidation: .none)
+        view.presentForTesting(TileBatch(generation: 1, contentToken: 1, quality: .full,
+                                         tiles: [RenderedTile(spec: spec, image: redImage)],
+                                         submittedAt: ContinuousClock().now))
+        let displayedRed = try #require(view.displayedImage(for: spec.key))
+
+        let blue = ViewportRenderSnapshot(items: [], background: RGBAColor(hex: "#2040D0"),
+                                          canvasSize: size, workingSpace: .sRGB)
+        view.updateContent(snapshot: blue, quality: .full,
+                           invalidation: ViewportInvalidation(revision: 1, region: .full),
+                           transientInvalidation: .none)
+        #expect(view.displayedTileCount == 1)
+        let retained = try #require(view.displayedImage(for: spec.key))
+        #expect(PNGExporter.pngData(retained) == PNGExporter.pngData(displayedRed))
+
+        let green = ViewportRenderSnapshot(items: [], background: RGBAColor(hex: "#20D040"),
+                                           canvasSize: size, workingSpace: .sRGB)
+        let staleImage = try #require(TileRasterizer.render(spec: spec, snapshot: green)?.image)
+        view.presentForTesting(TileBatch(generation: 99, contentToken: 1, quality: .full,
+                                         tiles: [RenderedTile(spec: spec, image: staleImage)],
+                                         submittedAt: ContinuousClock().now))
+        #expect(view.displayedContentToken(for: spec.key) == 1)
+        #expect(PNGExporter.pngData(view.displayedImage(for: spec.key)!) == PNGExporter.pngData(displayedRed))
+
+        let blueImage = try #require(TileRasterizer.render(spec: spec, snapshot: blue)?.image)
+        view.presentForTesting(TileBatch(generation: 2, contentToken: 2, quality: .full,
+                                         tiles: [RenderedTile(spec: spec, image: blueImage)],
+                                         submittedAt: ContinuousClock().now))
+        let displayedBlue = try #require(view.displayedImage(for: spec.key))
+        let sampler = try #require(ImageSampler(cgImage: displayedBlue))
+        let sample = sampler.color(atUnitX: 0.5, y: 0.5)
+        #expect(sample.b > 0.75)
+        #expect(sample.r < 0.3)
+    }
+
+    @Test func incompleteReplacementBatchIsNotPartiallyPresented() throws {
+        let size = CGSize(width: 32, height: 32)
+        let view = RetainedTileCanvasNSView(frame: CGRect(origin: .zero, size: size))
+        let visible = TileSpec(key: TileKey(level: 0, x: 0, y: 0),
+                               canvasRect: CGRect(origin: .zero, size: size), rasterScale: 1)
+        let missing = TileSpec(key: TileKey(level: 0, x: 1, y: 0),
+                               canvasRect: CGRect(x: 32, y: 0, width: 32, height: 32), rasterScale: 1)
+        let red = ViewportRenderSnapshot(items: [], background: RGBAColor(hex: "#D04020"),
+                                         canvasSize: size, workingSpace: .sRGB)
+        let redImage = try #require(TileRasterizer.render(spec: visible, snapshot: red)?.image)
+        view.updateContent(snapshot: red, quality: .full, invalidation: .initial,
+                           transientInvalidation: .none)
+        view.presentForTesting(TileBatch(generation: 1, contentToken: 1, quality: .full,
+                                         tiles: [RenderedTile(spec: visible, image: redImage)],
+                                         submittedAt: ContinuousClock().now))
+
+        let blue = ViewportRenderSnapshot(items: [], background: RGBAColor(hex: "#2040D0"),
+                                          canvasSize: size, workingSpace: .sRGB)
+        let blueImage = try #require(TileRasterizer.render(spec: visible, snapshot: blue)?.image)
+        view.updateContent(snapshot: blue, quality: .full,
+                           invalidation: ViewportInvalidation(revision: 1, region: .full),
+                           transientInvalidation: .none)
+        view.presentForTesting(TileBatch(generation: 2, contentToken: 2, quality: .full,
+                                         tiles: [RenderedTile(spec: visible, image: blueImage)],
+                                         submittedAt: ContinuousClock().now,
+                                         requestedSpecs: [visible, missing]))
+
+        #expect(view.displayedContentToken(for: visible.key) == 1)
+    }
+
+    @Test func layerDeletionPlansAFullInvalidation() {
+        let layer = Layer(name: "Delete me", transform: LayerTransform(position: .zero),
+                          kind: .shape(ShapeConfig()))
+        let old = ProjectModel(canvasSize: CGSize(width: 400, height: 300), layers: [layer])
+        var new = old
+        new.layers.removeAll()
+        #expect(RenderInvalidationPlanner.region(from: old, to: new) { _, _ in .zero } == .full)
+    }
+
+    @Test func zoomKeepsPriorGridVisibleUntilReplacementLODCompletes() throws {
+        let size = CGSize(width: 32, height: 32)
+        let view = RetainedTileCanvasNSView(frame: CGRect(origin: .zero, size: size))
+        let snapshot = ViewportRenderSnapshot(items: [], background: RGBAColor(hex: "#D04020"),
+                                              canvasSize: size, workingSpace: .sRGB)
+        let low = TileSpec(key: TileKey(level: 0, x: 0, y: 0),
+                           canvasRect: CGRect(origin: .zero, size: size), rasterScale: 1)
+        let lowImage = try #require(TileRasterizer.render(spec: low, snapshot: snapshot)?.image)
+        view.updateContent(snapshot: snapshot, quality: .full, invalidation: .initial,
+                           transientInvalidation: .none)
+        view.presentForTesting(TileBatch(generation: 1, contentToken: 1, quality: .full,
+                                         tiles: [RenderedTile(spec: low, image: lowImage)],
+                                         submittedAt: ContinuousClock().now))
+        #expect(view.visibleGridLevels == [0])
+
+        view.updateCanvasTransform(CGAffineTransform(scaleX: 2, y: 2))
+        view.displayFrameForTesting()
+        let highLevel = view.currentDesiredLevel
+        #expect(view.visibleGridLevels.contains(0))
+        #expect(!view.visibleGridLevels.contains(highLevel))
+
+        let highScale = pow(2, CGFloat(highLevel))
+        let high = TileSpec(key: TileKey(level: highLevel, x: 0, y: 0),
+                            canvasRect: CGRect(origin: .zero, size: size), rasterScale: highScale)
+        let highImage = try #require(TileRasterizer.render(spec: high, snapshot: snapshot)?.image)
+        view.presentForTesting(TileBatch(generation: 2, contentToken: 1, quality: .full,
+                                         tiles: [RenderedTile(spec: high, image: highImage)],
+                                         submittedAt: ContinuousClock().now))
+        #expect(view.visibleGridLevels == [highLevel])
+    }
+
+    @Test func schedulerCoalescesToNewestWithoutStarvingCompletedFrame() async {
+        let renderer: ViewportRenderScheduler.Renderer = { request in
+            try? await Task.sleep(for: .milliseconds(20))
+            return TileBatch(generation: request.generation,
+                             contentToken: request.contentToken,
+                             quality: request.quality,
+                             tiles: [], submittedAt: request.submittedAt)
+        }
+        let scheduler = ViewportRenderScheduler(renderer: renderer)
+        var presented: [UInt64] = []
+        scheduler.onBatch = { presented.append($0.generation) }
+        let size = CGSize(width: 32, height: 32)
+        let snapshot = ViewportRenderSnapshot(items: [], background: .black,
+                                              canvasSize: size, workingSpace: .sRGB)
+        let spec = TileSpec(key: TileKey(level: 0, x: 0, y: 0),
+                            canvasRect: CGRect(origin: .zero, size: size), rasterScale: 1)
+        for generation in 1...3 {
+            scheduler.submit(ViewportRenderRequest(generation: UInt64(generation), contentToken: 1,
+                                                   snapshot: snapshot, quality: .proxy,
+                                                   specs: [spec], submittedAt: ContinuousClock().now))
+        }
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(presented == [1, 3])
+        #expect(scheduler.metrics.coalesced == 2)
+        #expect(scheduler.metrics.completed == 2)
+    }
+
+    @Test func eightyLayerLargeCanvasStillPlansALocalInvalidation() {
+        let canvas = CGSize(width: 12_000, height: 8_000)
+        var layers: [Layer] = []
+        for index in 0..<80 {
+            let position = CGPoint(x: Double(150 + index * 120),
+                                   y: Double(200 + (index % 8) * 500))
+            let shape = ShapeConfig(size: CGSize(width: 100, height: 100))
+            layers.append(Layer(name: "Tile \(index)",
+                                transform: LayerTransform(position: position),
+                                kind: .shape(shape)))
+        }
+        let old = ProjectModel(canvasSize: canvas, layers: layers)
+        var new = old
+        let changedID = layers[42].id
+        new.modifyLayer(id: changedID) { $0.transform.position.x += 25 }
+        let region = RenderInvalidationPlanner.region(from: old, to: new) { item, model in
+            let size = item.shapeConfig?.size ?? model.canvasSize
+            return CGRect(origin: .zero, size: size)
+                .applying(item.transform.affine(naturalSize: size)).standardized
+        }
+        guard case .rect(let dirty) = region else {
+            Issue.record("Expected local invalidation for one of 80 layers")
+            return
+        }
+        #expect(dirty.width == 125)
+        #expect(dirty.height == 100)
+        #expect(dirty.width * dirty.height < canvas.width * canvas.height / 1000)
+    }
+}

@@ -3,7 +3,7 @@ import Foundation
 
 /// The serialized document state: everything needed to regenerate the artwork.
 nonisolated struct ProjectModel: Codable, Hashable, Sendable {
-    static let currentSchemaVersion = 5
+    static let currentSchemaVersion = 6
 
     /// Explicit manifest version. Documents written before versioning decode
     /// as v1; new migrations can branch on this without guessing from fields.
@@ -20,6 +20,9 @@ nonisolated struct ProjectModel: Codable, Hashable, Sendable {
     var canvasEffects: [Effect]
     var workspace: WorkspaceSettings
     var animation: AnimationSettings
+    /// Physical output metadata; it never changes canvas pixels.
+    var printSettings: PrintSettings
+    var exportSlices: [ExportSlice]
 
     init(schemaVersion: Int = ProjectModel.currentSchemaVersion,
          canvasSize: CGSize = CGSize(width: 3000, height: 3000),
@@ -29,7 +32,9 @@ nonisolated struct ProjectModel: Codable, Hashable, Sendable {
          palette: Palette = BuiltInPalettes.default,
          canvasEffects: [Effect] = [],
          workspace: WorkspaceSettings = WorkspaceSettings(),
-         animation: AnimationSettings = AnimationSettings()) {
+         animation: AnimationSettings = AnimationSettings(),
+         printSettings: PrintSettings = PrintSettings(),
+         exportSlices: [ExportSlice] = []) {
         self.schemaVersion = schemaVersion
         self.canvasSize = canvasSize
         self.colorSettings = colorSettings
@@ -39,11 +44,14 @@ nonisolated struct ProjectModel: Codable, Hashable, Sendable {
         self.canvasEffects = canvasEffects
         self.workspace = workspace
         self.animation = animation
+        self.printSettings = printSettings
+        self.exportSlices = exportSlices
     }
 
     // Custom decoding so documents saved before canvasEffects existed still open.
     private enum CodingKeys: String, CodingKey {
-        case schemaVersion, canvasSize, colorSettings, background, layers, palette, canvasEffects, workspace, animation
+        case schemaVersion, canvasSize, colorSettings, background, layers, palette, canvasEffects,
+             workspace, animation, printSettings, exportSlices
     }
 
     init(from decoder: Decoder) throws {
@@ -57,6 +65,8 @@ nonisolated struct ProjectModel: Codable, Hashable, Sendable {
         canvasEffects = try container.decodeIfPresent([Effect].self, forKey: .canvasEffects) ?? []
         workspace = try container.decodeIfPresent(WorkspaceSettings.self, forKey: .workspace) ?? WorkspaceSettings()
         animation = try container.decodeIfPresent(AnimationSettings.self, forKey: .animation) ?? AnimationSettings()
+        printSettings = try container.decodeIfPresent(PrintSettings.self, forKey: .printSettings) ?? PrintSettings()
+        exportSlices = try container.decodeIfPresent([ExportSlice].self, forKey: .exportSlices) ?? []
     }
 
     var canvasCenter: CGPoint { CGPoint(x: canvasSize.width / 2, y: canvasSize.height / 2) }
@@ -277,6 +287,28 @@ nonisolated struct ProjectModel: Codable, Hashable, Sendable {
                           kind: .pattern(config))
         model.layers = [layer]
         return model
+    }
+}
+
+nonisolated struct PrintSettings: Codable, Hashable, Sendable {
+    var dpi: Double
+    init(dpi: Double = 72) { self.dpi = max(1, dpi) }
+
+    func physicalSize(for pixels: CGSize) -> CGSize {
+        CGSize(width: pixels.width / dpi, height: pixels.height / dpi)
+    }
+}
+
+nonisolated struct ExportSlice: Identifiable, Codable, Hashable, Sendable {
+    var id: UUID
+    var name: String
+    var rect: CGRect
+    var scales: [Int]
+
+    init(id: UUID = UUID(), name: String = "Slice", rect: CGRect,
+         scales: [Int] = [1, 2, 3]) {
+        self.id = id; self.name = name; self.rect = rect
+        self.scales = scales.filter { $0 > 0 }
     }
 }
 

@@ -6,6 +6,33 @@ import UniformTypeIdentifiers
 
 /// Higher-level, undoable document operations used by the UI.
 extension PixelDocument {
+    /// Crops the canvas to the selected distorted layer's destination bounds.
+    /// Layer pixels are untouched; root transforms are translated as a group.
+    @MainActor
+    func perspectiveCrop(to layerID: UUID, renderStore: RenderStore,
+                         undoManager: UndoManager?) {
+        guard let layer = model.layer(id: layerID),
+              let deformation = layer.transform.deformation else { return }
+        let size = renderStore.naturalSize(for: layer, model: model)
+        let world = layer.transform.affine(naturalSize: size)
+            .concatenating(model.parentAffine(of: layerID))
+        let points = deformation.triangles(size: size).flatMap {
+            [$0.destination.0, $0.destination.1, $0.destination.2]
+        }.map { $0.applying(world) }
+        guard let first = points.first else { return }
+        let bounds = points.dropFirst().reduce(CGRect(origin: first, size: .zero)) {
+            $0.union(CGRect(origin: $1, size: .zero))
+        }.integral
+        guard bounds.width > 1, bounds.height > 1 else { return }
+        update(undoManager, actionName: "Perspective Crop") { model in
+            for index in model.layers.indices {
+                model.layers[index].transform.position.x -= bounds.minX
+                model.layers[index].transform.position.y -= bounds.minY
+            }
+            model.canvasSize = bounds.size
+        }
+    }
+
     nonisolated struct AssetImportOutcome: Sendable {
         var layerID: UUID
         var warning: String?

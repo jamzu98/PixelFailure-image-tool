@@ -94,8 +94,27 @@ enum TextOutliner {
         let text = config.displayText
         let result = NSMutableAttributedString(string: text, attributes: [
             .font: baseFont, .kern: config.tracking,
+            .ligature: (config.ligatures ?? true) ? 1 : 0,
             coreTextColorKey: config.color.cgColor,
         ])
+        var featureSettings: [[CFString: Int]] = []
+        if config.smallCaps == true {
+            featureSettings.append([
+                kCTFontFeatureTypeIdentifierKey: kLowerCaseType,
+                kCTFontFeatureSelectorIdentifierKey: kLowerCaseSmallCapsSelector,
+            ])
+        }
+        if let alternate = config.stylisticAlternates, alternate > 0 {
+            featureSettings.append([
+                kCTFontFeatureTypeIdentifierKey: kStylisticAlternativesType,
+                kCTFontFeatureSelectorIdentifierKey: alternate,
+            ])
+        }
+        if !featureSettings.isEmpty {
+            result.addAttribute(NSAttributedString.Key(rawValue: kCTFontFeatureSettingsAttribute as String),
+                                value: featureSettings,
+                                range: NSRange(location: 0, length: result.length))
+        }
         for run in config.styleRuns ?? [] {
             let location = min(max(run.location, 0), result.length)
             let length = min(max(run.length, 0), result.length - location)
@@ -125,10 +144,17 @@ enum TextOutliner {
         var origins = [CGPoint](repeating: .zero, count: lines.count)
         CTFrameGetLineOrigins(frame, CFRange(location: 0, length: 0), &origins)
         var primitives: [VectorPrimitive] = []
+        let usedHeight = min(box.height, CGFloat(max(lines.count, 1)) * config.size * config.lineHeight)
+        let spare = max(0, box.height - usedHeight)
+        let verticalOffset: CGFloat = switch config.verticalAlignment ?? .top {
+        case .top: 0
+        case .center: spare / 2
+        case .bottom: spare
+        }
         for index in lines.indices {
             let origin = origins[index]
             primitives += glyphPrimitives(of: lines[index],
-                                          offset: CGPoint(x: origin.x, y: box.height - origin.y),
+                                          offset: CGPoint(x: origin.x, y: box.height - origin.y + verticalOffset),
                                           fallbackColor: config.color)
         }
         return Result(primitives: primitives,

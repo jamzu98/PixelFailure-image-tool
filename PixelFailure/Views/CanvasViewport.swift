@@ -5,7 +5,7 @@ import SwiftUI
 struct CanvasViewport: View {
     @ObservedObject var document: PixelDocument
     @Bindable var editorState: EditorState
-    let renderStore: RenderStore
+    @ObservedObject var renderStore: RenderStore
     let animationTime: Double?
     @Environment(\.undoManager) private var undoManager
 
@@ -16,10 +16,13 @@ struct CanvasViewport: View {
     @State private var dragMode: DragMode?
     @State private var hoverLocation: CGPoint = .zero
     @State private var paintSession: PaintSession?
-    /// Bumped per stamp so the body re-renders during a stroke.
-    @State private var paintTick = 0
+    @State private var isPainting = false
+    @State private var paintInvalidation = TransientViewportInvalidation.none
     @State private var isHoveringViewport = false
     @State private var viewportSize: CGSize = .zero
+    @State private var viewportQuality: RenderQuality = .full
+    @State private var fullResolutionTask: Task<Void, Never>?
+    @State private var awaitingTiledHandoff = false
     @FocusState private var isFocused: Bool
 
     private enum DragMode {
@@ -53,10 +56,10 @@ struct CanvasViewport: View {
             let viewSize = geo.size
             let scale = effectiveZoom(viewSize: viewSize)
             let canvasTransform = self.canvasTransform(viewSize: viewSize, scale: scale)
-            let _ = paintTick
             let displayModel = animationTime.map { document.model.model(at: $0) } ?? document.model
-            let items = renderStore.renderItems(model: displayModel, quality: .preview)
-            let composite = renderStore.compositePreview(model: displayModel, extraHash: paintTick)
+            let transientInvalidation = animationTime.map {
+                TransientViewportInvalidation(revision: $0.bitPattern &+ 1, region: .full)
+            } ?? paintInvalidation
 
             ZStack {
                 Color(nsColor: .underPageBackgroundColor)
@@ -70,24 +73,28 @@ struct CanvasViewport: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .allowsHitTesting(false)
 
-                Canvas { context, _ in
-                    context.concatenate(canvasTransform)
-                    let canvasRect = CGRect(origin: .zero, size: document.model.canvasSize)
-                    if let composite {
-                        // Global adjustment preview: draw the flattened,
-                        // effect-processed composite instead of live vectors.
-                        var clipped = context
-                        clipped.clip(to: Path(canvasRect))
-                        clipped.draw(Image(decorative: composite, scale: 1), in: canvasRect)
-                    } else {
-                        CanvasRenderer.draw(items: items,
-                                            background: displayModel.background,
-                                            canvasSize: displayModel.canvasSize,
-                                            in: context,
-                                            space: displayModel.colorSettings.workingSpace)
-                    }
-                }
+                TiledCanvasView(model: displayModel,
+                                renderStore: renderStore,
+                                quality: viewportQuality,
+                                canvasTransform: canvasTransform,
+                                invalidation: renderStore.viewportInvalidation,
+                                transientInvalidation: transientInvalidation,
+                                suspendsContentUpdates: isDirectlyTransforming,
+                                onPresented: { quality in
+                                    guard awaitingTiledHandoff,
+                                          !isDirectlyTransforming,
+                                          quality != .proxy else { return }
+                                    awaitingTiledHandoff = false
+                                })
+                .opacity(usesImmediateTransformPreview ? 0 : 1)
                 .allowsHitTesting(false)
+
+                if usesImmediateTransformPreview {
+                    immediateTransformPreview(model: displayModel,
+                                              canvasTransform: canvasTransform,
+                                              quality: isDirectlyTransforming ? .proxy : .preview)
+                        .allowsHitTesting(false)
+                }
 
                 WorkspaceOverlay(document: document,
                                  editorState: editorState,
@@ -271,6 +278,67 @@ struct CanvasViewport: View {
             }
         }
         .clipped()
+        .onChange(of: document.isContinuousEditing) { _, _ in updateViewportQuality() }
+        .onChange(of: isPainting) { _, _ in updateViewportQuality() }
+        .onChange(of: editorState.isAnimationPlaying) { _, _ in updateViewportQuality() }
+        .onChange(of: editorState.isAnimationScrubbing) { _, _ in updateViewportQuality() }
+        .onDisappear { fullResolutionTask?.cancel() }
+    }
+
+    private func updateViewportQuality() {
+        fullResolutionTask?.cancel()
+        let active = document.isContinuousEditing || isPainting
+            || editorState.isAnimationPlaying || editorState.isAnimationScrubbing
+        if active {
+            viewportQuality = .proxy
+            return
+        }
+        viewportQuality = .preview
+        fullResolutionTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(220))
+            let stillActive = document.isContinuousEditing || isPainting
+                || editorState.isAnimationPlaying || editorState.isAnimationScrubbing
+            guard !Task.isCancelled, !stillActive else { return }
+            viewportQuality = .full
+        }
+    }
+
+    private var isDirectlyTransforming: Bool {
+        switch dragMode {
+        case .move, .scale, .rotate, .multiScale, .multiRotate:
+            true
+        default:
+            false
+        }
+    }
+
+    private var usesImmediateTransformPreview: Bool {
+        isDirectlyTransforming || awaitingTiledHandoff
+    }
+
+    @ViewBuilder
+    private func immediateTransformPreview(model: ProjectModel,
+                                           canvasTransform: CGAffineTransform,
+                                           quality: RenderQuality) -> some View {
+        if let composite = renderStore.composite(model: model, quality: quality) {
+            Canvas { context, _ in
+                context.concatenate(canvasTransform)
+                let canvasRect = CGRect(origin: .zero, size: model.canvasSize)
+                var clipped = context
+                clipped.clip(to: Path(canvasRect))
+                clipped.draw(Image(decorative: composite, scale: 1), in: canvasRect)
+            }
+        } else {
+            let items = renderStore.renderItems(model: model, quality: quality)
+            Canvas { context, _ in
+                context.concatenate(canvasTransform)
+                CanvasRenderer.draw(items: items,
+                                    background: model.background,
+                                    canvasSize: model.canvasSize,
+                                    in: context,
+                                    space: model.colorSettings.workingSpace)
+            }
+        }
     }
 
     /// Pastes whatever the pasteboard holds: one of our layers, or any
@@ -411,9 +479,12 @@ struct CanvasViewport: View {
 
     private func canvasTransform(viewSize: CGSize, scale: CGFloat) -> CGAffineTransform {
         let canvas = document.model.canvasSize
-        let tx = (viewSize.width - canvas.width * scale) / 2 + pan.width
-        let ty = (viewSize.height - canvas.height * scale) / 2 + pan.height
-        return CGAffineTransform(translationX: tx, y: ty).scaledBy(x: scale, y: scale)
+        let center = CGPoint(x: viewSize.width / 2 + pan.width,
+                             y: viewSize.height / 2 + pan.height)
+        return CGAffineTransform(translationX: center.x, y: center.y)
+            .rotated(by: editorState.canvasRotationDegrees * .pi / 180)
+            .scaledBy(x: scale, y: scale)
+            .translatedBy(x: -canvas.width / 2, y: -canvas.height / 2)
     }
 
     // MARK: - Gestures
@@ -505,6 +576,7 @@ struct CanvasViewport: View {
             .onEnded { value in
                 switch dragMode {
                 case .move:
+                    awaitingTiledHandoff = true
                     document.endGesture(undoManager, actionName: "Move Layer")
                     editorState.smartGuideX = nil
                     editorState.smartGuideY = nil
@@ -790,6 +862,11 @@ struct CanvasViewport: View {
                                         colorSettings: document.model.colorSettings)
         }
         renderStore.activePaintSession = paintSession
+        if paintSession != nil {
+            isPainting = true
+            paintInvalidation = TransientViewportInvalidation(
+                revision: paintInvalidation.revision &+ 1, region: .none)
+        }
     }
 
     private func extendPaintStroke(to viewPoint: CGPoint, canvasTransform: CGAffineTransform) {
@@ -864,9 +941,28 @@ struct CanvasViewport: View {
                            smoothing: brush.smoothing,
                            scatter: brush.scatter,
                            sizeJitter: brush.sizeJitter,
-                           opacityJitter: brush.opacityJitter)
+                           opacityJitter: brush.opacityJitter,
+                           angleJitter: brush.angleJitter,
+                           tipAspect: brush.tipAspect,
+                           grain: brush.grain)
         }
-        paintTick += 1
+        let parent = document.model.parentAffine(of: layer.id)
+        let parentScale = max(hypot(parent.a, parent.b), 1)
+        let canvasRadius = brush.size / 2 * parentScale + 4
+        let stamp = CGRect(x: canvasPoint.x - canvasRadius,
+                           y: canvasPoint.y - canvasRadius,
+                           width: canvasRadius * 2, height: canvasRadius * 2)
+        let accumulated: RenderInvalidationRegion
+        switch paintInvalidation.region {
+        case .none:
+            accumulated = .rect(stamp)
+        case .rect(let current):
+            accumulated = .rect(current.union(stamp))
+        case .full:
+            accumulated = .full
+        }
+        paintInvalidation = TransientViewportInvalidation(
+            revision: paintInvalidation.revision &+ 1, region: accumulated)
     }
 
     private func commitPaintSession() {
@@ -875,7 +971,9 @@ struct CanvasViewport: View {
         defer {
             paintSession = nil
             renderStore.activePaintSession = nil
-            paintTick += 1
+            isPainting = false
+            paintInvalidation = TransientViewportInvalidation(
+                revision: paintInvalidation.revision &+ 1, region: .none)
         }
         guard let image = session.currentImage,
               let data = PNGExporter.pngData(image) else { return }
@@ -1027,6 +1125,7 @@ struct CanvasViewport: View {
                 dragMode = .scale(layerID: layer.id, startScale: layer.transform.scale, startDistance: startDistance)
             }
         case .ended:
+            awaitingTiledHandoff = true
             document.endGesture(undoManager, actionName: "Scale Layer")
             dragMode = nil
         }
@@ -1052,6 +1151,7 @@ struct CanvasViewport: View {
                 dragMode = .rotate(layerID: layer.id, startRotation: layer.transform.rotationDegrees, startAngle: startAngle)
             }
         case .ended:
+            awaitingTiledHandoff = true
             document.endGesture(undoManager, actionName: "Rotate Layer")
             dragMode = nil
         }
@@ -1114,6 +1214,7 @@ struct CanvasViewport: View {
                                        startDistance: startDistance)
             }
         case .ended:
+            awaitingTiledHandoff = true
             document.endGesture(undoManager, actionName: "Scale Layers")
             dragMode = nil
         }
@@ -1156,6 +1257,7 @@ struct CanvasViewport: View {
                                         startAngle: startAngle)
             }
         case .ended:
+            awaitingTiledHandoff = true
             document.endGesture(undoManager, actionName: "Rotate Layers")
             dragMode = nil
         }
@@ -1669,13 +1771,14 @@ private struct WorkspaceOverlay: View {
 
 private struct NavigatorView: View {
     @ObservedObject var document: PixelDocument
-    let renderStore: RenderStore
+    @ObservedObject var renderStore: RenderStore
     let canvasTransform: CGAffineTransform
     let viewportSize: CGSize
     let zoomScale: CGFloat
     @Binding var pan: CGSize
     @State private var preview: CGImage?
     @State private var isHovering = false
+    @State private var refreshTask: Task<Void, Never>?
     @Environment(\.undoManager) private var undoManager
 
     private var previewSize: CGSize {
@@ -1736,11 +1839,20 @@ private struct NavigatorView: View {
                 Spacer()
             }
         }
-        .task(id: document.model.hashValue) { refreshPreview() }
+        .onAppear { refreshPreview() }
+        .onChange(of: renderStore.viewportInvalidation.revision) { _, _ in
+            refreshTask?.cancel()
+            refreshTask = Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(120))
+                guard !Task.isCancelled else { return }
+                refreshPreview()
+            }
+        }
+        .onDisappear { refreshTask?.cancel() }
     }
 
     private func refreshPreview() {
-        let items = renderStore.renderItems(model: document.model, quality: .preview)
+        let items = renderStore.renderItems(model: document.model, quality: .proxy)
         preview = PNGExporter.render(items: items, background: document.model.background,
                                      canvasSize: document.model.canvasSize,
                                      targetPixelSize: previewSize,

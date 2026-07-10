@@ -19,6 +19,10 @@ nonisolated enum EffectType: String, Codable, CaseIterable, Hashable, Sendable {
     case duotone
     case grain
     case blur
+    case sharpen
+    case noiseReduction
+    case lensCorrection
+    case rawDevelop
     case bloom
     case sliceGlitch
     case chromaticAberration
@@ -42,6 +46,10 @@ nonisolated enum EffectType: String, Codable, CaseIterable, Hashable, Sendable {
         case .duotone: "Palette Map"
         case .grain: "Grain"
         case .blur: "Blur"
+        case .sharpen: "Unsharp Mask"
+        case .noiseReduction: "Noise Reduction"
+        case .lensCorrection: "Lens Correction"
+        case .rawDevelop: "RAW Develop"
         case .bloom: "Bloom"
         case .sliceGlitch: "Slice Glitch"
         case .chromaticAberration: "Chromatic Aberration"

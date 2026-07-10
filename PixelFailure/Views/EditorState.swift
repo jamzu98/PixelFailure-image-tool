@@ -86,7 +86,7 @@ nonisolated struct PointerSample: Sendable {
     var timestamp: TimeInterval
 }
 
-nonisolated struct BrushPreset: Identifiable, Hashable, Sendable {
+nonisolated struct BrushPreset: Identifiable, Codable, Hashable, Sendable {
     let id: String
     let name: String
     let size: Double
@@ -97,6 +97,19 @@ nonisolated struct BrushPreset: Identifiable, Hashable, Sendable {
     let scatter: Double
     let sizeJitter: Double
     let opacityJitter: Double
+    let angleJitter: Double
+    let tipAspect: Double
+    let grain: Double
+
+    init(id: String, name: String, size: Double, hardness: Double, opacity: Double,
+         spacing: Double, smoothing: Double, scatter: Double, sizeJitter: Double,
+         opacityJitter: Double, angleJitter: Double = 0, tipAspect: Double = 1,
+         grain: Double = 0) {
+        self.id = id; self.name = name; self.size = size; self.hardness = hardness
+        self.opacity = opacity; self.spacing = spacing; self.smoothing = smoothing
+        self.scatter = scatter; self.sizeJitter = sizeJitter; self.opacityJitter = opacityJitter
+        self.angleJitter = angleJitter; self.tipAspect = tipAspect; self.grain = grain
+    }
 
     static let builtIns: [BrushPreset] = [
         BrushPreset(id: "soft", name: "Soft Round", size: 120, hardness: 0.2, opacity: 0.55,
@@ -104,7 +117,8 @@ nonisolated struct BrushPreset: Identifiable, Hashable, Sendable {
         BrushPreset(id: "hard", name: "Hard Round", size: 70, hardness: 0.95, opacity: 1,
                     spacing: 0.12, smoothing: 0.18, scatter: 0, sizeJitter: 0, opacityJitter: 0),
         BrushPreset(id: "texture", name: "Scatter", size: 90, hardness: 0.7, opacity: 0.65,
-                    spacing: 0.35, smoothing: 0.1, scatter: 0.8, sizeJitter: 0.45, opacityJitter: 0.35),
+                    spacing: 0.35, smoothing: 0.1, scatter: 0.8, sizeJitter: 0.45, opacityJitter: 0.35,
+                    angleJitter: 1, tipAspect: 0.55, grain: 0.45),
         BrushPreset(id: "ink", name: "Smooth Ink", size: 28, hardness: 0.9, opacity: 0.9,
                     spacing: 0.08, smoothing: 0.75, scatter: 0, sizeJitter: 0.08, opacityJitter: 0.08),
     ]
@@ -124,9 +138,14 @@ final class BrushSettings {
     var scatter = 0.0
     var sizeJitter = 0.0
     var opacityJitter = 0.0
+    var angleJitter = 0.0
+    var tipAspect = 1.0
+    var grain = 0.0
     var pressureControlsSize = true
     var pressureControlsOpacity = false
     var selectedPresetID = "soft"
+    var customPresets: [BrushPreset] = []
+    var presets: [BrushPreset] { BrushPreset.builtIns + customPresets }
 
     func apply(_ preset: BrushPreset) {
         selectedPresetID = preset.id
@@ -138,6 +157,9 @@ final class BrushSettings {
         scatter = preset.scatter
         sizeJitter = preset.sizeJitter
         opacityJitter = preset.opacityJitter
+        angleJitter = preset.angleJitter
+        tipAspect = preset.tipAspect
+        grain = preset.grain
     }
 }
 
@@ -164,9 +186,14 @@ final class EditorState {
     var animationPlayhead = 0.0
     var selectedAnimationKeyframeID: UUID?
     var isAnimationPlaying = false
+    var isAnimationScrubbing = false
 
     var activeTool: EditorTool = .move
     var brush = BrushSettings()
+    /// View-only canvas rotation used while drawing; never serialized.
+    var canvasRotationDegrees = 0.0
+    var isRecordingAction = false
+    var recordedActions: [RecordedAction] = []
 
     /// Which palette swatch the eyedropper replaces next (wraps around).
     var eyedropperSwatchIndex = 0

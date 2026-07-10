@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE dictionary SYSTEM "file://localhost/System/Library/DTDs/sdef.dtd">
+<dictionary title="PixelFailure Terminology">
+  <suite name="PixelFailure Suite" code="PxlF" description="PixelFailure automation commands.">
+    <command name="run action" code="PxlFRunA" description="Apply recorded action JSON to the front document.">
+      <cocoa class="PFRunActionCommand"/>
+      <direct-parameter type="text" description="A RecordedAction JSON payload."/>
+      <result type="text" description="A completion summary."/>
+    </command>
+  </suite>
+</dictionary>

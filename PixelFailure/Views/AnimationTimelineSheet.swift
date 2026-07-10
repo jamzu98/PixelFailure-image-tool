@@ -147,7 +147,10 @@ struct AnimationTimelineDock: View {
                 }
             }
         }
-        .onDisappear { exportTask?.cancel() }
+        .onDisappear {
+            editorState.isAnimationScrubbing = false
+            exportTask?.cancel()
+        }
     }
 
     private var timelineTrack: some View {
@@ -158,7 +161,9 @@ struct AnimationTimelineDock: View {
                     set: { value in
                         editorState.animationPlayhead = value
                         editorState.selectedAnimationKeyframeID = nil
-                    }), in: 0...max(settings.duration, 0.1))
+                    }), in: 0...max(settings.duration, 0.1), onEditingChanged: { editing in
+                        editorState.isAnimationScrubbing = editing
+                    })
 
                 ForEach(keyframes) { frame in
                     Button {

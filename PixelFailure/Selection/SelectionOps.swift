@@ -134,6 +134,41 @@ extension PixelDocument {
         }
     }
 
+    /// Selection-based patch/heal. `sourceOffset` is measured in canvas
+    /// coordinates from the target selection toward the clean source area.
+    @MainActor
+    func patchSelection(_ selection: CanvasSelection, layerID: UUID,
+                        sourceOffset: CGVector, renderStore: RenderStore,
+                        undoManager: UndoManager?) {
+        guard let layer = model.layer(id: layerID), !model.isEffectivelyLocked(layerID),
+              let config = layer.imageConfig,
+              let base = renderStore.originalImage(key: config.imageKey),
+              let transform = SelectionRasterizer.canvasToContentBuffer(
+                layer: layer, naturalSize: renderStore.naturalSize(for: layer, model: model),
+                config: config, parentAffine: model.parentAffine(of: layerID)),
+              let mask = SelectionRasterizer.colorMask(selection: selection, transform: transform,
+                                                        pixelSize: config.pixelSize,
+                                                        colorSettings: model.colorSettings) else { return }
+        let width = Int(config.pixelSize.width), height = Int(config.pixelSize.height)
+        guard let patch = model.colorSettings.makeRGBAContext(width: width, height: height),
+              let output = model.colorSettings.makeRGBAContext(width: width, height: height) else { return }
+        let rect = CGRect(x: 0, y: 0, width: width, height: height)
+        let scale = config.pixelSize.width / max(renderStore.naturalSize(for: layer, model: model).width, 1)
+        patch.translateBy(x: -sourceOffset.dx * scale, y: sourceOffset.dy * scale)
+        patch.draw(base, in: rect)
+        patch.setBlendMode(.destinationIn); patch.draw(mask, in: rect)
+        guard let patchImage = patch.makeImage() else { return }
+        output.draw(base, in: rect)
+        output.setAlpha(0.82); output.draw(patchImage, in: rect)
+        guard let result = output.makeImage(), let data = PNGExporter.pngData(result) else { return }
+        let key = storeImage(data: data, fileExtension: "png")
+        update(undoManager, actionName: "Patch Selection") { model in
+            model.modifyLayer(id: layerID) { layer in
+                layer.recordSourceIfNeeded(); layer.modifyImage { $0.imageKey = key }
+            }
+        }
+    }
+
     @MainActor
     func superResolveLayer(layerID: UUID, renderStore: RenderStore,
                            undoManager: UndoManager?) {

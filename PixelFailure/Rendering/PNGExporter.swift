@@ -6,7 +6,7 @@ import Foundation
 /// Renders the document into a bitmap at an exact pixel size and encodes PNG.
 /// If the target aspect differs from the canvas, the artwork scales to fill
 /// and center-crops — the wallpaper-friendly behavior.
-enum PNGExporter {
+nonisolated enum PNGExporter {
     static func render(items: [RenderItem],
                        background: RGBAColor,
                        canvasSize: CGSize,
@@ -31,15 +31,28 @@ enum PNGExporter {
                         y: (targetPixelSize.height - canvasSize.height * scale) / 2)
         ctx.scaleBy(x: scale, y: scale)
 
+        drawCanvas(items: items, background: background, canvasSize: canvasSize,
+                   context: ctx, space: space)
+
+        return ctx.makeImage()
+    }
+
+    /// Shared Core Graphics ground truth for export and retained viewport tiles.
+    /// The caller supplies the canvas-to-destination transform; drawing here
+    /// always happens in the document's y-down canvas coordinate system.
+    static func drawCanvas(items: [RenderItem],
+                           background: RGBAColor,
+                           canvasSize: CGSize,
+                           context ctx: CGContext,
+                           space: WorkingColorSpace) {
+        ctx.saveGState()
         ctx.clip(to: CGRect(origin: .zero, size: canvasSize))
         ctx.setFillColor(background.cgColor(in: space))
         ctx.fill(CGRect(origin: .zero, size: canvasSize))
-
         for item in items {
             drawItem(item, context: ctx, space: space)
         }
-
-        return ctx.makeImage()
+        ctx.restoreGState()
     }
 
     /// Draws one item (recursively for groups) with opacity, blend mode,
@@ -53,23 +66,53 @@ enum PNGExporter {
         ctx.concatenate(item.transform)
 
         let naturalRect = CGRect(origin: .zero, size: item.naturalSize)
+        if let deformation = item.deformation {
+            drawDeformed(item, deformation: deformation, naturalRect: naturalRect,
+                         context: ctx, space: space)
+        } else {
+            for style in item.styles where style.isEnabled {
+                drawStyle(style, content: item.content, naturalRect: naturalRect, context: ctx, space: space)
+            }
+            drawContent(item.content, naturalRect: naturalRect, context: ctx, space: space)
 
-        for style in item.styles where style.isEnabled {
-            drawStyle(style, content: item.content, naturalRect: naturalRect, context: ctx, space: space)
-        }
-        drawContent(item.content, naturalRect: naturalRect, context: ctx, space: space)
-
-        // Mask inside the layer's transparency layer: keep only the pixels
-        // where the mask's alpha is set.
-        if let mask = item.mask {
-            ctx.saveGState()
-            ctx.setBlendMode(.destinationIn)
-            drawUpright(mask.alpha, in: naturalRect, context: ctx)
-            ctx.restoreGState()
+            // Mask inside the layer's transparency layer: keep only the pixels
+            // where the mask's alpha is set.
+            if let mask = item.mask {
+                ctx.saveGState()
+                ctx.setBlendMode(.destinationIn)
+                drawUpright(mask.alpha, in: naturalRect, context: ctx)
+                ctx.restoreGState()
+            }
         }
 
         ctx.endTransparencyLayer()
         ctx.restoreGState()
+    }
+
+    private static func drawDeformed(_ item: RenderItem, deformation: LayerDeformation,
+                                     naturalRect: CGRect, context ctx: CGContext,
+                                     space: WorkingColorSpace) {
+        for triangle in deformation.triangles(size: item.naturalSize) {
+            guard let map = triangle.affine else { continue }
+            ctx.saveGState()
+            let destination = CGMutablePath()
+            destination.move(to: triangle.destination.0)
+            destination.addLine(to: triangle.destination.1)
+            destination.addLine(to: triangle.destination.2)
+            destination.closeSubpath()
+            ctx.addPath(destination)
+            ctx.clip()
+            ctx.concatenate(map)
+            for style in item.styles where style.isEnabled {
+                drawStyle(style, content: item.content, naturalRect: naturalRect, context: ctx, space: space)
+            }
+            drawContent(item.content, naturalRect: naturalRect, context: ctx, space: space)
+            if let mask = item.mask {
+                ctx.setBlendMode(.destinationIn)
+                drawUpright(mask.alpha, in: naturalRect, context: ctx)
+            }
+            ctx.restoreGState()
+        }
     }
 
     private static func drawContent(_ content: RenderItem.Content, naturalRect: CGRect,

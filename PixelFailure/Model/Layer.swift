@@ -431,6 +431,11 @@ nonisolated enum TextAlignmentChoice: String, Codable, CaseIterable, Hashable, S
     }
 }
 
+nonisolated enum TextVerticalAlignment: String, Codable, CaseIterable, Hashable, Sendable {
+    case top, center, bottom
+    var displayName: String { rawValue.capitalized }
+}
+
 nonisolated struct TextConfig: Codable, Hashable, Sendable {
     var text: String
     var fontFamily: String
@@ -447,6 +452,11 @@ nonisolated struct TextConfig: Codable, Hashable, Sendable {
     var boxSize: CGSize?
     var styleRuns: [TextStyleRun]?
     var pathLayerID: UUID?
+    /// Optional for manifest back-compat; nil means the historic defaults.
+    var verticalAlignment: TextVerticalAlignment?
+    var ligatures: Bool?
+    var smallCaps: Bool?
+    var stylisticAlternates: Int?
 
     init(text: String = "UNTITLED",
          fontFamily: String = "Helvetica Neue",
@@ -458,7 +468,10 @@ nonisolated struct TextConfig: Codable, Hashable, Sendable {
          alignment: TextAlignmentChoice = .center,
          color: RGBAColor = RGBAColor(hex: "#EFE8D8"),
          allCaps: Bool = true, boxSize: CGSize? = nil,
-         styleRuns: [TextStyleRun]? = nil, pathLayerID: UUID? = nil) {
+         styleRuns: [TextStyleRun]? = nil, pathLayerID: UUID? = nil,
+         verticalAlignment: TextVerticalAlignment? = nil,
+         ligatures: Bool? = nil, smallCaps: Bool? = nil,
+         stylisticAlternates: Int? = nil) {
         self.text = text
         self.fontFamily = fontFamily
         self.weight = weight
@@ -472,6 +485,10 @@ nonisolated struct TextConfig: Codable, Hashable, Sendable {
         self.boxSize = boxSize
         self.styleRuns = styleRuns
         self.pathLayerID = pathLayerID
+        self.verticalAlignment = verticalAlignment
+        self.ligatures = ligatures
+        self.smallCaps = smallCaps
+        self.stylisticAlternates = stylisticAlternates
     }
 
     var displayText: String { allCaps ? text.uppercased() : text }

@@ -100,23 +100,22 @@ enum SVGExporter {
             body += "<g mask=\"url(#\(maskID))\">\n"
         }
 
-        switch item.content {
-        case .primitives(let primitives):
-            for primitive in primitives {
-                body += pathElement(primitive)
+        if let deformation = item.deformation {
+            for (triangleIndex, triangle) in deformation.triangles(size: item.naturalSize).enumerated() {
+                guard let map = triangle.affine else { continue }
+                let clipID = "mesh\(index)_\(triangleIndex)"
+                let points = [triangle.destination.0, triangle.destination.1, triangle.destination.2]
+                    .map { "\(fmt(Double($0.x))),\(fmt(Double($0.y)))" }.joined(separator: " ")
+                defs += "<clipPath id=\"\(clipID)\" clipPathUnits=\"userSpaceOnUse\"><polygon points=\"\(points)\"/></clipPath>\n"
+                body += "<g clip-path=\"url(#\(clipID))\"><g transform=\"\(matrix(map))\">\n"
+                body += contentElement(item.content, size: item.naturalSize,
+                                       index: index * 1000 + triangleIndex,
+                                       defs: &defs, idCounter: &idCounter)
+                body += "</g></g>\n"
             }
-        case .raster(let image):
-            if let png = PNGExporter.pngData(image) {
-                let base64 = png.base64EncodedString()
-                body += "<image width=\"\(fmt(Double(item.naturalSize.width)))\" height=\"\(fmt(Double(item.naturalSize.height)))\" "
-                body += "preserveAspectRatio=\"none\" xlink:href=\"data:image/png;base64,\(base64)\"/>\n"
-            }
-        case .fill(let config):
-            body += fillElement(config, size: item.naturalSize, index: index, defs: &defs)
-        case .group(let children):
-            for child in children {
-                body += element(for: child, defs: &defs, idCounter: &idCounter)
-            }
+        } else {
+            body += contentElement(item.content, size: item.naturalSize, index: index,
+                                   defs: &defs, idCounter: &idCounter)
         }
 
         if item.mask != nil {
@@ -124,6 +123,26 @@ enum SVGExporter {
         }
         body += "</g>\n"
         return body
+    }
+
+    private static func contentElement(_ content: RenderItem.Content, size: CGSize,
+                                       index: Int, defs: inout String,
+                                       idCounter: inout Int) -> String {
+        switch content {
+        case .primitives(let primitives):
+            return primitives.map(pathElement).joined()
+        case .raster(let image):
+            guard let png = PNGExporter.pngData(image) else { return "" }
+            return "<image width=\"\(fmt(Double(size.width)))\" height=\"\(fmt(Double(size.height)))\" preserveAspectRatio=\"none\" xlink:href=\"data:image/png;base64,\(png.base64EncodedString())\"/>\n"
+        case .fill(let config):
+            return fillElement(config, size: size, index: index, defs: &defs)
+        case .group(let children):
+            return children.map { element(for: $0, defs: &defs, idCounter: &idCounter) }.joined()
+        }
+    }
+
+    private static func matrix(_ t: CGAffineTransform) -> String {
+        "matrix(\(fmt(t.a)),\(fmt(t.b)),\(fmt(t.c)),\(fmt(t.d)),\(fmt(t.tx)),\(fmt(t.ty)))"
     }
 
     private static func styleFilter(_ styles: [LayerStyle], index: Int,

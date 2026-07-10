@@ -1,4 +1,6 @@
+import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Reusable "add layer" menu items, shared by the sidebar + button, the tool
 /// strip, and the Layer app menu.
@@ -164,9 +166,16 @@ struct ToolOptionsBar: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             case .hand:
-                Text("Drag to pan the canvas.")
+                Text("Drag to pan")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("Rotate")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                NumericSlider(value: Binding(
+                    get: { editorState.canvasRotationDegrees },
+                    set: { editorState.canvasRotationDegrees = $0 }),
+                    range: -180...180, defaultValue: 0, fractionDigits: 1)
+                    .frame(width: 130)
+                Button("Reset View") { editorState.canvasRotationDegrees = 0 }
             case .pen:
                 Text("Click to create path nodes · Return to close the path.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -245,13 +254,19 @@ struct ToolOptionsBar: View {
         Picker("Preset", selection: Binding(
             get: { brush.selectedPresetID },
             set: { id in
-                if let preset = BrushPreset.builtIns.first(where: { $0.id == id }) {
+                if let preset = brush.presets.first(where: { $0.id == id }) {
                     brush.apply(preset)
                 }
             })) {
-            ForEach(BrushPreset.builtIns) { preset in Text(preset.name).tag(preset.id) }
+            ForEach(brush.presets) { preset in Text(preset.name).tag(preset.id) }
         }
         .frame(width: 130)
+
+        Menu {
+            Button("Import Presets…") { importBrushPresets(into: brush) }
+            Button("Export Custom Presets…") { exportBrushPresets(brush.customPresets) }
+                .disabled(brush.customPresets.isEmpty)
+        } label: { Image(systemName: "paintbrush.pointed") }
 
         if editorState.editingMaskLayerID != nil {
             Label("Editing Mask", systemImage: "circle.lefthalf.filled")
@@ -310,6 +325,18 @@ struct ToolOptionsBar: View {
                               range: 0...1, defaultValue: 0)
                     .frame(width: 130)
             }
+            LabeledContent("Angle Jitter") {
+                NumericSlider(value: Binding(get: { brush.angleJitter }, set: { brush.angleJitter = $0 }),
+                              range: 0...1, defaultValue: 0).frame(width: 130)
+            }
+            LabeledContent("Tip Aspect") {
+                NumericSlider(value: Binding(get: { brush.tipAspect }, set: { brush.tipAspect = $0 }),
+                              range: 0.1...1, defaultValue: 1).frame(width: 130)
+            }
+            LabeledContent("Grain") {
+                NumericSlider(value: Binding(get: { brush.grain }, set: { brush.grain = $0 }),
+                              range: 0...1, defaultValue: 0).frame(width: 130)
+            }
             Toggle("Pressure → Size", isOn: Binding(get: { brush.pressureControlsSize },
                                                      set: { brush.pressureControlsSize = $0 }))
             Toggle("Pressure → Opacity", isOn: Binding(get: { brush.pressureControlsOpacity },
@@ -358,5 +385,24 @@ struct ToolOptionsBar: View {
                 }
             }
         }
+    }
+
+    private func importBrushPresets(into brush: BrushSettings) {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = ["pfbrush", "abr"].compactMap { UTType(filenameExtension: $0) }
+        guard panel.runModal() == .OK, let url = panel.url,
+              let data = try? Data(contentsOf: url),
+              let presets = try? BrushPresetLibrary.import(data, fileExtension: url.pathExtension) else { return }
+        brush.customPresets.append(contentsOf: presets)
+        if let first = presets.first { brush.apply(first) }
+    }
+
+    private func exportBrushPresets(_ presets: [BrushPreset]) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "Brushes.pfbrush"
+        if let type = UTType(filenameExtension: "pfbrush") { panel.allowedContentTypes = [type] }
+        guard panel.runModal() == .OK, let url = panel.url,
+              let data = try? BrushPresetLibrary.export(presets) else { return }
+        try? data.write(to: url, options: .atomic)
     }
 }

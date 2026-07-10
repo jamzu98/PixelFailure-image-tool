@@ -9,6 +9,7 @@ struct InspectorView: View {
     @Environment(\.undoManager) private var undoManager
     @State private var draftWidth: Int = 0
     @State private var draftHeight: Int = 0
+    @State private var snapshotName = "Snapshot"
 
     var body: some View {
         VStack(spacing: 0) {
@@ -50,12 +51,43 @@ struct InspectorView: View {
                 } else {
                     canvasSection
                 }
+                historySection
             }
             .formStyle(.grouped)
 
             Divider()
 
             PalettePanel(document: document, editorState: editorState, renderStore: renderStore)
+        }
+    }
+
+    private var historySection: some View {
+        Section("History & Snapshots") {
+            DisclosureGroup("Recent History (\(document.history.count))") {
+                ForEach(Array(document.history.suffix(30).reversed())) { state in
+                    Button {
+                        document.jumpToHistory(state.id, undoManager: undoManager)
+                    } label: {
+                        HStack {
+                            Text(state.name)
+                            Spacer()
+                            Text(state.createdAt, style: .time).foregroundStyle(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            HStack {
+                TextField("Snapshot name", text: $snapshotName)
+                Button("Save") {
+                    document.createCheckpoint(name: snapshotName.isEmpty ? "Snapshot" : snapshotName)
+                }
+            }
+            ForEach(document.checkpoints) { state in
+                Button("Restore \(state.name)") {
+                    document.restoreCheckpoint(state.id, undoManager: undoManager)
+                }
+            }
         }
     }
 
@@ -252,6 +284,53 @@ struct InspectorView: View {
                 }
             }
 
+            LabeledContent("Skew") {
+                HStack(spacing: 4) {
+                    numericField("X°", value: Binding(
+                        get: { document.model.layer(id: layer.id)?.transform.skewXDegrees ?? 0 },
+                        set: { value in document.update(undoManager, actionName: "Skew") {
+                            $0.modifyLayer(id: layer.id) { $0.transform.skewXDegrees = value }
+                        }}))
+                    numericField("Y°", value: Binding(
+                        get: { document.model.layer(id: layer.id)?.transform.skewYDegrees ?? 0 },
+                        set: { value in document.update(undoManager, actionName: "Skew") {
+                            $0.modifyLayer(id: layer.id) { $0.transform.skewYDegrees = value }
+                        }}))
+                }
+            }
+
+            HStack {
+                Button("Corner Pin") {
+                    document.update(undoManager, actionName: "Corner Pin") {
+                        $0.modifyLayer(id: layer.id) { $0.transform.deformation = .identityCornerPin }
+                    }
+                }
+                Button("Warp 3×3") {
+                    let points = (0..<3).flatMap { row in (0..<3).map { column in
+                        CGPoint(x: Double(column) / 2, y: Double(row) / 2)
+                    }}
+                    document.update(undoManager, actionName: "Warp Mesh") {
+                        $0.modifyLayer(id: layer.id) {
+                            $0.transform.deformation = .warpMesh(columns: 3, rows: 3, points: points)
+                        }
+                    }
+                }
+                if layer.transform.deformation != nil {
+                    Button("Clear Distort") {
+                        document.update(undoManager, actionName: "Clear Distortion") {
+                            $0.modifyLayer(id: layer.id) { $0.transform.deformation = nil }
+                        }
+                    }
+                }
+            }
+            if layer.transform.deformation != nil {
+                deformationControls(layer)
+                Button("Perspective Crop to Distortion") {
+                    document.perspectiveCrop(to: layer.id, renderStore: renderStore,
+                                             undoManager: undoManager)
+                }
+            }
+
             HStack {
                 Button("Center") {
                     document.update(undoManager, actionName: "Center Layer") { model in
@@ -276,6 +355,50 @@ struct InspectorView: View {
             }
         }
         .disabled(document.model.isEffectivelyLocked(layer.id))
+    }
+
+    @ViewBuilder
+    private func deformationControls(_ layer: Layer) -> some View {
+        let points: [CGPoint] = switch layer.transform.deformation {
+        case .cornerPin(let points): points
+        case .warpMesh(_, _, let points): points
+        case nil: []
+        }
+        DisclosureGroup("Distortion Points") {
+            ForEach(points.indices, id: \.self) { index in
+                LabeledContent("P\(index + 1)") {
+                    HStack(spacing: 4) {
+                        numericField("X", value: Binding(
+                            get: { points[index].x },
+                            set: { setDeformationPoint(layer.id, index: index,
+                                                       point: CGPoint(x: $0, y: points[index].y)) }))
+                        numericField("Y", value: Binding(
+                            get: { points[index].y },
+                            set: { setDeformationPoint(layer.id, index: index,
+                                                       point: CGPoint(x: points[index].x, y: $0)) }))
+                    }
+                }
+            }
+            Text("Coordinates are normalized to the layer; values outside 0…1 are allowed.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private func setDeformationPoint(_ layerID: UUID, index: Int, point: CGPoint) {
+        document.update(undoManager, actionName: "Distort Point") { model in
+            model.modifyLayer(id: layerID) { layer in
+                switch layer.transform.deformation {
+                case .cornerPin(var points):
+                    guard points.indices.contains(index) else { return }
+                    points[index] = point; layer.transform.deformation = .cornerPin(points)
+                case .warpMesh(let columns, let rows, var points):
+                    guard points.indices.contains(index) else { return }
+                    points[index] = point
+                    layer.transform.deformation = .warpMesh(columns: columns, rows: rows, points: points)
+                case nil: break
+                }
+            }
+        }
     }
 
     // MARK: - Multiple selection
@@ -538,6 +661,32 @@ struct InspectorView: View {
             if draftSizeDiffers {
                 Button("Apply Size") { applyDraftSize() }
                     .keyboardShortcut(.defaultAction)
+            }
+
+            LabeledContent("Resolution") {
+                HStack {
+                    TextField("DPI", value: Binding(
+                        get: { document.model.printSettings.dpi },
+                        set: { dpi in document.update(undoManager, actionName: "Print Resolution") {
+                            $0.printSettings.dpi = max(1, dpi)
+                        }}), format: .number.precision(.fractionLength(0)))
+                        .frame(width: 62)
+                    Text("dpi").foregroundStyle(.secondary)
+                }
+            }
+            let physical = document.model.printSettings.physicalSize(for: document.model.canvasSize)
+            Text(String(format: "Print size %.2f × %.2f in", physical.width, physical.height))
+                .font(.caption).foregroundStyle(.secondary)
+
+            Button("Add Full-canvas Export Slice") {
+                document.update(undoManager, actionName: "Add Export Slice") {
+                    $0.exportSlices.append(ExportSlice(name: "Artwork",
+                                                       rect: CGRect(origin: .zero, size: $0.canvasSize)))
+                }
+            }
+            ForEach(document.model.exportSlices) { slice in
+                Text("\(slice.name) · \(slice.scales.map { "@\($0)x" }.joined(separator: ", "))")
+                    .font(.caption)
             }
 
             ColorPicker("Background", selection: Binding(

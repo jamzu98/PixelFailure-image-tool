@@ -26,7 +26,7 @@ struct ExportSheet: View {
 
     private enum Format: String, CaseIterable {
         case png = "PNG", jpeg = "JPEG", tiff = "TIFF", heic = "HEIC", webp = "WebP"
-        case pdf = "PDF", svg = "SVG"
+        case pdf = "PDF", svg = "SVG", psd = "PSD"
 
         var raster: ImageEncoder.Format? {
             switch self {
@@ -35,14 +35,19 @@ struct ExportSheet: View {
             case .tiff: .tiff
             case .heic: .heic
             case .webp: .webp
-            case .pdf, .svg: nil
+            case .pdf, .svg, .psd: nil
             }
         }
 
         var isAvailable: Bool { raster?.isAvailable ?? true }
 
-        var utType: UTType { raster?.utType ?? (self == .pdf ? .pdf : .svg) }
-        var fileExtension: String { raster?.fileExtension ?? (self == .pdf ? "pdf" : "svg") }
+        var utType: UTType {
+            if let raster { return raster.utType }
+            if self == .pdf { return .pdf }
+            if self == .psd { return UTType(filenameExtension: "psd") ?? .data }
+            return .svg
+        }
+        var fileExtension: String { raster?.fileExtension ?? (self == .pdf ? "pdf" : self == .psd ? "psd" : "svg") }
     }
 
     @State private var format: Format = .png
@@ -66,7 +71,7 @@ struct ExportSheet: View {
             }
             .pickerStyle(.segmented)
 
-            if format != .svg {
+            if format != .svg && format != .psd {
                 Picker("Size", selection: $presetIndex) {
                     ForEach(SizePreset.exportPresets.indices, id: \.self) { i in
                         Text(SizePreset.exportPresets[i].name).tag(i)
@@ -111,7 +116,9 @@ struct ExportSheet: View {
                         .foregroundStyle(.secondary)
                 }
             } else {
-                Text("Patterns, shapes, and text export as true vectors; image layers are embedded as PNG.")
+                Text(format == .psd
+                     ? "Exports names, opacity, blend modes, visibility, and one raster channel set per layer."
+                     : "Patterns, shapes, and text export as true vectors; image layers are embedded as PNG.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if !document.model.canvasEffects.isEmpty {
@@ -128,6 +135,9 @@ struct ExportSheet: View {
             }
 
             HStack {
+                if !document.model.exportSlices.isEmpty {
+                    Button("Export Slices…") { exportSlices() }
+                }
                 Spacer()
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
@@ -141,7 +151,7 @@ struct ExportSheet: View {
     }
 
     private func targetSize() -> CGSize {
-        guard format != .svg else { return document.model.canvasSize }
+        guard format != .svg && format != .psd else { return document.model.canvasSize }
         let preset = SizePreset.exportPresets[presetIndex]
         if preset.size == .zero {
             return CGSize(width: max(16, customWidth), height: max(16, customHeight))
@@ -199,8 +209,16 @@ struct ExportSheet: View {
                     image = EffectPipeline.shared.apply(effects: model.canvasEffects,
                                                         to: image, palette: model.palette)
                 }
-                guard let data = PDFExporter.data(image: image, pageSize: targetSize()) else {
+                let inches = model.printSettings.physicalSize(for: targetSize())
+                let page = CGSize(width: inches.width * 72, height: inches.height * 72)
+                guard let data = PDFExporter.data(image: image, pageSize: page) else {
                     errorMessage = "PDF encoding failed."
+                    return
+                }
+                try data.write(to: url)
+            } else if format == .psd {
+                guard let data = PSDExporter.data(model: model, renderStore: renderStore) else {
+                    errorMessage = "PSD encoding failed."
                     return
                 }
                 try data.write(to: url)
@@ -216,5 +234,22 @@ struct ExportSheet: View {
         } catch {
             errorMessage = "Export failed: \(error.localizedDescription)"
         }
+    }
+
+    private func exportSlices() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true; panel.canChooseFiles = false
+        panel.canCreateDirectories = true; panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let directory = panel.url,
+              let image = PNGExporter.render(items: renderStore.renderItems(model: document.model, quality: .full),
+                                             background: document.model.background,
+                                             canvasSize: document.model.canvasSize,
+                                             targetPixelSize: document.model.canvasSize,
+                                             colorSettings: document.model.colorSettings) else { return }
+        do {
+            for asset in AssetExporter.assets(from: image, slices: document.model.exportSlices) {
+                try asset.data.write(to: directory.appendingPathComponent(asset.name), options: .atomic)
+            }
+        } catch { errorMessage = "Slice export failed: \(error.localizedDescription)" }
     }
 }

@@ -29,12 +29,15 @@ struct RenderItem: Identifiable {
     var transform: CGAffineTransform
     var naturalSize: CGSize
     var content: Content
+    var deformation: LayerDeformation? = nil
     var mask: RenderMask?
     var styles: [LayerStyle] = []
     var svgWarning: String? = nil
 }
 
-enum RenderQuality {
+nonisolated enum RenderQuality: Hashable, Sendable {
+    /// Fast mip used only while a continuous editor gesture is in flight.
+    case proxy
     /// Rasters capped to a working resolution for interactive speed.
     case preview
     /// Native resolution — used at export time.
@@ -42,23 +45,39 @@ enum RenderQuality {
 
     var maxRasterDimension: Int? {
         switch self {
+        case .proxy: 512
         case .preview: 1600
         case .full: nil
         }
     }
 }
 
+nonisolated enum RenderInvalidationRegion: Equatable, Sendable {
+    case none
+    case rect(CGRect)
+    case full
+}
+
+nonisolated struct ViewportInvalidation: Equatable, Sendable {
+    var revision: UInt64
+    var region: RenderInvalidationRegion
+
+    static let initial = ViewportInvalidation(revision: 0, region: .full)
+}
+
 /// Per-document render cache: decoded images, resolved effect chains,
 /// generated primitives. Owned by the editor window; all main-actor.
-final class RenderStore {
+final class RenderStore: ObservableObject {
     private unowned let document: PixelDocument
+
+    @Published private(set) var viewportInvalidation: ViewportInvalidation = .initial
 
     private var decodedImages: [String: CGImage] = [:]
     private var previewImages: [UUID: (hash: Int, image: CGImage)] = [:]
     private var primitives: [UUID: (hash: Int, primitives: [VectorPrimitive], naturalSize: CGSize)] = [:]
     private var samplers: [UUID: (hash: Int, sampler: ImageSampler)] = [:]
     private var masks: [UUID: (hash: Int, mask: RenderMask)] = [:]
-    private var composite: (hash: Int, image: CGImage)?
+    private var composites: [RenderQuality: (hash: Int, image: CGImage)] = [:]
     private var thumbnails: [UUID: (hash: Int, image: CGImage)] = [:]
 
     /// While a brush stroke is in flight, this session's buffer overrides the
@@ -102,8 +121,23 @@ final class RenderStore {
         primitives.removeAll()
         samplers.removeAll()
         masks.removeAll()
-        composite = nil
+        composites.removeAll()
         thumbnails.removeAll()
+    }
+
+    /// Converts a model mutation into a canvas-space dirty region. Workspace,
+    /// selection, and animation-settings-only changes intentionally produce no
+    /// redraw; structural/global and evaluated-animation changes conservatively
+    /// invalidate the canvas.
+    func modelDidChange(from oldModel: ProjectModel, to newModel: ProjectModel) {
+        let region = RenderInvalidationPlanner.region(from: oldModel, to: newModel) {
+            [weak self] layer, model in
+            self?.renderBounds(for: layer, model: model) ?? .zero
+        }
+        guard region != .none else { return }
+        viewportInvalidation = ViewportInvalidation(
+            revision: viewportInvalidation.revision &+ 1,
+            region: region)
     }
 
     /// Small sidebar thumbnail of one layer's content (mask applied,
@@ -150,25 +184,34 @@ final class RenderStore {
     /// preview resolution. Used by the viewport when canvasEffects is
     /// non-empty. `extraHash` lets callers force refresh (e.g. paint ticks).
     func compositePreview(model: ProjectModel, extraHash: Int = 0) -> CGImage? {
+        composite(model: model, quality: .preview, extraHash: extraHash)
+    }
+
+    /// Flattened composite for the requested viewport tier. Proxy and preview
+    /// tiers are mip-sized; idle `.full` uses the native canvas dimensions.
+    func composite(model: ProjectModel, quality: RenderQuality,
+                   extraHash: Int = 0) -> CGImage? {
         guard !model.canvasEffects.isEmpty else { return nil }
         var hasher = Hasher()
         hasher.combine(model)
+        hasher.combine(quality)
         hasher.combine(extraHash)
         let hash = hasher.finalize()
-        if let composite, composite.hash == hash { return composite.image }
+        if let cached = composites[quality], cached.hash == hash { return cached.image }
 
-        let maxDim = 1400.0
+        let maxDim = quality.maxRasterDimension.map(Double.init)
+            ?? Double(max(model.canvasSize.width, model.canvasSize.height))
         let scale = min(1, maxDim / Double(max(model.canvasSize.width, model.canvasSize.height)))
         let target = CGSize(width: max(8, model.canvasSize.width * scale),
                             height: max(8, model.canvasSize.height * scale))
-        let items = renderItems(model: model, quality: .preview)
+        let items = renderItems(model: model, quality: quality)
         guard let flat = PNGExporter.render(items: items,
                                             background: model.background,
                                             canvasSize: model.canvasSize,
                                             targetPixelSize: target,
                                             colorSettings: model.colorSettings.previewVariant) else { return nil }
         let result = EffectPipeline.shared.apply(effects: model.canvasEffects, to: flat, palette: model.palette)
-        composite = (hash, result)
+        composites[quality] = (hash, result)
         return result
     }
 
@@ -250,6 +293,7 @@ final class RenderStore {
                               transform: layer.transform.affine(naturalSize: result.naturalSize),
                               naturalSize: result.naturalSize,
                               content: .primitives(result.primitives),
+                              deformation: layer.transform.deformation,
                               mask: mask)
         case .image(let config):
             guard let image = resolvedImage(for: layer, config: config, model: model, quality: quality) else { return nil }
@@ -260,6 +304,7 @@ final class RenderStore {
                               transform: layer.transform.affine(naturalSize: naturalSize),
                               naturalSize: naturalSize,
                               content: .raster(image),
+                              deformation: layer.transform.deformation,
                               mask: mask)
         case .fill(let config):
             return RenderItem(id: layer.id,
@@ -268,6 +313,7 @@ final class RenderStore {
                               transform: layer.transform.affine(naturalSize: model.canvasSize),
                               naturalSize: model.canvasSize,
                               content: .fill(config),
+                              deformation: layer.transform.deformation,
                               mask: mask)
         case .group(let config):
             let children = resolve(layers: config.children, model: model, quality: quality)
@@ -277,6 +323,7 @@ final class RenderStore {
                               transform: layer.transform.affine(naturalSize: model.canvasSize),
                               naturalSize: model.canvasSize,
                               content: .group(children),
+                              deformation: layer.transform.deformation,
                               mask: mask)
         case .adjustment:
             return nil
@@ -427,6 +474,7 @@ final class RenderStore {
         var hasher = Hasher()
         hasher.combine(config)
         hasher.combine(model.palette)
+        hasher.combine(quality)
         let hash = hasher.finalize()
 
         if quality.maxRasterDimension != nil, let cached = previewImages[layer.id], cached.hash == hash {
@@ -484,5 +532,80 @@ final class RenderStore {
         ctx.interpolationQuality = .high
         ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
         return ctx.makeImage()
+    }
+
+    private func renderBounds(for layer: Layer, model: ProjectModel) -> CGRect {
+        let size = naturalSize(for: layer, model: model)
+        guard size.width > 0, size.height > 0 else { return .zero }
+        let local = layer.transform.affine(naturalSize: size)
+        let world = local.concatenating(model.parentAffine(of: layer.id))
+        var bounds: CGRect
+        if let deformation = layer.transform.deformation {
+            let points = deformation.triangles(size: size).flatMap {
+                [$0.destination.0, $0.destination.1, $0.destination.2]
+            }.map { $0.applying(world) }
+            if let first = points.first {
+                bounds = points.dropFirst().reduce(CGRect(origin: first, size: .zero)) {
+                    $0.union(CGRect(origin: $1, size: .zero))
+                }.standardized
+            } else {
+                bounds = CGRect(origin: .zero, size: size).applying(world).standardized
+            }
+        } else {
+            bounds = CGRect(origin: .zero, size: size).applying(world).standardized
+        }
+        let worldScale = max(hypot(world.a, world.b), hypot(world.c, world.d))
+        for style in layer.styles where style.isEnabled {
+            let outset = (style.size + max(abs(style.offsetX), abs(style.offsetY))) * worldScale
+            bounds = bounds.insetBy(dx: -outset, dy: -outset)
+        }
+        // Cover Core Graphics antialiasing that can extend just outside the
+        // mathematical layer bounds and into an adjacent retained tile.
+        return bounds.insetBy(dx: -2, dy: -2)
+    }
+}
+
+enum RenderInvalidationPlanner {
+    typealias Bounds = (_ layer: Layer, _ model: ProjectModel) -> CGRect
+
+    static func region(from oldModel: ProjectModel, to newModel: ProjectModel,
+                       bounds: Bounds) -> RenderInvalidationRegion {
+        guard oldModel != newModel else { return .none }
+
+        if oldModel.canvasSize != newModel.canvasSize
+            || oldModel.background != newModel.background
+            || oldModel.colorSettings != newModel.colorSettings
+            || oldModel.palette != newModel.palette
+            || oldModel.canvasEffects != newModel.canvasEffects
+            || oldModel.animation != newModel.animation {
+            return .full
+        }
+
+        let oldLayers = oldModel.allLayers
+        let newLayers = newModel.allLayers
+        guard oldLayers.map(\.id) == newLayers.map(\.id) else { return .full }
+        for layer in oldLayers {
+            guard oldModel.parentGroupID(of: layer.id) == newModel.parentGroupID(of: layer.id) else {
+                return .full
+            }
+        }
+
+        var dirty: CGRect?
+        for oldLayer in oldLayers {
+            guard let newLayer = newModel.layer(id: oldLayer.id), oldLayer != newLayer else { continue }
+            if oldLayer.kind.isGroup || newLayer.kind.isGroup
+                || oldLayer.kind.isAdjustment || newLayer.kind.isAdjustment
+                || oldLayer.clipsToBelow || newLayer.clipsToBelow {
+                return .full
+            }
+            let changed = bounds(oldLayer, oldModel).union(bounds(newLayer, newModel))
+            guard !changed.isNull, !changed.isEmpty else { continue }
+            dirty = dirty.map { $0.union(changed) } ?? changed
+        }
+
+        guard let dirty else { return .none }
+        let canvas = CGRect(origin: .zero, size: newModel.canvasSize)
+        let clipped = dirty.intersection(canvas)
+        return clipped.isNull || clipped.isEmpty ? .none : .rect(clipped)
     }
 }

@@ -60,20 +60,24 @@ Rasterize also stopped baking below native resolution, so a scaled-down
 layer keeps its full pixel fidelity. Transforms themselves were already
 live (never baked), so nothing re-samples from a bake.
 
-## Stage 3 — Tiled/Metal viewport & proxy rendering
+## Stage 3 — Tiled/Metal viewport & proxy rendering ✅
 
-The performance gate, carried over from v1. Stage 1 doubles memory per pixel,
-so tiling can't wait any longer. No later feature matters if the canvas
-stutters at 12 000 × 8 000 with 80 layers.
+Shipped as a display-linked retained `CALayer` tile grid that consumes
+immutable `RenderItem` snapshots and draws every tile through the same Core
+Graphics ground truth as PNG export. Complete replacement batches are swapped
+atomically, so the prior pixels stay visible while updated tiles render in the
+background. Model diffs now produce canvas-space dirty
+rectangles for isolated layer edits and conservatively invalidate the full
+canvas for structural, palette, color-space, background, adjustment, and
+canvas-effect changes. The navigator follows render revisions instead of a
+whole-model hash. Continuous parameter edits, animation scrubbing, and
+playback use a 512-pixel proxy mip, upgrade immediately to the normal preview,
+then restore native-resolution raster/effect rendering after a short idle.
+Pan and zoom update the retained grid transform immediately; zoom replaces the
+old LOD only after the next visible grid is complete. Exports remain unchanged
+and always request full quality.
 
-- Metal- or CALayer-tile-backed canvas with dirty-rect invalidation, replacing
-  whole-model-hash re-renders (the `task(id: document.model.hashValue)`
-  pattern in `Views/CanvasViewport.swift` and `NavigatorView`)
-- Proxy/mip previews while scrubbing effect parameters; full-resolution render
-  on idle
-- Export paths unchanged — `CGContext` remains ground truth for parity
-
-## Stage 4 — Transform suite
+## Stage 4 — Transform suite ✅
 
 What compositing work reaches for constantly: fitting artwork onto a surface,
 correcting a photographed cover, distorting type.
@@ -87,7 +91,13 @@ Builds on Stage 2 (transforms stay non-destructive) and Stage 3 (live
 preview). Touchpoints: `Model/LayerTransform.swift` grows beyond affine —
 SVG/PNG/viewport parity must hold for every new transform kind.
 
-## Stage 5 — Text engine v2
+Shipped as optional normalized deformation geometry on `LayerTransform`:
+editable skew, corner-pin and regular warp meshes share triangle maps across
+the viewport, CGContext exporter, and true-vector SVG writer. Perspective crop
+uses the distorted bounds without baking pixels. Canvas rotation lives only in
+`EditorState`, so drawing can rotate freely without changing the document.
+
+## Stage 5 — Text engine v2 ✅
 
 Text layers are currently single-run point text. Pro-grade typography means:
 
@@ -99,7 +109,12 @@ Text layers are currently single-run point text. Pro-grade typography means:
 Keep outlining through `Rendering/TextOutliner.swift` so SVG export stays
 true-vector — that's a differentiator, not a limitation.
 
-## Stage 6 — Brush engine v2
+Shipped with wrapping area boxes, vertical and horizontal alignment,
+per-range font/weight/size/color runs, editable path layers as baselines,
+ligature/small-cap/stylistic-alternate controls, and explicit tracking.
+CoreText output is still converted to paths before reaching any renderer.
+
+## Stage 6 — Brush engine v2 ✅
 
 The NSEvent input layer with tablet pressure already exists
 (`Views/CanvasViewport.swift`); this stage is about the mark itself.
@@ -109,7 +124,12 @@ The NSEvent input layer with tablet pressure already exists
 - Stroke stabilization / smoothing amount
 - Preset browser with import/export; ABR import
 
-## Stage 7 — History & recovery
+Shipped with deterministic spacing/scatter/size/opacity/angle dynamics,
+elliptical custom tips, procedural grain, smoothing and tablet pressure. The
+preset browser reads/writes `.pfbrush`; ABR names and dynamics import with a
+documented textured-tip fallback for unsupported proprietary sampled pixels.
+
+## Stage 7 — History & recovery ✅
 
 Single linear undo isn't enough for long sessions.
 
@@ -120,7 +140,12 @@ Single linear undo isn't enough for long sessions.
 The append-only image store already gives one-undo-per-stroke; the history
 panel hangs off the same mechanism rather than a new one.
 
-## Stage 8 — Photo & retouch completeness
+Shipped with a 200-state named session history, clickable inspector history,
+persistent named document snapshots, and delayed atomic recovery archives for
+unsaved documents. History and snapshots swap models only; stored images remain
+append-only and referenced keys stay recoverable.
+
+## Stage 8 — Photo & retouch completeness ✅
 
 Design-first ordering pushed this behind text and brushes, but a professional
 tool can't lack a sharpen filter.
@@ -132,7 +157,11 @@ tool can't lack a sharpen filter.
 - RAW develop module: linear-light exposure/highlights/white-balance pipeline
   (depends on Stage 1's 16-bit buffers)
 
-## Stage 9 — Interop round-trip & print model
+Shipped with non-destructive unsharp mask, noise reduction, lens distortion /
+vignette and chromatic-aberration effects; selection-based patch healing; and
+a linear-light RAW develop stack that preserves the document's 16-bit output.
+
+## Stage 9 — Interop round-trip & print model ✅
 
 PSD import exists; collaboration is still one-way, and the canvas is pure
 pixels.
@@ -144,7 +173,12 @@ pixels.
 - Export slices and @1x/@2x/@3x asset export
 - Artboards (stretch goal)
 
-## Stage 10 — Automation & ecosystem
+Shipped with layered 8-bit RGB PSD export (names, pixels, visibility, opacity,
+clipping and supported blend modes), the existing layered importer fidelity
+path, persisted DPI/physical-size metadata, DPI-aware PDF pages, named export
+slices, and @1x/@2x/@3x asset output. Artboards remain the stated stretch goal.
+
+## Stage 10 — Automation & ecosystem ✅
 
 Late-stage, but a big part of why studios can't leave Photoshop.
 
@@ -152,6 +186,11 @@ Late-stage, but a big part of why studios can't leave Photoshop.
 - Recordable actions (macro record & replay)
 - Shortcuts and AppleScript support
 - Plugin API — aspirational; scope only after the above ship
+
+Shipped with multi-file batch application, Codable macro actions with in-app
+record/replay, a shared front-document automation bridge for Shortcuts and
+AppleScript, and a versioned plugin manifest/action contract. Dynamic plugin
+loading and a marketplace remain deferred with the marketplace non-goal below.
 
 ---
 

@@ -9,6 +9,9 @@ struct EditorView: View {
     @Environment(\.undoManager) private var undoManager
     @AppStorage("didCompleteOnboarding") private var didCompleteOnboarding = false
     @State private var importNotice: String?
+    @State private var recoveryID = UUID()
+    @State private var recoveryTask: Task<Void, Never>?
+    @State private var pendingRecoveryURL: URL?
 
     init(document: PixelDocument) {
         self.document = document
@@ -69,9 +72,51 @@ struct EditorView: View {
         } message: {
             Text(importNotice ?? "")
         }
+        .alert("Recover Unsaved Document?", isPresented: Binding(
+            get: { pendingRecoveryURL != nil },
+            set: { if !$0 { pendingRecoveryURL = nil } })) {
+                Button("Recover") { recoverPendingDocument() }
+                Button("Discard", role: .destructive) { discardPendingRecovery() }
+                Button("Later", role: .cancel) { pendingRecoveryURL = nil }
+            } message: {
+                Text("PixelFailure found an autosave left by an interrupted session.")
+            }
         .onDrop(of: [.fileURL, .image], isTargeted: nil) { providers in
             handleDrop(providers)
         }
+        .onChange(of: document.model) { oldModel, newModel in
+            renderStore.modelDidChange(from: oldModel, to: newModel)
+            recoveryTask?.cancel()
+            recoveryTask = Task { @MainActor in
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled else { return }
+                _ = try? RecoveryStore.save(document, identifier: recoveryID)
+            }
+        }
+        .onAppear {
+            AutomationBridge.shared.activeDocument = document
+            pendingRecoveryURL = RecoveryStore.available().first
+        }
+        .onDisappear {
+            recoveryTask?.cancel()
+            RecoveryStore.discard(identifier: recoveryID)
+            if AutomationBridge.shared.activeDocument === document {
+                AutomationBridge.shared.activeDocument = nil
+            }
+        }
+    }
+
+    private func recoverPendingDocument() {
+        guard let url = pendingRecoveryURL,
+              let archive = try? RecoveryStore.load(url) else { return }
+        document.restoreRecovery(archive)
+        try? RecoveryStore.discard(url)
+        pendingRecoveryURL = nil
+    }
+
+    private func discardPendingRecovery() {
+        if let url = pendingRecoveryURL { try? RecoveryStore.discard(url) }
+        pendingRecoveryURL = nil
     }
 
     // MARK: - Toolbar
@@ -130,6 +175,31 @@ struct EditorView: View {
                 Button("Show Welcome") { didCompleteOnboarding = false }
             } label: {
                 Label("Share", systemImage: "square.and.arrow.up.on.square")
+            }
+
+            Menu {
+                if editorState.isRecordingAction {
+                    Button("Stop Recording") {
+                        editorState.recordedActions.append(document.actionRecorder.stop(name: "Recorded Action"))
+                        editorState.isRecordingAction = false
+                    }
+                } else {
+                    Button("Start Recording") {
+                        document.actionRecorder.start()
+                        editorState.isRecordingAction = true
+                    }
+                }
+                Divider()
+                ForEach(editorState.recordedActions) { action in
+                    Button("Run \(action.name)") {
+                        document.update(undoManager, actionName: action.name) {
+                            ActionExecutor.apply(action, to: &$0)
+                        }
+                    }
+                }
+            } label: {
+                Label(editorState.isRecordingAction ? "Recording" : "Actions",
+                      systemImage: editorState.isRecordingAction ? "record.circle.fill" : "play.square.stack")
             }
         }
     }
@@ -231,8 +301,10 @@ struct EditorView: View {
 
     private func printArtwork() {
         guard let image = renderedArtwork() else { return }
-        let view = NSImageView(frame: CGRect(origin: .zero, size: document.model.canvasSize))
-        view.image = NSImage(cgImage: image, size: document.model.canvasSize)
+        let inches = document.model.printSettings.physicalSize(for: document.model.canvasSize)
+        let printSize = CGSize(width: inches.width * 72, height: inches.height * 72)
+        let view = NSImageView(frame: CGRect(origin: .zero, size: printSize))
+        view.image = NSImage(cgImage: image, size: printSize)
         view.imageScaling = .scaleProportionallyUpOrDown
         let operation = NSPrintOperation(view: view, printInfo: NSPrintInfo.shared)
         operation.showsPrintPanel = true
@@ -257,7 +329,7 @@ private struct OnboardingView: View {
                 onboardingRow("sidebar.left", "Layers", "Drag layers into groups; Shift-click selects several.")
                 onboardingRow("cursorarrow.motionlines", "Canvas", "Use V to move, B to paint, and P for editable paths.")
                 onboardingRow("dice", "Generative", "⌘R rerolls a seed; the variations grid explores complete parameter combinations.")
-                onboardingRow("square.and.arrow.up", "Export", "⌘E exports PNG, JPEG, TIFF, HEIC, WebP, PDF, or SVG.")
+                onboardingRow("square.and.arrow.up", "Export", "⌘E exports raster assets, PDF, SVG, or layered PSD.")
             }
             HStack {
                 Spacer()

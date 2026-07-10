@@ -82,7 +82,10 @@ final class PaintSession {
                 smoothing: Double = 0,
                 scatter: Double = 0,
                 sizeJitter: Double = 0,
-                opacityJitter: Double = 0) {
+                opacityJitter: Double = 0,
+                angleJitter: Double = 0,
+                tipAspect: Double = 1,
+                grain: Double = 0) {
         // Flip into the buffer's y-up space.
         var target = CGPoint(x: point.x, y: pixelSize.height - point.y)
         let radius = max(0.5, radius)
@@ -100,12 +103,14 @@ final class PaintSession {
                                 y: last.y + (target.y - last.y) * t)
                 dynamicStamp(at: p, radius: radius, hardness: hardness, opacity: opacity,
                              color: color, erase: erase, scatter: scatter,
-                             sizeJitter: sizeJitter, opacityJitter: opacityJitter)
+                             sizeJitter: sizeJitter, opacityJitter: opacityJitter,
+                             angleJitter: angleJitter, tipAspect: tipAspect, grain: grain)
             }
         } else {
             dynamicStamp(at: target, radius: radius, hardness: hardness, opacity: opacity,
                          color: color, erase: erase, scatter: scatter,
-                         sizeJitter: sizeJitter, opacityJitter: opacityJitter)
+                         sizeJitter: sizeJitter, opacityJitter: opacityJitter,
+                         angleJitter: angleJitter, tipAspect: tipAspect, grain: grain)
         }
         lastPoint = target
         currentImage = context.makeImage()
@@ -160,14 +165,26 @@ final class PaintSession {
     private func dynamicStamp(at center: CGPoint, radius: Double, hardness: Double,
                               opacity: Double, color: RGBAColor, erase: Bool,
                               scatter: Double, sizeJitter: Double, opacityJitter: Double) {
+        dynamicStamp(at: center, radius: radius, hardness: hardness, opacity: opacity,
+                     color: color, erase: erase, scatter: scatter, sizeJitter: sizeJitter,
+                     opacityJitter: opacityJitter, angleJitter: 0, tipAspect: 1, grain: 0)
+    }
+
+    private func dynamicStamp(at center: CGPoint, radius: Double, hardness: Double,
+                              opacity: Double, color: RGBAColor, erase: Bool,
+                              scatter: Double, sizeJitter: Double, opacityJitter: Double,
+                              angleJitter: Double, tipAspect: Double, grain: Double) {
         let angle = rng.range(0, .pi * 2)
         let spread = rng.unit() * max(scatter, 0) * radius
         let point = CGPoint(x: center.x + cos(angle) * spread,
                             y: center.y + sin(angle) * spread)
         let variedRadius = radius * (1 + rng.jitter(min(max(sizeJitter, 0), 1)))
         let variedOpacity = opacity * (1 + rng.jitter(min(max(opacityJitter, 0), 1)))
+        let grainOpacity = variedOpacity * (1 - min(max(grain, 0), 1) * rng.unit() * 0.65)
         stamp(at: point, radius: max(0.5, variedRadius), hardness: hardness,
-              opacity: min(max(variedOpacity, 0.01), 1), color: color, erase: erase)
+              opacity: min(max(grainOpacity, 0.01), 1), color: color, erase: erase,
+              angle: rng.jitter(min(max(angleJitter, 0), 1)) * .pi,
+              aspect: min(max(tipAspect, 0.1), 1))
     }
 
     private func cloneStamp(at target: CGPoint, offset: CGVector, radius: Double,
@@ -216,7 +233,9 @@ final class PaintSession {
                        hardness: Double,
                        opacity: Double,
                        color: RGBAColor,
-                       erase: Bool) {
+                       erase: Bool,
+                       angle: Double = 0,
+                       aspect: Double = 1) {
         // Radial falloff: full opacity to `hardness`, fading to zero at the rim.
         let alpha = min(max(opacity, 0.01), 1)
         let gradientColors: [CGColor]
@@ -242,9 +261,12 @@ final class PaintSession {
 
         context.saveGState()
         context.setBlendMode(erase && !isMask ? .destinationOut : .normal)
+        context.translateBy(x: center.x, y: center.y)
+        context.rotate(by: angle)
+        context.scaleBy(x: 1, y: aspect)
         context.drawRadialGradient(gradient,
-                                   startCenter: center, startRadius: 0,
-                                   endCenter: center, endRadius: CGFloat(radius),
+                                   startCenter: .zero, startRadius: 0,
+                                   endCenter: .zero, endRadius: CGFloat(radius),
                                    options: [])
         context.restoreGState()
     }

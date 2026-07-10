@@ -77,6 +77,20 @@ extension EffectType {
             ]
         case .blur:
             return [.slider("radius", "Radius", min: 0, max: 0.08, initial: 0.01)]
+        case .sharpen:
+            return [.slider("radius", "Radius", min: 0.0005, max: 0.05, initial: 0.004),
+                    .slider("intensity", "Amount", min: 0, max: 3, initial: 0.8)]
+        case .noiseReduction:
+            return [.slider("noise", "Noise", min: 0, max: 0.1, initial: 0.02),
+                    .slider("sharpness", "Detail", min: 0, max: 1, initial: 0.4)]
+        case .lensCorrection:
+            return [.slider("distortion", "Distortion", min: -1, max: 1, initial: 0),
+                    .slider("vignette", "Vignette", min: 0, max: 2, initial: 0)]
+        case .rawDevelop:
+            return [.slider("exposure", "Exposure", min: -5, max: 5, initial: 0),
+                    .slider("highlights", "Highlights", min: -1, max: 1, initial: 0),
+                    .slider("temperature", "Temperature", min: 2500, max: 10000, initial: 6500),
+                    .slider("tint", "Tint", min: -150, max: 150, initial: 0)]
         case .bloom:
             return [
                 .slider("radius", "Radius", min: 0, max: 0.05, initial: 0.01),
@@ -288,6 +302,51 @@ final class EffectPipeline {
             filter.inputImage = image.clampedToExtent()
             filter.radius = Float(p.double("radius", 0.01) * minDim)
             return filter.outputImage ?? image
+
+        case .sharpen:
+            return image.applyingFilter("CIUnsharpMask", parameters: [
+                kCIInputRadiusKey: p.double("radius", 0.004) * minDim,
+                kCIInputIntensityKey: p.double("intensity", 0.8),
+            ])
+
+        case .noiseReduction:
+            return image.applyingFilter("CINoiseReduction", parameters: [
+                "inputNoiseLevel": p.double("noise", 0.02),
+                "inputSharpness": p.double("sharpness", 0.4),
+            ])
+
+        case .lensCorrection:
+            var result = image
+            let distortion = p.double("distortion", 0)
+            if abs(distortion) > 0.0001 {
+                result = result.applyingFilter("CIBumpDistortion", parameters: [
+                    kCIInputCenterKey: CIVector(x: extent.midX, y: extent.midY),
+                    kCIInputRadiusKey: hypot(extent.width, extent.height),
+                    kCIInputScaleKey: distortion * -0.35,
+                ])
+            }
+            let vignette = p.double("vignette", 0)
+            if vignette > 0.0001 {
+                result = result.applyingFilter("CIVignette", parameters: [
+                    kCIInputIntensityKey: vignette, kCIInputRadiusKey: minDim,
+                ])
+            }
+            return result
+
+        case .rawDevelop:
+            var linear = image.applyingFilter("CISRGBToneCurveToLinear")
+            linear = linear.applyingFilter("CIExposureAdjust", parameters: [
+                kCIInputEVKey: p.double("exposure", 0),
+            ])
+            linear = linear.applyingFilter("CIHighlightShadowAdjust", parameters: [
+                "inputHighlightAmount": p.double("highlights", 0),
+            ])
+            linear = linear.applyingFilter("CITemperatureAndTint", parameters: [
+                "inputNeutral": CIVector(x: 6500, y: 0),
+                "inputTargetNeutral": CIVector(x: p.double("temperature", 6500),
+                                                y: p.double("tint", 0)),
+            ])
+            return linear.applyingFilter("CILinearToSRGBToneCurve")
 
         case .bloom:
             let filter = CIFilter.bloom()

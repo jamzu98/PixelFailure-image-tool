@@ -27,16 +27,37 @@ enum CanvasRenderer {
         layerContext.drawLayer { inner in
             inner.concatenate(item.transform)
             let naturalRect = CGRect(origin: .zero, size: item.naturalSize)
-            if let mask = item.mask {
-                inner.clipToLayer { maskContext in
-                    maskContext.draw(Image(decorative: mask.alpha, scale: 1), in: naturalRect)
+            if let deformation = item.deformation {
+                for triangle in deformation.triangles(size: item.naturalSize) {
+                    guard let map = triangle.affine else { continue }
+                    var patch = inner
+                    var clip = Path()
+                    clip.move(to: triangle.destination.0)
+                    clip.addLine(to: triangle.destination.1)
+                    clip.addLine(to: triangle.destination.2)
+                    clip.closeSubpath()
+                    patch.clip(to: clip)
+                    patch.concatenate(map)
+                    drawLocal(item, naturalRect: naturalRect, in: patch, space: space)
                 }
+            } else {
+                drawLocal(item, naturalRect: naturalRect, in: inner, space: space)
             }
-            for style in item.styles where style.isEnabled {
-                drawStyle(style, content: item.content, naturalRect: naturalRect, in: inner, space: space)
-            }
-            draw(item.content, naturalRect: naturalRect, in: inner, space: space)
         }
+    }
+
+    private static func drawLocal(_ item: RenderItem, naturalRect: CGRect,
+                                  in context: GraphicsContext, space: WorkingColorSpace) {
+        var context = context
+        if let mask = item.mask {
+            context.clipToLayer { maskContext in
+                maskContext.draw(Image(decorative: mask.alpha, scale: 1), in: naturalRect)
+            }
+        }
+        for style in item.styles where style.isEnabled {
+            drawStyle(style, content: item.content, naturalRect: naturalRect, in: context, space: space)
+        }
+        draw(item.content, naturalRect: naturalRect, in: context, space: space)
     }
 
     private static func drawStyle(_ style: LayerStyle, content: RenderItem.Content,

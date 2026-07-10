@@ -85,6 +85,34 @@ struct TextInspector: View {
                               format: .number.precision(.fractionLength(0)))
                         .frame(width: 62)
                 }
+                Picker("Vertical", selection: Binding(
+                    get: { config.verticalAlignment ?? .top },
+                    set: { value in document.update(undoManager, actionName: "Vertical Alignment") {
+                        $0.modifyLayer(id: layerID) { $0.modifyText { $0.verticalAlignment = value } }
+                    }})) {
+                    ForEach(TextVerticalAlignment.allCases, id: \.self) { value in
+                        Text(value.displayName).tag(value)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+
+            DisclosureGroup("OpenType") {
+                Toggle("Ligatures", isOn: Binding(
+                    get: { config.ligatures ?? true },
+                    set: { value in document.update(undoManager, actionName: "Ligatures") {
+                        $0.modifyLayer(id: layerID) { $0.modifyText { $0.ligatures = value } }
+                    }}))
+                Toggle("Small Caps", isOn: Binding(
+                    get: { config.smallCaps ?? false },
+                    set: { value in document.update(undoManager, actionName: "Small Caps") {
+                        $0.modifyLayer(id: layerID) { $0.modifyText { $0.smallCaps = value } }
+                    }}))
+                Stepper("Stylistic Alternate \(config.stylisticAlternates ?? 0)", value: Binding(
+                    get: { config.stylisticAlternates ?? 0 },
+                    set: { value in document.update(undoManager, actionName: "Stylistic Alternate") {
+                        $0.modifyLayer(id: layerID) { $0.modifyText { $0.stylisticAlternates = value } }
+                    }}), in: 0...20)
             }
 
             let pathLayers = document.model.allLayers.filter(\.kind.isPath)
