@@ -7,7 +7,13 @@ enum SVGExporter {
     static func svg(items: [RenderItem],
                     background: RGBAColor,
                     canvasSize: CGSize,
-                    skippedGlobalEffects: Bool = false) -> String {
+                    skippedGlobalEffects: Bool = false,
+                    workingSpace: WorkingColorSpace = .sRGB) -> String {
+        // SVG's rgb() is sRGB by definition — convert wide-gamut documents
+        // up front (out-of-gamut colors clip; rasters keep their profiles
+        // inside their embedded PNGs).
+        let items = workingSpace == .sRGB ? items : items.map { srgbItem($0, from: workingSpace) }
+        let background = background.converted(from: workingSpace, to: .sRGB)
         let w = Int(canvasSize.width)
         let h = Int(canvasSize.height)
         var defs = ""
@@ -34,6 +40,33 @@ enum SVGExporter {
         out += body
         out += "</svg>\n"
         return out
+    }
+
+    /// Re-expresses every color an item carries in sRGB.
+    private static func srgbItem(_ item: RenderItem, from space: WorkingColorSpace) -> RenderItem {
+        var item = item
+        item.styles = item.styles.map { style in
+            var style = style
+            style.color = style.color.converted(from: space, to: .sRGB)
+            return style
+        }
+        switch item.content {
+        case .primitives(let primitives):
+            item.content = .primitives(primitives.map { primitive in
+                var primitive = primitive
+                primitive.fill = primitive.fill?.converted(from: space, to: .sRGB)
+                primitive.stroke = primitive.stroke?.converted(from: space, to: .sRGB)
+                return primitive
+            })
+        case .fill(var config):
+            config.colors = config.colors.map { $0.converted(from: space, to: .sRGB) }
+            item.content = .fill(config)
+        case .group(let children):
+            item.content = .group(children.map { srgbItem($0, from: space) })
+        case .raster:
+            break
+        }
+        return item
     }
 
     /// One item (recursively for groups) as a transformed, masked <g>.

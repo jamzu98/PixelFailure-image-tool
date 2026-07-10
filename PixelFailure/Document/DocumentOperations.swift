@@ -127,7 +127,7 @@ extension PixelDocument {
                      undoManager: UndoManager?) -> AssetImportOutcome? {
         let ext = fileExtension.lowercased()
         if ext == "pdf" {
-            guard let image = Self.rasterizeFirstPDFPage(data),
+            guard let image = Self.rasterizeFirstPDFPage(data, colorSettings: model.colorSettings),
                   let png = PNGExporter.pngData(image),
                   let id = addImageLayer(data: png, suggestedName: suggestedName + " — Page 1",
                                          undoManager: undoManager) else { return nil }
@@ -171,17 +171,15 @@ extension PixelDocument {
         return AssetImportOutcome(layerID: id, warning: nil)
     }
 
-    nonisolated private static func rasterizeFirstPDFPage(_ data: Data) -> CGImage? {
+    nonisolated private static func rasterizeFirstPDFPage(_ data: Data,
+                                                          colorSettings: ColorSettings) -> CGImage? {
         guard let provider = CGDataProvider(data: data as CFData),
               let pdf = CGPDFDocument(provider), let page = pdf.page(at: 1) else { return nil }
         let box = page.getBoxRect(.mediaBox)
         let scale = min(2, 8192 / max(box.width, box.height))
         let width = max(1, Int((box.width * scale).rounded()))
         let height = max(1, Int((box.height * scale).rounded()))
-        guard let context = CGContext(data: nil, width: width, height: height,
-                                      bitsPerComponent: 8, bytesPerRow: 0,
-                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        guard let context = colorSettings.makeRGBAContext(width: width, height: height) else { return nil }
         context.setFillColor(CGColor(gray: 1, alpha: 1))
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
         context.scaleBy(x: scale, y: scale)
@@ -290,10 +288,7 @@ extension PixelDocument {
         let scale = min(1, maxDim / max(model.canvasSize.width, model.canvasSize.height))
         let width = max(8, Int(model.canvasSize.width * scale))
         let height = max(8, Int(model.canvasSize.height * scale))
-        guard let ctx = CGContext(data: nil, width: width, height: height,
-                                  bitsPerComponent: 8, bytesPerRow: 0,
-                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+        guard let ctx = model.colorSettings.makeRGBAContext(width: width, height: height),
               let image = ctx.makeImage(),
               let data = PNGExporter.pngData(image) else { return nil }
 
@@ -355,12 +350,13 @@ extension PixelDocument {
     /// pasteboard's flattened-PNG representation, and layer thumbnails.
     @MainActor
     func layerBitmap(id: UUID, renderStore: RenderStore, maxDimension: Double = 8192,
-                     quality: RenderQuality = .full) -> CGImage? {
+                     quality: RenderQuality = .full,
+                     minimumScale: Double = 0.01) -> CGImage? {
         guard let layer = model.layer(id: id) else { return nil }
         let naturalSize = renderStore.naturalSize(for: layer, model: model)
         guard naturalSize.width > 0, naturalSize.height > 0 else { return nil }
 
-        let bakeScale = min(max(layer.transform.scale, 0.01),
+        let bakeScale = min(max(layer.transform.scale, minimumScale),
                             maxDimension / Double(max(naturalSize.width, naturalSize.height)))
         let pixelSize = CGSize(width: max(1, (naturalSize.width * bakeScale).rounded()),
                                height: max(1, (naturalSize.height * bakeScale).rounded()))
@@ -381,7 +377,9 @@ extension PixelDocument {
         return PNGExporter.render(items: items,
                                   background: .clear,
                                   canvasSize: naturalSize,
-                                  targetPixelSize: pixelSize)
+                                  targetPixelSize: pixelSize,
+                                  colorSettings: quality == .full
+                                      ? model.colorSettings : model.colorSettings.previewVariant)
     }
 
     /// Bakes a layer into pixels: vector layers (pattern/text/fill/shape)
@@ -389,8 +387,11 @@ extension PixelDocument {
     /// Position, rotation, opacity, blend mode, and mask stay live.
     @MainActor
     func rasterizeLayer(id: UUID, renderStore: RenderStore, undoManager: UndoManager?) {
+        // Never bake below native resolution: a layer scaled down keeps its
+        // full pixel fidelity, so scaling it back up later re-samples the
+        // real content, not a shrunken bake.
         guard let layer = model.layer(id: id),
-              let baked = layerBitmap(id: id, renderStore: renderStore),
+              let baked = layerBitmap(id: id, renderStore: renderStore, minimumScale: 1),
               let data = PNGExporter.pngData(baked) else { return }
 
         let pixelSize = CGSize(width: baked.width, height: baked.height)
@@ -399,8 +400,26 @@ extension PixelDocument {
         let newScale = layer.transform.scale * Double(naturalSize.width) / Double(pixelSize.width)
         update(undoManager, actionName: "Rasterize Layer") { model in
             model.modifyLayer(id: id) { layer in
+                layer.recordSourceIfNeeded()
                 layer.kind = .image(ImageConfig(imageKey: key, pixelSize: pixelSize))
                 layer.transform.scale = newScale
+            }
+        }
+    }
+
+    /// Restores the layer as it was before its pixels were first baked —
+    /// the reverse of rasterize/retouch/super-resolution/painting. The
+    /// append-only image store still holds the original bytes, so this works
+    /// across save/reopen, not just within the undo stack.
+    @MainActor
+    func revertLayerToSource(id: UUID, undoManager: UndoManager?) {
+        guard let layer = model.layer(id: id), let source = layer.source,
+              !model.isEffectivelyLocked(id) else { return }
+        update(undoManager, actionName: "Revert to Original") { model in
+            model.modifyLayer(id: id) { layer in
+                layer.kind = source.kind
+                layer.transform.scale = source.scale
+                layer.source = nil
             }
         }
     }

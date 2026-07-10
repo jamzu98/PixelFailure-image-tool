@@ -91,14 +91,12 @@ extension PixelDocument {
               let mask = SelectionRasterizer.colorMask(selection: selection,
                                                        transform: transform,
                                                        pixelSize: config.pixelSize,
-                                                       color: color) else { return }
+                                                       color: color,
+                                                       colorSettings: model.colorSettings) else { return }
 
         let width = max(1, Int(config.pixelSize.width))
         let height = max(1, Int(config.pixelSize.height))
-        guard let ctx = CGContext(data: nil, width: width, height: height,
-                                  bitsPerComponent: 8, bytesPerRow: 0,
-                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+        guard let ctx = model.colorSettings.makeRGBAContext(width: width, height: height) else { return }
         let rect = CGRect(x: 0, y: 0, width: width, height: height)
         ctx.draw(base, in: rect)
         ctx.setBlendMode(blendMode)
@@ -108,6 +106,7 @@ extension PixelDocument {
         let key = storeImage(data: data, fileExtension: "png")
         update(undoManager, actionName: actionName) { model in
             model.modifyLayer(id: layerID) { layer in
+                layer.recordSourceIfNeeded()
                 layer.modifyImage { $0.imageKey = key }
             }
         }
@@ -128,7 +127,10 @@ extension PixelDocument {
               let data = PNGExporter.pngData(result) else { return }
         let key = storeImage(data: data, fileExtension: "png")
         update(undoManager, actionName: "Content-Aware Fill") { model in
-            model.modifyLayer(id: layerID) { $0.modifyImage { $0.imageKey = key } }
+            model.modifyLayer(id: layerID) { layer in
+                layer.recordSourceIfNeeded()
+                layer.modifyImage { $0.imageKey = key }
+            }
         }
     }
 
@@ -143,6 +145,7 @@ extension PixelDocument {
         let key = storeImage(data: data, fileExtension: "png")
         update(undoManager, actionName: "Super Resolution 2×") { model in
             model.modifyLayer(id: layerID) { layer in
+                layer.recordSourceIfNeeded()
                 layer.modifyImage {
                     $0.imageKey = key
                     $0.pixelSize = CGSize(width: result.width, height: result.height)
@@ -216,14 +219,12 @@ extension PixelDocument {
                                                                       parentAffine: model.parentAffine(of: layerID)),
               let mask = SelectionRasterizer.colorMask(selection: selection,
                                                        transform: transform,
-                                                       pixelSize: bufferSize) else { return nil }
+                                                       pixelSize: bufferSize,
+                                                       colorSettings: model.colorSettings) else { return nil }
 
         let width = Int(bufferSize.width)
         let height = Int(bufferSize.height)
-        guard let ctx = CGContext(data: nil, width: width, height: height,
-                                  bitsPerComponent: 8, bytesPerRow: 0,
-                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        guard let ctx = model.colorSettings.makeRGBAContext(width: width, height: height) else { return nil }
         let rect = CGRect(x: 0, y: 0, width: width, height: height)
         ctx.draw(resolved, in: rect)
         ctx.setBlendMode(.destinationIn)

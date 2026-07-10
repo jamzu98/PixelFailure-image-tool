@@ -52,11 +52,11 @@ struct TextInspector: View {
             .pickerStyle(.segmented)
 
             ColorPicker("Color", selection: Binding(
-                get: { config.color.color },
+                get: { config.color.color(in: document.model.colorSettings.workingSpace) },
                 set: { newValue in
                     document.update(undoManager, actionName: "Text Color") { model in
                         model.modifyLayer(id: layerID) { layer in
-                            layer.modifyText { $0.color = RGBAColor(colorValue: newValue) }
+                            layer.modifyText { $0.color = RGBAColor(colorValue: newValue, in: document.model.colorSettings.workingSpace) }
                         }
                     }
                 }
@@ -112,8 +112,8 @@ struct TextInspector: View {
                         Text("\(run.location)…\(run.location + run.length)")
                             .font(.caption.monospacedDigit())
                         ColorPicker("", selection: Binding(
-                            get: { (run.color ?? config.color).color },
-                            set: { color in updateRun(run.id) { $0.color = RGBAColor(colorValue: color) } }))
+                            get: { (run.color ?? config.color).color(in: document.model.colorSettings.workingSpace) },
+                            set: { color in updateRun(run.id) { $0.color = RGBAColor(colorValue: color, in: document.model.colorSettings.workingSpace) } }))
                             .labelsHidden()
                         Button {
                             document.update(undoManager, actionName: "Remove Text Style") {

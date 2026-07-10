@@ -10,14 +10,13 @@ enum PNGExporter {
     static func render(items: [RenderItem],
                        background: RGBAColor,
                        canvasSize: CGSize,
-                       targetPixelSize: CGSize) -> CGImage? {
+                       targetPixelSize: CGSize,
+                       colorSettings: ColorSettings = .default) -> CGImage? {
         let width = Int(targetPixelSize.width)
         let height = Int(targetPixelSize.height)
         guard width > 0, height > 0,
-              let ctx = CGContext(data: nil, width: width, height: height,
-                                  bitsPerComponent: 8, bytesPerRow: 0,
-                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+              let ctx = colorSettings.makeRGBAContext(width: width, height: height) else { return nil }
+        let space = colorSettings.workingSpace
 
         ctx.interpolationQuality = .high
 
@@ -33,11 +32,11 @@ enum PNGExporter {
         ctx.scaleBy(x: scale, y: scale)
 
         ctx.clip(to: CGRect(origin: .zero, size: canvasSize))
-        ctx.setFillColor(background.cgColor)
+        ctx.setFillColor(background.cgColor(in: space))
         ctx.fill(CGRect(origin: .zero, size: canvasSize))
 
         for item in items {
-            drawItem(item, context: ctx)
+            drawItem(item, context: ctx, space: space)
         }
 
         return ctx.makeImage()
@@ -45,7 +44,8 @@ enum PNGExporter {
 
     /// Draws one item (recursively for groups) with opacity, blend mode,
     /// transform, and mask.
-    private static func drawItem(_ item: RenderItem, context ctx: CGContext) {
+    private static func drawItem(_ item: RenderItem, context ctx: CGContext,
+                                 space: WorkingColorSpace) {
         ctx.saveGState()
         ctx.setAlpha(CGFloat(item.opacity))
         ctx.setBlendMode(item.blendMode.cgBlendMode)
@@ -55,9 +55,9 @@ enum PNGExporter {
         let naturalRect = CGRect(origin: .zero, size: item.naturalSize)
 
         for style in item.styles where style.isEnabled {
-            drawStyle(style, content: item.content, naturalRect: naturalRect, context: ctx)
+            drawStyle(style, content: item.content, naturalRect: naturalRect, context: ctx, space: space)
         }
-        drawContent(item.content, naturalRect: naturalRect, context: ctx)
+        drawContent(item.content, naturalRect: naturalRect, context: ctx, space: space)
 
         // Mask inside the layer's transparency layer: keep only the pixels
         // where the mask's alpha is set.
@@ -73,19 +73,19 @@ enum PNGExporter {
     }
 
     private static func drawContent(_ content: RenderItem.Content, naturalRect: CGRect,
-                                    context ctx: CGContext) {
+                                    context ctx: CGContext, space: WorkingColorSpace) {
         switch content {
         case .primitives(let primitives):
             for primitive in primitives {
                 let cgPath = primitive.path.cgPath
                 if let fill = primitive.fill {
                     ctx.addPath(cgPath)
-                    ctx.setFillColor(fill.cgColor)
+                    ctx.setFillColor(fill.cgColor(in: space))
                     ctx.fillPath()
                 }
                 if let stroke = primitive.stroke {
                     ctx.addPath(cgPath)
-                    ctx.setStrokeColor(stroke.cgColor)
+                    ctx.setStrokeColor(stroke.cgColor(in: space))
                     ctx.setLineWidth(CGFloat(primitive.lineWidth))
                     ctx.setLineCap(primitive.lineCap)
                     ctx.setLineJoin(primitive.lineJoin)
@@ -96,21 +96,22 @@ enum PNGExporter {
         case .raster(let image):
             drawUpright(image, in: naturalRect, context: ctx)
         case .fill(let config):
-            drawFill(config, in: naturalRect, context: ctx)
+            drawFill(config, in: naturalRect, context: ctx, space: space)
         case .group(let children):
             for child in children {
-                drawItem(child, context: ctx)
+                drawItem(child, context: ctx, space: space)
             }
         }
     }
 
     private static func drawStyle(_ style: LayerStyle, content: RenderItem.Content,
-                                  naturalRect: CGRect, context ctx: CGContext) {
-        let color = style.color.withAlpha(style.color.a * style.opacity).cgColor
+                                  naturalRect: CGRect, context ctx: CGContext,
+                                  space: WorkingColorSpace) {
+        let color = style.color.withAlpha(style.color.a * style.opacity).cgColor(in: space)
         func drawShadow(offset: CGSize, blur: CGFloat) {
             ctx.saveGState()
             ctx.setShadow(offset: offset, blur: blur, color: color)
-            drawContent(content, naturalRect: naturalRect, context: ctx)
+            drawContent(content, naturalRect: naturalRect, context: ctx, space: space)
             ctx.restoreGState()
         }
         switch style.type {
@@ -136,17 +137,18 @@ enum PNGExporter {
         ctx.restoreGState()
     }
 
-    private static func drawFill(_ config: FillConfig, in rect: CGRect, context ctx: CGContext) {
+    private static func drawFill(_ config: FillConfig, in rect: CGRect, context ctx: CGContext,
+                                 space: WorkingColorSpace) {
         guard config.colors.count > 1, config.style != .solid else {
-            ctx.setFillColor((config.colors.first ?? .black).cgColor)
+            ctx.setFillColor((config.colors.first ?? .black).cgColor(in: space))
             ctx.fill(rect)
             return
         }
-        let cgColors = config.colors.map(\.cgColor) as CFArray
+        let cgColors = config.colors.map { $0.cgColor(in: space) } as CFArray
         let locations: [CGFloat] = config.colors.indices.map {
             CGFloat($0) / CGFloat(config.colors.count - 1)
         }
-        guard let gradient = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.sRGB),
+        guard let gradient = CGGradient(colorsSpace: space.cgColorSpace,
                                         colors: cgColors,
                                         locations: locations) else { return }
         ctx.saveGState()

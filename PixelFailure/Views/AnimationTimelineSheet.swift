@@ -229,7 +229,8 @@ struct AnimationTimelineDock: View {
     private func render(_ model: ProjectModel, size: CGSize) -> CGImage? {
         var image = PNGExporter.render(items: renderStore.renderItems(model: model, quality: .full),
                                        background: model.background, canvasSize: model.canvasSize,
-                                       targetPixelSize: size)
+                                       targetPixelSize: size,
+                                       colorSettings: model.colorSettings.previewVariant)
         if let current = image, !model.canvasEffects.isEmpty {
             image = EffectPipeline.shared.apply(effects: model.canvasEffects, to: current,
                                                 palette: model.palette)

@@ -206,7 +206,8 @@ struct EditorView: View {
         var image = PNGExporter.render(items: renderStore.renderItems(model: document.model, quality: .full),
                                        background: document.model.background,
                                        canvasSize: document.model.canvasSize,
-                                       targetPixelSize: document.model.canvasSize)
+                                       targetPixelSize: document.model.canvasSize,
+                                       colorSettings: document.model.colorSettings)
         if let current = image, !document.model.canvasEffects.isEmpty {
             image = EffectPipeline.shared.apply(effects: document.model.canvasEffects,
                                                 to: current, palette: document.model.palette)

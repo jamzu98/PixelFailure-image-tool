@@ -40,11 +40,11 @@ struct FillInspector: View {
             ForEach(config.colors.indices, id: \.self) { i in
                 HStack {
                     ColorPicker(config.style == .solid ? "Color" : "Stop \(i + 1)", selection: Binding(
-                        get: { config.colors[i].color },
+                        get: { config.colors[i].color(in: document.model.colorSettings.workingSpace) },
                         set: { newValue in
                             modify("Fill Color") { fill in
                                 guard fill.colors.indices.contains(i) else { return }
-                                fill.colors[i] = RGBAColor(colorValue: newValue)
+                                fill.colors[i] = RGBAColor(colorValue: newValue, in: document.model.colorSettings.workingSpace)
                             }
                         }
                     ))

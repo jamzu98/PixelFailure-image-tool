@@ -58,7 +58,8 @@ struct PalettePanel: View {
                         set: { newValue in
                             document.update(undoManager, actionName: "Edit Swatch") { model in
                                 guard model.palette.colors.indices.contains(i) else { return }
-                                model.palette.colors[i] = RGBAColor(colorValue: newValue)
+                                model.palette.colors[i] = RGBAColor(colorValue: newValue,
+                                                                    in: model.colorSettings.workingSpace)
                                 model.palette.name = "Custom"
                             }
                         }

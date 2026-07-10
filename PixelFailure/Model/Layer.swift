@@ -16,6 +16,11 @@ nonisolated struct Layer: Identifiable, Codable, Hashable, Sendable {
     /// Uses the alpha of the nearest visible sibling below as a clipping base.
     var clipsToBelow: Bool
     var styles: [LayerStyle]
+    /// Snapshot taken the first time a destructive operation bakes this
+    /// layer's pixels (rasterize, retouch, super-resolution, painting).
+    /// Powers "Revert to Original" across sessions — the append-only image
+    /// store keeps the referenced bytes alive.
+    var source: LayerSource?
 
     init(id: UUID = UUID(),
          name: String,
@@ -27,7 +32,8 @@ nonisolated struct Layer: Identifiable, Codable, Hashable, Sendable {
          mask: LayerMask? = nil,
          isLocked: Bool = false,
          clipsToBelow: Bool = false,
-         styles: [LayerStyle] = []) {
+         styles: [LayerStyle] = [],
+         source: LayerSource? = nil) {
         self.id = id
         self.name = name
         self.isVisible = isVisible
@@ -39,11 +45,12 @@ nonisolated struct Layer: Identifiable, Codable, Hashable, Sendable {
         self.isLocked = isLocked
         self.clipsToBelow = clipsToBelow
         self.styles = styles
+        self.source = source
     }
 
     // Custom decoding so documents saved before isLocked existed still open.
     private enum CodingKeys: String, CodingKey {
-        case id, name, isVisible, opacity, blendMode, transform, kind, mask, isLocked, clipsToBelow, styles
+        case id, name, isVisible, opacity, blendMode, transform, kind, mask, isLocked, clipsToBelow, styles, source
     }
 
     init(from decoder: Decoder) throws {
@@ -59,6 +66,29 @@ nonisolated struct Layer: Identifiable, Codable, Hashable, Sendable {
         isLocked = try container.decodeIfPresent(Bool.self, forKey: .isLocked) ?? false
         clipsToBelow = try container.decodeIfPresent(Bool.self, forKey: .clipsToBelow) ?? false
         styles = try container.decodeIfPresent([LayerStyle].self, forKey: .styles) ?? []
+        source = try container.decodeIfPresent(LayerSource.self, forKey: .source)
+    }
+}
+
+/// What a layer was before its pixels were first baked: the complete kind
+/// (vector config or original image reference) plus the transform scale the
+/// bake folded into pixels.
+nonisolated struct LayerSource: Codable, Hashable, Sendable {
+    var kind: LayerKind
+    var scale: Double
+
+    /// A short human-readable name for what reverting restores.
+    var displayName: String {
+        switch kind {
+        case .pattern(let config): "the \(config.generator.displayName) generator"
+        case .image: "the original image"
+        case .text: "editable text"
+        case .fill: "the fill layer"
+        case .shape: "the editable shape"
+        case .group: "the layer group"
+        case .adjustment: "the adjustment layer"
+        case .path: "the editable path"
+        }
     }
 }
 

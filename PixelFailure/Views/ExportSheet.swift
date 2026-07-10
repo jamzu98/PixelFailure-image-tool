@@ -169,7 +169,8 @@ struct ExportSheet: View {
                 guard var image = PNGExporter.render(items: items,
                                                      background: model.background,
                                                      canvasSize: model.canvasSize,
-                                                     targetPixelSize: targetSize()) else {
+                                                     targetPixelSize: targetSize(),
+                                                     colorSettings: model.colorSettings) else {
                     errorMessage = "Rendering failed."
                     return
                 }
@@ -189,7 +190,8 @@ struct ExportSheet: View {
                 guard var image = PNGExporter.render(items: items,
                                                      background: model.background,
                                                      canvasSize: model.canvasSize,
-                                                     targetPixelSize: targetSize()) else {
+                                                     targetPixelSize: targetSize(),
+                                                     colorSettings: model.colorSettings) else {
                     errorMessage = "Rendering failed."
                     return
                 }
@@ -206,7 +208,8 @@ struct ExportSheet: View {
                 let svg = SVGExporter.svg(items: items,
                                           background: model.background,
                                           canvasSize: model.canvasSize,
-                                          skippedGlobalEffects: !model.canvasEffects.isEmpty)
+                                          skippedGlobalEffects: !model.canvasEffects.isEmpty,
+                                          workingSpace: model.colorSettings.workingSpace)
                 try svg.write(to: url, atomically: true, encoding: .utf8)
             }
             dismiss()

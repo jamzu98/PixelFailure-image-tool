@@ -66,12 +66,17 @@ nonisolated enum ImageEncoder {
     }
 
     private static func flattened(_ image: CGImage, over background: RGBAColor) -> CGImage? {
+        // Flatten in the image's own space so the working-space profile
+        // survives into the JPEG (which is 8-bit regardless).
+        let space = image.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!
+        let workingSpace: WorkingColorSpace =
+            space.name == CGColorSpace.displayP3 ? .displayP3 : .sRGB
         guard let ctx = CGContext(data: nil, width: image.width, height: image.height,
                                   bitsPerComponent: 8, bytesPerRow: 0,
-                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  space: space.model == .rgb ? space : CGColorSpace(name: CGColorSpace.sRGB)!,
                                   bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
         let rect = CGRect(x: 0, y: 0, width: image.width, height: image.height)
-        ctx.setFillColor(background.cgColor)
+        ctx.setFillColor(background.cgColor(in: workingSpace))
         ctx.fill(rect)
         ctx.draw(image, in: rect)
         return ctx.makeImage()

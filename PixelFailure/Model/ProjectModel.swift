@@ -3,12 +3,15 @@ import Foundation
 
 /// The serialized document state: everything needed to regenerate the artwork.
 nonisolated struct ProjectModel: Codable, Hashable, Sendable {
-    static let currentSchemaVersion = 4
+    static let currentSchemaVersion = 5
 
     /// Explicit manifest version. Documents written before versioning decode
     /// as v1; new migrations can branch on this without guessing from fields.
     var schemaVersion: Int
     var canvasSize: CGSize
+    /// Working color space + raster bit depth (v5). Older documents decode
+    /// as sRGB / 8-bit and render exactly as they always did.
+    var colorSettings: ColorSettings
     var background: RGBAColor
     /// Bottom-to-top: index 0 draws first.
     var layers: [Layer]
@@ -20,6 +23,7 @@ nonisolated struct ProjectModel: Codable, Hashable, Sendable {
 
     init(schemaVersion: Int = ProjectModel.currentSchemaVersion,
          canvasSize: CGSize = CGSize(width: 3000, height: 3000),
+         colorSettings: ColorSettings = .default,
          background: RGBAColor = RGBAColor(hex: "#211E1B"),
          layers: [Layer] = [],
          palette: Palette = BuiltInPalettes.default,
@@ -28,6 +32,7 @@ nonisolated struct ProjectModel: Codable, Hashable, Sendable {
          animation: AnimationSettings = AnimationSettings()) {
         self.schemaVersion = schemaVersion
         self.canvasSize = canvasSize
+        self.colorSettings = colorSettings
         self.background = background
         self.layers = layers
         self.palette = palette
@@ -38,13 +43,14 @@ nonisolated struct ProjectModel: Codable, Hashable, Sendable {
 
     // Custom decoding so documents saved before canvasEffects existed still open.
     private enum CodingKeys: String, CodingKey {
-        case schemaVersion, canvasSize, background, layers, palette, canvasEffects, workspace, animation
+        case schemaVersion, canvasSize, colorSettings, background, layers, palette, canvasEffects, workspace, animation
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
         canvasSize = try container.decode(CGSize.self, forKey: .canvasSize)
+        colorSettings = try container.decodeIfPresent(ColorSettings.self, forKey: .colorSettings) ?? .default
         background = try container.decode(RGBAColor.self, forKey: .background)
         layers = try container.decode([Layer].self, forKey: .layers)
         palette = try container.decode(Palette.self, forKey: .palette)

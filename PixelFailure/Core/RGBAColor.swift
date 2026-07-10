@@ -42,6 +42,29 @@ nonisolated struct RGBAColor: Codable, Hashable, Sendable {
         CGColor(srgbRed: CGFloat(r), green: CGFloat(g), blue: CGFloat(b), alpha: CGFloat(a))
     }
 
+    /// Component values interpreted in the document's working space.
+    func color(in space: WorkingColorSpace) -> Color {
+        Color(space.swiftUISpace, red: r, green: g, blue: b, opacity: a)
+    }
+
+    func cgColor(in space: WorkingColorSpace) -> CGColor {
+        CGColor(colorSpace: space.cgColorSpace,
+                components: [CGFloat(r), CGFloat(g), CGFloat(b), CGFloat(a)]) ?? cgColor
+    }
+
+    /// The same visual color re-expressed in another working space
+    /// (perceptual conversion, components clamped to the target gamut).
+    func converted(from source: WorkingColorSpace, to target: WorkingColorSpace) -> RGBAColor {
+        guard source != target,
+              let converted = cgColor(in: source).converted(to: target.cgColorSpace,
+                                                            intent: .defaultIntent, options: nil),
+              let parts = converted.components, parts.count >= 4 else { return self }
+        return RGBAColor(r: min(max(Double(parts[0]), 0), 1),
+                         g: min(max(Double(parts[1]), 0), 1),
+                         b: min(max(Double(parts[2]), 0), 1),
+                         a: Double(parts[3]))
+    }
+
     /// Relative luminance (perceptual-ish, for sorting and duotone ramps).
     var luminance: Double { 0.2126 * r + 0.7152 * g + 0.0722 * b }
 
@@ -57,6 +80,12 @@ nonisolated struct RGBAColor: Codable, Hashable, Sendable {
         return "rgba(\(ri),\(gi),\(bi),\(String(format: "%.3f", a)))"
     }
 
+    /// SVG's rgb() is sRGB by definition; wide-gamut components convert
+    /// (out-of-gamut colors clip — the documented SVG degradation).
+    func svgString(in space: WorkingColorSpace) -> String {
+        space == .sRGB ? svgString : converted(from: space, to: .sRGB).svgString
+    }
+
     func withAlpha(_ alpha: Double) -> RGBAColor {
         RGBAColor(r: r, g: g, b: b, a: alpha)
     }
@@ -70,8 +99,15 @@ nonisolated struct RGBAColor: Codable, Hashable, Sendable {
     }
 
     init(colorValue: Color) {
+        self.init(colorValue: colorValue, in: .sRGB)
+    }
+
+    /// Captures a picked color in the working space, so wide-gamut picks
+    /// survive instead of clamping to sRGB.
+    init(colorValue: Color, in space: WorkingColorSpace) {
         let ns = NSColor(colorValue)
-        let converted = ns.usingColorSpace(.sRGB) ?? .black
+        let target: NSColorSpace = space == .displayP3 ? .displayP3 : .sRGB
+        let converted = ns.usingColorSpace(target) ?? .black
         r = Double(converted.redComponent)
         g = Double(converted.greenComponent)
         b = Double(converted.blueComponent)

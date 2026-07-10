@@ -140,7 +140,8 @@ final class RenderStore {
         guard let image = PNGExporter.render(items: items,
                                              background: .clear,
                                              canvasSize: naturalSize,
-                                             targetPixelSize: target) else { return nil }
+                                             targetPixelSize: target,
+                                             colorSettings: model.colorSettings.previewVariant) else { return nil }
         thumbnails[layer.id] = (hash, image)
         return image
     }
@@ -164,7 +165,8 @@ final class RenderStore {
         guard let flat = PNGExporter.render(items: items,
                                             background: model.background,
                                             canvasSize: model.canvasSize,
-                                            targetPixelSize: target) else { return nil }
+                                            targetPixelSize: target,
+                                            colorSettings: model.colorSettings.previewVariant) else { return nil }
         let result = EffectPipeline.shared.apply(effects: model.canvasEffects, to: flat, palette: model.palette)
         composite = (hash, result)
         return result
@@ -210,11 +212,17 @@ final class RenderStore {
                       height: max(8, (model.canvasSize.height * scale).rounded()))
     }
 
+    /// Full quality composites at the document's depth; previews stay 8-bit.
+    private func renderSettings(model: ProjectModel, quality: RenderQuality) -> ColorSettings {
+        quality == .full ? model.colorSettings : model.colorSettings.previewVariant
+    }
+
     private func canvasRaster(items: [RenderItem], model: ProjectModel,
                               quality: RenderQuality) -> CGImage? {
         PNGExporter.render(items: items, background: .clear,
                            canvasSize: model.canvasSize,
-                           targetPixelSize: targetSize(model: model, quality: quality))
+                           targetPixelSize: targetSize(model: model, quality: quality),
+                           colorSettings: renderSettings(model: model, quality: quality))
     }
 
     private func clippedCanvas(item: RenderItem, base: RenderItem,
@@ -222,10 +230,8 @@ final class RenderStore {
         guard let foreground = canvasRaster(items: [item], model: model, quality: quality),
               let alphaBase = canvasRaster(items: [base], model: model, quality: quality) else { return nil }
         let width = foreground.width, height = foreground.height
-        guard let context = CGContext(data: nil, width: width, height: height,
-                                      bitsPerComponent: 8, bytesPerRow: 0,
-                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        guard let context = renderSettings(model: model, quality: quality)
+            .makeRGBAContext(width: width, height: height) else { return nil }
         let rect = CGRect(x: 0, y: 0, width: width, height: height)
         context.draw(foreground, in: rect)
         context.setBlendMode(.destinationIn)
@@ -438,7 +444,8 @@ final class RenderStore {
         }
 
         if let maxDim = quality.maxRasterDimension, max(image.width, image.height) > maxDim {
-            image = downsample(image, maxDimension: maxDim) ?? image
+            image = downsample(image, maxDimension: maxDim,
+                               space: model.colorSettings.workingSpace) ?? image
         }
 
         let result = EffectPipeline.shared.apply(effects: config.effects, to: image, palette: model.palette)
@@ -461,19 +468,19 @@ final class RenderStore {
             return cached.sampler
         }
         guard let resolved = resolvedImage(for: layer, config: config, model: model, quality: .preview),
-              let sampler = ImageSampler(cgImage: resolved, maxDimension: 220) else { return nil }
+              let sampler = ImageSampler(cgImage: resolved, maxDimension: 220,
+                                         space: model.colorSettings.workingSpace) else { return nil }
         samplers[layer.id] = (hash, sampler)
         return sampler
     }
 
-    private func downsample(_ image: CGImage, maxDimension: Int) -> CGImage? {
+    private func downsample(_ image: CGImage, maxDimension: Int,
+                            space: WorkingColorSpace) -> CGImage? {
         let scale = Double(maxDimension) / Double(max(image.width, image.height))
         let w = max(1, Int(Double(image.width) * scale))
         let h = max(1, Int(Double(image.height) * scale))
-        guard let ctx = CGContext(data: nil, width: w, height: h,
-                                  bitsPerComponent: 8, bytesPerRow: 0,
-                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        guard let ctx = ColorSettings(workingSpace: space, bitDepth: .eight)
+            .makeRGBAContext(width: w, height: h) else { return nil }
         ctx.interpolationQuality = .high
         ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
         return ctx.makeImage()

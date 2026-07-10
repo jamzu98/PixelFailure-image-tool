@@ -9,7 +9,9 @@ nonisolated struct ImageSampler: Sendable {
     /// RGBA, 8 bits per channel, premultiplied alpha.
     let pixels: [UInt8]
 
-    init?(cgImage: CGImage, maxDimension: Int = 256) {
+    /// Samples in the given working space so returned component values mean
+    /// the same thing as every other color in the document.
+    init?(cgImage: CGImage, maxDimension: Int = 256, space: WorkingColorSpace = .sRGB) {
         let scale = Double(maxDimension) / Double(max(cgImage.width, cgImage.height))
         let w = max(1, Int((Double(cgImage.width) * min(scale, 1)).rounded()))
         let h = max(1, Int((Double(cgImage.height) * min(scale, 1)).rounded()))
@@ -20,7 +22,7 @@ nonisolated struct ImageSampler: Sendable {
                                       width: w, height: h,
                                       bitsPerComponent: 8,
                                       bytesPerRow: w * 4,
-                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                      space: space.cgColorSpace,
                                       bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
             ctx.interpolationQuality = .medium
             ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))

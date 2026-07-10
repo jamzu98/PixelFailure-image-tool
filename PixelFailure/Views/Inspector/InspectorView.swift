@@ -74,10 +74,10 @@ struct InspectorView: View {
                 DisclosureGroup(style.type.displayName) {
                     Toggle("Enabled", isOn: styleBinding(layer.id, style, \.isEnabled))
                     ColorPicker("Color", selection: Binding(
-                        get: { style.color.color },
+                        get: { style.color.color(in: document.model.colorSettings.workingSpace) },
                         set: { color in
                             updateStyle(layer.id, style.id, action: "Style Color") {
-                                $0.color = RGBAColor(colorValue: color)
+                                $0.color = RGBAColor(colorValue: color, in: document.model.colorSettings.workingSpace)
                             }
                     }))
                     LabeledContent("Size") {
@@ -367,11 +367,11 @@ struct InspectorView: View {
                 }))
             if let fill = config.fill {
                 ColorPicker("Fill Color", selection: Binding(
-                    get: { fill.color },
+                    get: { fill.color(in: document.model.colorSettings.workingSpace) },
                     set: { color in
                         document.update(undoManager, actionName: "Path Fill Color") {
                             $0.modifyLayer(id: layerID) {
-                                $0.modifyPath { $0.fill = RGBAColor(colorValue: color) }
+                                $0.modifyPath { $0.fill = RGBAColor(colorValue: color, in: document.model.colorSettings.workingSpace) }
                             }
                         }
                     }))
@@ -387,11 +387,11 @@ struct InspectorView: View {
                 }))
             if let stroke = config.stroke {
                 ColorPicker("Stroke Color", selection: Binding(
-                    get: { stroke.color },
+                    get: { stroke.color(in: document.model.colorSettings.workingSpace) },
                     set: { color in
                         document.update(undoManager, actionName: "Path Stroke Color") {
                             $0.modifyLayer(id: layerID) {
-                                $0.modifyPath { $0.stroke = RGBAColor(colorValue: color) }
+                                $0.modifyPath { $0.stroke = RGBAColor(colorValue: color, in: document.model.colorSettings.workingSpace) }
                             }
                         }
                 }))
@@ -541,10 +541,11 @@ struct InspectorView: View {
             }
 
             ColorPicker("Background", selection: Binding(
-                get: { document.model.background.color },
+                get: { document.model.background.color(in: document.model.colorSettings.workingSpace) },
                 set: { newValue in
                     document.update(undoManager, actionName: "Background Color") { model in
-                        model.background = RGBAColor(colorValue: newValue)
+                        model.background = RGBAColor(colorValue: newValue,
+                                                     in: model.colorSettings.workingSpace)
                     }
                 }
             ))
@@ -555,6 +556,8 @@ struct InspectorView: View {
         .onAppear { syncDraftSize() }
         .onChange(of: document.model.canvasSize) { _, _ in syncDraftSize() }
 
+        colorSection
+
         EffectStackSection(document: document,
                            title: "Canvas Effects",
                            target: .canvas,
@@ -562,6 +565,33 @@ struct InspectorView: View {
                            footnote: "Applied to the whole composite. Affects PNG export and the preview; SVG export skips them.")
 
         workspaceSection
+    }
+
+    @ViewBuilder
+    private var colorSection: some View {
+        Section("Color") {
+            Picker("Working Space", selection: Binding(
+                get: { document.model.colorSettings.workingSpace },
+                set: { value in
+                    document.update(undoManager, actionName: "Working Color Space") {
+                        $0.colorSettings.workingSpace = value
+                    }
+                })) {
+                ForEach(WorkingColorSpace.allCases, id: \.self) { Text($0.displayName).tag($0) }
+            }
+            Picker("Bit Depth", selection: Binding(
+                get: { document.model.colorSettings.bitDepth },
+                set: { value in
+                    document.update(undoManager, actionName: "Raster Bit Depth") {
+                        $0.colorSettings.bitDepth = value
+                    }
+                })) {
+                ForEach(RasterBitDepth.allCases, id: \.self) { Text($0.displayName).tag($0) }
+            }
+            Text("Exports embed the working-space profile. Switching the space reassigns existing color values to the new gamut; imported images keep their own profiles. 16-bit keeps smooth gradients band-free and exports via PNG and TIFF.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
     }
 
     @ViewBuilder

@@ -336,8 +336,8 @@ struct ToolOptionsBar: View {
         }
         if editorState.activeTool == .brush && editorState.editingMaskLayerID == nil {
             ColorPicker("", selection: Binding(
-                get: { brush.color.color },
-                set: { brush.color = RGBAColor(colorValue: $0) }
+                get: { brush.color.color(in: document.model.colorSettings.workingSpace) },
+                set: { brush.color = RGBAColor(colorValue: $0, in: document.model.colorSettings.workingSpace) }
             ))
             .labelsHidden()
             .frame(width: 30)

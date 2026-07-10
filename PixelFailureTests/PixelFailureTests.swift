@@ -1338,3 +1338,212 @@ struct AnimationTests {
         #expect(CGImageSourceGetCount(source) == model.animation.frameCount)
     }
 }
+
+@MainActor
+struct ColorManagementTests {
+    /// Documents saved before v5 carry no colorSettings and must decode as
+    /// sRGB / 8-bit — the exact pipeline they were authored in.
+    @Test func preV5ManifestDecodesAsSRGB8() throws {
+        let old = """
+        {
+          "background": {"a": 1, "b": 0.1, "g": 0.12, "r": 0.13},
+          "canvasSize": [1000, 1000],
+          "layers": [],
+          "palette": {"colors": [{"a": 1, "b": 0.2, "g": 0.4, "r": 0.6}], "name": "Test"}
+        }
+        """
+        let model = try JSONDecoder().decode(ProjectModel.self, from: Data(old.utf8))
+        #expect(model.colorSettings == .default)
+        #expect(model.colorSettings.workingSpace == .sRGB)
+        #expect(model.colorSettings.bitDepth == .eight)
+    }
+
+    @Test func colorSettingsRoundTrip() throws {
+        var model = ProjectModel()
+        model.colorSettings = ColorSettings(workingSpace: .displayP3, bitDepth: .sixteen)
+        let decoded = try JSONDecoder().decode(ProjectModel.self, from: JSONEncoder().encode(model))
+        #expect(decoded.colorSettings.workingSpace == .displayP3)
+        #expect(decoded.colorSettings.bitDepth == .sixteen)
+    }
+
+    @Test func renderHonorsWorkingSpaceAndDepth() throws {
+        let item = RenderItem(id: UUID(), opacity: 1, blendMode: .normal,
+                              transform: .identity, naturalSize: CGSize(width: 32, height: 32),
+                              content: .fill(FillConfig(style: .solid, colors: [RGBAColor(r: 1, g: 0, b: 0)])))
+        let settings = ColorSettings(workingSpace: .displayP3, bitDepth: .sixteen)
+        let image = try #require(PNGExporter.render(items: [item], background: .black,
+                                                    canvasSize: CGSize(width: 32, height: 32),
+                                                    targetPixelSize: CGSize(width: 32, height: 32),
+                                                    colorSettings: settings))
+        #expect(image.bitsPerComponent == 16)
+        #expect(image.colorSpace?.name == CGColorSpace.displayP3)
+    }
+
+    /// The PNG encoder must preserve 16-bit depth and embed the P3 profile,
+    /// and both must survive a decode round-trip.
+    @Test func pngRoundTripKeepsDepthAndProfile() throws {
+        let settings = ColorSettings(workingSpace: .displayP3, bitDepth: .sixteen)
+        let ctx = try #require(settings.makeRGBAContext(width: 8, height: 8))
+        ctx.setFillColor(RGBAColor(r: 1, g: 0, b: 0).cgColor(in: .displayP3))
+        ctx.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
+        let image = try #require(ctx.makeImage())
+        let data = try #require(PNGExporter.pngData(image))
+        let source = try #require(CGImageSourceCreateWithData(data as CFData, nil))
+        let decoded = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        #expect(decoded.bitsPerComponent == 16)
+        let profile = try #require(decoded.colorSpace?.name as String?)
+        #expect(profile.contains("P3"))
+    }
+
+    @Test func jpegExportEmbedsWorkingSpaceProfile() throws {
+        let settings = ColorSettings(workingSpace: .displayP3, bitDepth: .eight)
+        let ctx = try #require(settings.makeRGBAContext(width: 8, height: 8))
+        ctx.setFillColor(RGBAColor(r: 0.5, g: 0.5, b: 0.5).cgColor(in: .displayP3))
+        ctx.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
+        let image = try #require(ctx.makeImage())
+        let data = try #require(ImageEncoder.encode(image, format: .jpeg, quality: 0.9))
+        let source = try #require(CGImageSourceCreateWithData(data as CFData, nil))
+        let props = try #require(CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any])
+        let profile = try #require(props[kCGImagePropertyProfileName] as? String)
+        #expect(profile.contains("P3"))
+    }
+
+    /// sRGB pure red sits inside P3, so its P3 coordinates pull off the gamut
+    /// edge; converting back must return (within rounding) to where it began.
+    @Test func workingSpaceConversionIsSaneAndReversible() {
+        let red = RGBAColor(r: 1, g: 0, b: 0)
+        let inP3 = red.converted(from: .sRGB, to: .displayP3)
+        #expect(inP3.r < 0.95 && inP3.r > 0.85)
+        let back = inP3.converted(from: .displayP3, to: .sRGB)
+        #expect(abs(back.r - 1) < 0.02 && abs(back.g) < 0.02 && abs(back.b) < 0.02)
+    }
+
+    @Test func paintSessionBuffersMatchDocumentDepth() {
+        let settings = ColorSettings(workingSpace: .displayP3, bitDepth: .sixteen)
+        let session = PaintSession(target: .content(layerID: UUID()), base: nil,
+                                   pixelSize: CGSize(width: 16, height: 16),
+                                   colorSettings: settings)
+        #expect(session?.currentImage?.bitsPerComponent == 16)
+        #expect(session?.currentImage?.colorSpace?.name == CGColorSpace.displayP3)
+    }
+
+    /// SVG output is sRGB by definition — P3 components must convert, not
+    /// pass through as misinterpreted sRGB values.
+    @Test func svgConvertsWideGamutColors() {
+        let item = RenderItem(id: UUID(), opacity: 1, blendMode: .normal,
+                              transform: .identity, naturalSize: CGSize(width: 10, height: 10),
+                              content: .primitives([VectorPrimitive(
+                                path: Path(CGRect(x: 0, y: 0, width: 10, height: 10)),
+                                fill: RGBAColor(r: 1, g: 0, b: 0))]))
+        let svg = SVGExporter.svg(items: [item], background: .black,
+                                  canvasSize: CGSize(width: 10, height: 10),
+                                  workingSpace: .displayP3)
+        // P3 pure red is outside sRGB: it clips to rgb(255,...) with low g/b.
+        #expect(svg.contains("rgb(255,"))
+    }
+}
+
+@MainActor
+struct LayerSourceTests {
+    /// Rasterizing records the vector source; revert restores it exactly,
+    /// including the transform scale the bake folded into pixels.
+    @Test func rasterizeRecordsSourceAndRevertRestoresIt() {
+        let document = PixelDocument()
+        let store = RenderStore(document: document)
+        let layerID = document.model.layers[0].id
+        let originalKind = document.model.layers[0].kind
+        document.update(nil) { $0.modifyLayer(id: layerID) { $0.transform.scale = 0.5 } }
+
+        document.rasterizeLayer(id: layerID, renderStore: store, undoManager: nil)
+        let baked = document.model.layer(id: layerID)
+        #expect(baked?.kind.isImage == true)
+        #expect(baked?.source?.kind == originalKind)
+        #expect(baked?.source?.scale == 0.5)
+
+        document.revertLayerToSource(id: layerID, undoManager: nil)
+        let reverted = document.model.layer(id: layerID)
+        #expect(reverted?.kind == originalKind)
+        #expect(reverted?.transform.scale == 0.5)
+        #expect(reverted?.source == nil)
+    }
+
+    /// A second bake keeps the earliest snapshot — revert always returns to
+    /// the authored content, not an intermediate bake.
+    @Test func laterBakesKeepEarliestSource() {
+        let document = PixelDocument()
+        let store = RenderStore(document: document)
+        let layerID = document.model.layers[0].id
+        let originalKind = document.model.layers[0].kind
+
+        document.rasterizeLayer(id: layerID, renderStore: store, undoManager: nil)
+        document.superResolveLayer(layerID: layerID, renderStore: store, undoManager: nil)
+
+        let layer = document.model.layer(id: layerID)
+        #expect(layer?.source?.kind == originalKind)
+        document.revertLayerToSource(id: layerID, undoManager: nil)
+        #expect(document.model.layer(id: layerID)?.kind == originalKind)
+    }
+
+    /// Rasterizing a scaled-down layer must not bake away resolution.
+    @Test func rasterizeKeepsNativeResolutionWhenScaledDown() {
+        let document = PixelDocument()
+        let store = RenderStore(document: document)
+        let layerID = document.model.layers[0].id
+        document.update(nil) { $0.modifyLayer(id: layerID) { $0.transform.scale = 0.25 } }
+
+        document.rasterizeLayer(id: layerID, renderStore: store, undoManager: nil)
+        let config = document.model.layer(id: layerID)?.imageConfig
+        // Baked at natural (canvas) resolution, not 25% of it.
+        #expect(config?.pixelSize == document.model.canvasSize)
+        #expect(abs((document.model.layer(id: layerID)?.transform.scale ?? 0) - 0.25) < 0.001)
+    }
+
+    @Test func sourceSurvivesEncodeAndOldManifestsDecodeWithoutIt() throws {
+        let document = PixelDocument()
+        let store = RenderStore(document: document)
+        let layerID = document.model.layers[0].id
+        document.rasterizeLayer(id: layerID, renderStore: store, undoManager: nil)
+
+        let data = try JSONEncoder().encode(document.model)
+        let decoded = try JSONDecoder().decode(ProjectModel.self, from: data)
+        #expect(decoded.layer(id: layerID)?.source != nil)
+        #expect(decoded.layer(id: layerID)?.source == document.model.layer(id: layerID)?.source)
+
+        // A layer JSON without "source" decodes to nil.
+        var object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        var layers = try #require(object["layers"] as? [[String: Any]])
+        layers[0]["source"] = nil
+        object["layers"] = layers
+        let stripped = try JSONSerialization.data(withJSONObject: object)
+        let old = try JSONDecoder().decode(ProjectModel.self, from: stripped)
+        #expect(old.layer(id: layerID)?.source == nil)
+    }
+
+    /// The pasteboard payload must carry the source's image bytes, or a
+    /// pasted layer could never revert. Uses an image layer so the source
+    /// snapshot actually references stored pixels.
+    @Test func transferPayloadIncludesSourceImageKeys() throws {
+        let document = PixelDocument()
+        let store = RenderStore(document: document)
+        let ctx = try #require(ColorSettings.default.makeRGBAContext(width: 8, height: 8))
+        ctx.setFillColor(RGBAColor(r: 0.4, g: 0.5, b: 0.6).cgColor)
+        ctx.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
+        let bitmap = try #require(ctx.makeImage())
+        let png = try #require(PNGExporter.pngData(bitmap))
+        let originalKey = document.storeImage(data: png, fileExtension: "png")
+        let layer = Layer(name: "Photo", transform: LayerTransform(position: .zero),
+                          kind: .image(ImageConfig(imageKey: originalKey,
+                                                   pixelSize: CGSize(width: 8, height: 8))))
+        document.update(nil) { $0.layers.append(layer) }
+
+        document.superResolveLayer(layerID: layer.id, renderStore: store, undoManager: nil)
+
+        let baked = try #require(document.model.layer(id: layer.id))
+        #expect(baked.imageConfig?.imageKey != originalKey)
+        #expect(baked.source?.kind == layer.kind)
+        #expect(baked.referencedImageKeys.contains(originalKey))
+
+        let transfer = document.transferPayload(for: layer.id, renderStore: store)
+        #expect(transfer?.images?[originalKey] != nil)
+    }
+}

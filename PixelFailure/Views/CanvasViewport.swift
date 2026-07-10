@@ -83,7 +83,8 @@ struct CanvasViewport: View {
                         CanvasRenderer.draw(items: items,
                                             background: displayModel.background,
                                             canvasSize: displayModel.canvasSize,
-                                            in: context)
+                                            in: context,
+                                            space: displayModel.colorSettings.workingSpace)
                     }
                 }
                 .allowsHitTesting(false)
@@ -592,7 +593,8 @@ struct CanvasViewport: View {
         guard let flat = PNGExporter.render(items: items,
                                             background: model.background,
                                             canvasSize: model.canvasSize,
-                                            targetPixelSize: target),
+                                            targetPixelSize: target,
+                                            colorSettings: model.colorSettings.previewVariant),
               let path = MagicWand.select(at: canvasPoint,
                                           tolerance: editorState.wandTolerance,
                                           composite: flat,
@@ -784,7 +786,8 @@ struct CanvasViewport: View {
                 }
             }
             paintSession = PaintSession(target: .content(layerID: id), base: base,
-                                        pixelSize: config.pixelSize, clipPath: clip)
+                                        pixelSize: config.pixelSize, clipPath: clip,
+                                        colorSettings: document.model.colorSettings)
         }
         renderStore.activePaintSession = paintSession
     }
@@ -881,6 +884,7 @@ struct CanvasViewport: View {
         case .content(let id):
             document.update(undoManager, actionName: editorState.activeTool.displayName) { model in
                 model.modifyLayer(id: id) { layer in
+                    layer.recordSourceIfNeeded()
                     layer.modifyImage { $0.imageKey = key }
                 }
             }
@@ -906,11 +910,13 @@ struct CanvasViewport: View {
         guard var flat = PNGExporter.render(items: items,
                                             background: model.background,
                                             canvasSize: model.canvasSize,
-                                            targetPixelSize: target) else { return }
+                                            targetPixelSize: target,
+                                            colorSettings: model.colorSettings.previewVariant) else { return }
         if !model.canvasEffects.isEmpty {
             flat = EffectPipeline.shared.apply(effects: model.canvasEffects, to: flat, palette: model.palette)
         }
-        guard let sampler = ImageSampler(cgImage: flat, maxDimension: Int(maxDim)) else { return }
+        guard let sampler = ImageSampler(cgImage: flat, maxDimension: Int(maxDim),
+                                         space: model.colorSettings.workingSpace) else { return }
         let picked = sampler.color(atUnitX: canvasPoint.x / model.canvasSize.width,
                                    y: canvasPoint.y / model.canvasSize.height).withAlpha(1)
 
@@ -1737,7 +1743,8 @@ private struct NavigatorView: View {
         let items = renderStore.renderItems(model: document.model, quality: .preview)
         preview = PNGExporter.render(items: items, background: document.model.background,
                                      canvasSize: document.model.canvasSize,
-                                     targetPixelSize: previewSize)
+                                     targetPixelSize: previewSize,
+                                     colorSettings: document.model.colorSettings.previewVariant)
     }
 
     private func viewportRect(in mini: CGSize) -> CGRect {

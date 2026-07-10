@@ -106,17 +106,27 @@ nonisolated extension Layer {
             group.children = group.children.map { $0.withFreshIDs() }
             copy.kind = .group(group)
         }
+        if let source = copy.source {
+            // Ids inside the snapshot must stay unique too, or reverting a
+            // duplicate would collide with the original's reverted layers.
+            var shadow = shadowLayer(kind: source.kind).withFreshIDs()
+            shadow.id = copy.id
+            copy.source?.kind = shadow.kind
+        }
         return copy
     }
 
     /// All image-store keys referenced in this layer's subtree (content
-    /// images and masks).
+    /// images, masks, and the pre-bake source snapshot).
     var referencedImageKeys: [String] {
         var keys: [String] = []
         if let config = imageConfig { keys.append(config.imageKey) }
         if let mask, !mask.imageKey.isEmpty { keys.append(mask.imageKey) }
         if case .group(let group) = kind {
             keys += group.children.flatMap(\.referencedImageKeys)
+        }
+        if let source {
+            keys += shadowLayer(kind: source.kind).referencedImageKeys
         }
         return keys
     }
@@ -136,5 +146,24 @@ nonisolated extension Layer {
             }
             kind = .group(group)
         }
+        if let source {
+            var shadow = shadowLayer(kind: source.kind)
+            shadow.remapImageKeys(map)
+            self.source?.kind = shadow.kind
+        }
+    }
+
+    /// Captures the layer's pre-bake state the first time pixels are baked;
+    /// later bakes keep the earliest snapshot so "Revert to Original" always
+    /// returns to the imported/authored content.
+    mutating func recordSourceIfNeeded() {
+        guard source == nil else { return }
+        source = LayerSource(kind: kind, scale: transform.scale)
+    }
+
+    /// A bare copy carrying only the given kind — reuses the subtree
+    /// recursions above for the source snapshot's kind.
+    private func shadowLayer(kind: LayerKind) -> Layer {
+        Layer(id: id, name: name, transform: transform, kind: kind)
     }
 }

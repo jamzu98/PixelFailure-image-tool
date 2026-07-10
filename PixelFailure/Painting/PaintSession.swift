@@ -15,6 +15,7 @@ final class PaintSession {
 
     let target: Target
     let pixelSize: CGSize
+    private let colorSettings: ColorSettings
     private let context: CGContext
     private(set) var currentImage: CGImage?
     private var lastPoint: CGPoint?
@@ -34,24 +35,24 @@ final class PaintSession {
 
     /// `base` seeds the buffer (existing pixels / existing mask).
     /// `clipPath` (buffer space, even-odd) confines strokes to a selection.
-    init?(target: Target, base: CGImage?, pixelSize: CGSize, clipPath: CGPath? = nil) {
+    init?(target: Target, base: CGImage?, pixelSize: CGSize, clipPath: CGPath? = nil,
+          colorSettings: ColorSettings = .default) {
         self.target = target
         self.pixelSize = pixelSize
+        self.colorSettings = colorSettings
         let width = max(1, Int(pixelSize.width))
         let height = max(1, Int(pixelSize.height))
 
         let isMask = if case .mask = target { true } else { false }
         let ctx: CGContext?
         if isMask {
+            // Masks stay 8-bit grayscale — they carry coverage, not color.
             ctx = CGContext(data: nil, width: width, height: height,
                             bitsPerComponent: 8, bytesPerRow: 0,
                             space: CGColorSpaceCreateDeviceGray(),
                             bitmapInfo: CGImageAlphaInfo.none.rawValue)
         } else {
-            ctx = CGContext(data: nil, width: width, height: height,
-                            bitsPerComponent: 8, bytesPerRow: 0,
-                            space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            ctx = colorSettings.makeRGBAContext(width: width, height: height)
         }
         guard let ctx else { return nil }
         self.context = ctx
@@ -227,11 +228,12 @@ final class PaintSession {
                               CGColor(gray: gray, alpha: alpha),
                               CGColor(gray: gray, alpha: 0)]
         } else {
-            space = CGColorSpace(name: CGColorSpace.sRGB)!
+            let workingSpace = colorSettings.workingSpace
+            space = workingSpace.cgColorSpace
             let base = erase ? RGBAColor.white : color
-            gradientColors = [base.withAlpha(alpha).cgColor,
-                              base.withAlpha(alpha).cgColor,
-                              base.withAlpha(0).cgColor]
+            gradientColors = [base.withAlpha(alpha).cgColor(in: workingSpace),
+                              base.withAlpha(alpha).cgColor(in: workingSpace),
+                              base.withAlpha(0).cgColor(in: workingSpace)]
         }
         let locations: [CGFloat] = [0, CGFloat(min(max(hardness, 0), 0.99)), 1]
         guard let gradient = CGGradient(colorsSpace: space,

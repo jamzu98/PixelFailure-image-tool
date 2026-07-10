@@ -134,7 +134,13 @@ final class EffectPipeline {
                 .cropped(to: extent)
         }
 
-        guard let output = context.createCGImage(image, from: extent) else { return input }
+        // Preserve the input's tagging: a P3 or 16-bit composite keeps its
+        // gamut and depth through the effect stack instead of collapsing to
+        // the CIContext default (sRGB 8-bit).
+        let space = input.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!
+        let format: CIFormat = input.bitsPerComponent > 8 ? .RGBA16 : .RGBA8
+        guard let output = context.createCGImage(image, from: extent,
+                                                 format: format, colorSpace: space) else { return input }
         return output
     }
 

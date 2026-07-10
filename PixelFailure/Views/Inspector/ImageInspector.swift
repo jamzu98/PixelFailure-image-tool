@@ -7,6 +7,16 @@ struct ImageInspector: View {
     @Environment(\.undoManager) private var undoManager
 
     var body: some View {
+        if let source = document.model.layer(id: layerID)?.source {
+            Section("Original") {
+                Button("Revert to Original") {
+                    document.revertLayerToSource(id: layerID, undoManager: undoManager)
+                }
+                Text("Restores \(source.displayName) as it was before pixels were baked. Everything painted, filled, or rasterized since is discarded (undoable).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
         cropSection
         EffectStackSection(document: document,
                            title: "Effects",

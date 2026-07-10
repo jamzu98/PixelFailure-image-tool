@@ -15,13 +15,11 @@ enum SelectionRasterizer {
     static func colorMask(selection: CanvasSelection,
                           transform: CGAffineTransform,
                           pixelSize: CGSize,
-                          color: RGBAColor = .white) -> CGImage? {
+                          color: RGBAColor = .white,
+                          colorSettings: ColorSettings = .default) -> CGImage? {
         let width = max(1, Int(pixelSize.width))
         let height = max(1, Int(pixelSize.height))
-        guard let ctx = CGContext(data: nil, width: width, height: height,
-                                  bitsPerComponent: 8, bytesPerRow: 0,
-                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        guard let ctx = colorSettings.makeRGBAContext(width: width, height: height) else { return nil }
 
         // Apply the canvas→buffer transform to the path, not the context, so
         // the feather blur below operates in buffer pixels.
@@ -29,7 +27,7 @@ enum SelectionRasterizer {
         if let transformed = withTransform(selection.path.cgPath, transform) {
             ctx.addPath(transformed)
         }
-        ctx.setFillColor(color.cgColor)
+        ctx.setFillColor(color.cgColor(in: colorSettings.workingSpace))
         ctx.fillPath(using: .evenOdd)
         guard var image = ctx.makeImage() else { return nil }
 

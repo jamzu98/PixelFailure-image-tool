@@ -292,7 +292,8 @@ private struct VariationsSheet: View {
             }
             let items = renderStore.renderItems(model: model, quality: .preview)
             guard let image = PNGExporter.render(items: items, background: model.background,
-                                                 canvasSize: canvas, targetPixelSize: size) else { return nil }
+                                                 canvasSize: canvas, targetPixelSize: size,
+                                                 colorSettings: model.colorSettings.previewVariant) else { return nil }
             return VariationPreview(seed: seed, params: params, image: image)
         }
     }

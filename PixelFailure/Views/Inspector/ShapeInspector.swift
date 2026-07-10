@@ -59,8 +59,8 @@ struct ShapeInspector: View {
             ))
             if let fill = config.fill {
                 ColorPicker("Fill Color", selection: Binding(
-                    get: { fill.color },
-                    set: { newValue in modify("Fill Color") { $0.fill = RGBAColor(colorValue: newValue) } }
+                    get: { fill.color(in: document.model.colorSettings.workingSpace) },
+                    set: { newValue in modify("Fill Color") { $0.fill = RGBAColor(colorValue: newValue, in: document.model.colorSettings.workingSpace) } }
                 ))
             }
 
@@ -76,8 +76,8 @@ struct ShapeInspector: View {
             ))
             if let stroke = config.stroke {
                 ColorPicker("Stroke Color", selection: Binding(
-                    get: { stroke.color },
-                    set: { newValue in modify("Stroke Color") { $0.stroke = RGBAColor(colorValue: newValue) } }
+                    get: { stroke.color(in: document.model.colorSettings.workingSpace) },
+                    set: { newValue in modify("Stroke Color") { $0.stroke = RGBAColor(colorValue: newValue, in: document.model.colorSettings.workingSpace) } }
                 ))
                 gestureSlider("Stroke Width", value: config.strokeWidth, range: 0.5...120) { shape, value in
                     shape.strokeWidth = value
