@@ -57,6 +57,86 @@ nonisolated struct Palette: Codable, Hashable, Sendable {
     }
 }
 
+nonisolated enum PaletteHarmony: String, CaseIterable, Sendable {
+    case complementary, analogous, triadic, splitComplementary, monochromatic
+
+    var displayName: String {
+        switch self {
+        case .complementary: "Complementary"
+        case .analogous: "Analogous"
+        case .triadic: "Triadic"
+        case .splitComplementary: "Split Complementary"
+        case .monochromatic: "Monochromatic"
+        }
+    }
+}
+
+nonisolated extension Palette {
+    func harmony(_ type: PaletteHarmony) -> Palette {
+        let base = colors.first ?? .black
+        let hsl = Self.rgbToHSL(base)
+        let hueOffsets: [Double]
+        let lightOffsets: [Double]
+        switch type {
+        case .complementary:
+            hueOffsets = [0, 0, 0.5, 0.5, 0]
+            lightOffsets = [-0.22, 0.15, -0.18, 0.18, 0.34]
+        case .analogous:
+            hueOffsets = [-1.0 / 12, -1.0 / 24, 0, 1.0 / 24, 1.0 / 12]
+            lightOffsets = [-0.16, 0.08, 0, 0.18, -0.08]
+        case .triadic:
+            hueOffsets = [0, 1.0 / 3, 2.0 / 3, 1.0 / 3, 2.0 / 3]
+            lightOffsets = [-0.15, -0.08, -0.05, 0.2, 0.24]
+        case .splitComplementary:
+            hueOffsets = [0, 5.0 / 12, 7.0 / 12, 5.0 / 12, 7.0 / 12]
+            lightOffsets = [-0.16, -0.08, -0.05, 0.2, 0.24]
+        case .monochromatic:
+            hueOffsets = [0, 0, 0, 0, 0]
+            lightOffsets = [-0.3, -0.15, 0, 0.18, 0.34]
+        }
+        let colors = zip(hueOffsets, lightOffsets).map { hueOffset, lightOffset in
+            Self.hslToRGB(h: (hsl.h + hueOffset).truncatingRemainder(dividingBy: 1),
+                          s: min(max(hsl.s, 0.25), 0.9),
+                          l: min(max(hsl.l + lightOffset, 0.06), 0.94), alpha: base.a)
+        }
+        return Palette(name: type.displayName, colors: colors)
+    }
+
+    private static func rgbToHSL(_ color: RGBAColor) -> (h: Double, s: Double, l: Double) {
+        let maximum = max(color.r, color.g, color.b)
+        let minimum = min(color.r, color.g, color.b)
+        let lightness = (maximum + minimum) / 2
+        let delta = maximum - minimum
+        guard delta > 0 else { return (0, 0, lightness) }
+        let saturation = delta / (1 - abs(2 * lightness - 1))
+        var hue: Double
+        if maximum == color.r { hue = ((color.g - color.b) / delta).truncatingRemainder(dividingBy: 6) }
+        else if maximum == color.g { hue = (color.b - color.r) / delta + 2 }
+        else { hue = (color.r - color.g) / delta + 4 }
+        hue /= 6
+        if hue < 0 { hue += 1 }
+        return (hue, saturation, lightness)
+    }
+
+    private static func hslToRGB(h: Double, s: Double, l: Double, alpha: Double) -> RGBAColor {
+        let hue = h < 0 ? h + 1 : h
+        let chroma = (1 - abs(2 * l - 1)) * s
+        let x = chroma * (1 - abs((hue * 6).truncatingRemainder(dividingBy: 2) - 1))
+        let m = l - chroma / 2
+        let sector = Int(floor(hue * 6)) % 6
+        let rgb: (Double, Double, Double)
+        switch sector {
+        case 0: rgb = (chroma, x, 0)
+        case 1: rgb = (x, chroma, 0)
+        case 2: rgb = (0, chroma, x)
+        case 3: rgb = (0, x, chroma)
+        case 4: rgb = (x, 0, chroma)
+        default: rgb = (chroma, 0, x)
+        }
+        return RGBAColor(r: rgb.0 + m, g: rgb.1 + m, b: rgb.2 + m, a: alpha)
+    }
+}
+
 /// Curated muted/earthy palettes — the app's aesthetic default.
 nonisolated enum BuiltInPalettes {
     static let all: [Palette] = [

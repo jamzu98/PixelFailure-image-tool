@@ -18,9 +18,12 @@ struct InspectorView: View {
                 } else if let layer = document.model.layer(id: editorState.selectedLayerID) {
                     commonSection(layer)
                     maskSection(layer)
+                    compositingSection(layer)
                     switch layer.kind {
                     case .pattern(let config):
-                        PatternInspector(document: document, layerID: layer.id, config: config)
+                        PatternInspector(document: document, editorState: editorState,
+                                         layerID: layer.id, config: config,
+                                         renderStore: renderStore)
                     case .image(let config):
                         ImageInspector(document: document, layerID: layer.id, config: config)
                     case .text(let config):
@@ -37,6 +40,12 @@ struct InspectorView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+                    case .adjustment(let config):
+                        EffectStackSection(document: document, title: "Adjustments",
+                                           target: .layer(layer.id), effects: config.effects,
+                                           footnote: "Applies non-destructively to visible layers below in this container.")
+                    case .path(let config):
+                        pathSection(layerID: layer.id, config: config)
                     }
                 } else {
                     canvasSection
@@ -50,20 +59,98 @@ struct InspectorView: View {
         }
     }
 
+    @ViewBuilder
+    private func compositingSection(_ layer: Layer) -> some View {
+        Section("Compositing") {
+            Toggle("Clip to Layer Below", isOn: Binding(
+                get: { document.model.layer(id: layer.id)?.clipsToBelow ?? false },
+                set: { value in
+                    document.update(undoManager, actionName: "Clipping Mask") {
+                        $0.modifyLayer(id: layer.id) { $0.clipsToBelow = value }
+                    }
+                }))
+
+            ForEach(layer.styles) { style in
+                DisclosureGroup(style.type.displayName) {
+                    Toggle("Enabled", isOn: styleBinding(layer.id, style, \.isEnabled))
+                    ColorPicker("Color", selection: Binding(
+                        get: { style.color.color },
+                        set: { color in
+                            updateStyle(layer.id, style.id, action: "Style Color") {
+                                $0.color = RGBAColor(colorValue: color)
+                            }
+                    }))
+                    LabeledContent("Size") {
+                        NumericSlider(value: styleBinding(layer.id, style, \.size),
+                                      range: 0...120, defaultValue: 16)
+                    }
+                    LabeledContent("Opacity") {
+                        NumericSlider(value: styleBinding(layer.id, style, \.opacity),
+                                      range: 0...1, defaultValue: 0.6)
+                    }
+                    if style.type == .dropShadow {
+                        LabeledContent("Offset X") {
+                            NumericSlider(value: styleBinding(layer.id, style, \.offsetX),
+                                          range: -150...150, defaultValue: 12)
+                        }
+                        LabeledContent("Offset Y") {
+                            NumericSlider(value: styleBinding(layer.id, style, \.offsetY),
+                                          range: -150...150, defaultValue: 12)
+                        }
+                    }
+                    Button("Remove Style", role: .destructive) {
+                        document.update(undoManager, actionName: "Remove Style") {
+                            $0.modifyLayer(id: layer.id) { $0.styles.removeAll { $0.id == style.id } }
+                        }
+                    }
+                }
+            }
+            Menu("Add Layer Style") {
+                ForEach(LayerStyleType.allCases, id: \.self) { type in
+                    Button(type.displayName) {
+                        document.update(undoManager, actionName: "Add \(type.displayName)") {
+                            $0.modifyLayer(id: layer.id) { $0.styles.append(LayerStyle(type: type)) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func updateStyle(_ layerID: UUID, _ styleID: UUID, action: String,
+                             _ change: @escaping (inout LayerStyle) -> Void) {
+        document.update(undoManager, actionName: action) { model in
+            model.modifyLayer(id: layerID) { layer in
+                guard let index = layer.styles.firstIndex(where: { $0.id == styleID }) else { return }
+                change(&layer.styles[index])
+            }
+        }
+    }
+
+    private func styleBinding<T>(_ layerID: UUID, _ style: LayerStyle,
+                                 _ keyPath: WritableKeyPath<LayerStyle, T>) -> Binding<T> {
+        Binding(get: {
+            document.model.layer(id: layerID)?.styles.first(where: { $0.id == style.id })?[keyPath: keyPath]
+                ?? style[keyPath: keyPath]
+        }, set: { value in
+            updateStyle(layerID, style.id, action: "Layer Style") { $0[keyPath: keyPath] = value }
+        })
+    }
+
     // MARK: - Common layer controls
 
     @ViewBuilder
     private func commonSection(_ layer: Layer) -> some View {
         Section("Layer") {
             LabeledContent("Opacity") {
-                Slider(value: Binding(
+                NumericSlider(value: Binding(
                     get: { document.model.layer(id: layer.id)?.opacity ?? 1 },
                     set: { newValue in
                         document.updateDuringGesture { model in
                             model.modifyLayer(id: layer.id) { $0.opacity = newValue }
                         }
                     }
-                ), in: 0...1) { editing in
+                ), range: 0...1, defaultValue: 1) { editing in
                     if editing { document.beginGesture() } else { document.endGesture(undoManager, actionName: "Opacity") }
                 }
             }
@@ -81,7 +168,7 @@ struct InspectorView: View {
                 }
             }
 
-            if layer.isLocked {
+            if document.model.isEffectivelyLocked(layer.id) {
                 Label("Layer is locked — transform and painting are disabled.", systemImage: "lock.fill")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -140,27 +227,27 @@ struct InspectorView: View {
             }
 
             LabeledContent("Scale") {
-                Slider(value: Binding(
+                NumericSlider(value: Binding(
                     get: { log2(document.model.layer(id: layer.id)?.transform.scale ?? 1) },
                     set: { newValue in
                         document.updateDuringGesture { model in
                             model.modifyLayer(id: layer.id) { $0.transform.scale = pow(2, newValue) }
                         }
                     }
-                ), in: -4...4) { editing in
+                ), range: -4...4, defaultValue: 0) { editing in
                     if editing { document.beginGesture() } else { document.endGesture(undoManager, actionName: "Scale") }
                 }
             }
 
             LabeledContent("Rotation") {
-                Slider(value: Binding(
+                NumericSlider(value: Binding(
                     get: { document.model.layer(id: layer.id)?.transform.rotationDegrees ?? 0 },
                     set: { newValue in
                         document.updateDuringGesture { model in
                             model.modifyLayer(id: layer.id) { $0.transform.rotationDegrees = newValue }
                         }
                     }
-                ), in: -180...180) { editing in
+                ), range: -180...180, defaultValue: 0, fractionDigits: 1) { editing in
                     if editing { document.beginGesture() } else { document.endGesture(undoManager, actionName: "Rotation") }
                 }
             }
@@ -188,7 +275,7 @@ struct InspectorView: View {
                 }
             }
         }
-        .disabled(layer.isLocked)
+        .disabled(document.model.isEffectivelyLocked(layer.id))
     }
 
     // MARK: - Multiple selection
@@ -234,6 +321,94 @@ struct InspectorView: View {
                     .foregroundStyle(.secondary)
             }
         }
+
+        let booleanEligible = editorState.selectedLayerIDs.filter {
+            guard let layer = document.model.layer(id: $0) else { return false }
+            return layer.kind.isPath || layer.kind.isShape
+        }
+        if booleanEligible.count >= 2 {
+            Section("Boolean Paths") {
+                HStack {
+                    ForEach(PixelDocument.BooleanPathOperation.allCases, id: \.self) { operation in
+                        Button(operation.displayName) {
+                            if let id = document.booleanPath(ids: editorState.selectedLayerIDs,
+                                                             operation: operation,
+                                                             undoManager: undoManager) {
+                                editorState.selectedLayerID = id
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func pathSection(layerID: UUID, config: PathConfig) -> some View {
+        Section("Path") {
+            Text(config.commands == nil
+                 ? "\(config.nodes.count) editable nodes" : "Boolean path commands")
+                .foregroundStyle(.secondary)
+            Toggle("Closed", isOn: Binding(
+                get: { config.isClosed },
+                set: { value in
+                    document.update(undoManager, actionName: "Close Path") {
+                        $0.modifyLayer(id: layerID) { $0.modifyPath { $0.isClosed = value } }
+                    }
+                }))
+            Toggle("Fill", isOn: Binding(
+                get: { config.fill != nil },
+                set: { value in
+                    document.update(undoManager, actionName: "Path Fill") {
+                        $0.modifyLayer(id: layerID) {
+                            $0.modifyPath { $0.fill = value ? document.model.palette.color(1) : nil }
+                        }
+                    }
+                }))
+            if let fill = config.fill {
+                ColorPicker("Fill Color", selection: Binding(
+                    get: { fill.color },
+                    set: { color in
+                        document.update(undoManager, actionName: "Path Fill Color") {
+                            $0.modifyLayer(id: layerID) {
+                                $0.modifyPath { $0.fill = RGBAColor(colorValue: color) }
+                            }
+                        }
+                    }))
+            }
+            Toggle("Stroke", isOn: Binding(
+                get: { config.stroke != nil },
+                set: { value in
+                    document.update(undoManager, actionName: "Path Stroke") {
+                        $0.modifyLayer(id: layerID) {
+                            $0.modifyPath { $0.stroke = value ? RGBAColor(hex: "#EFE8D8") : nil }
+                        }
+                    }
+                }))
+            if let stroke = config.stroke {
+                ColorPicker("Stroke Color", selection: Binding(
+                    get: { stroke.color },
+                    set: { color in
+                        document.update(undoManager, actionName: "Path Stroke Color") {
+                            $0.modifyLayer(id: layerID) {
+                                $0.modifyPath { $0.stroke = RGBAColor(colorValue: color) }
+                            }
+                        }
+                }))
+                LabeledContent("Stroke Width") {
+                    NumericSlider(value: Binding(
+                        get: { config.strokeWidth },
+                        set: { value in
+                            document.updateDuringGesture {
+                                $0.modifyLayer(id: layerID) { $0.modifyPath { $0.strokeWidth = value } }
+                            }
+                        }), range: 0.5...100, defaultValue: 8) { editing in
+                            if editing { document.beginGesture() }
+                            else { document.endGesture(undoManager, actionName: "Path Stroke Width") }
+                        }
+                }
+            }
+        }
     }
 
     private func numericField(_ label: String, value: Binding<Double>) -> some View {
@@ -277,14 +452,37 @@ struct InspectorView: View {
                         }
                     }
                 ))
-                let isEditing = editorState.editingMaskLayerID == layer.id
-                Button(isEditing ? "Done Editing Mask" : "Edit Mask (Paint)") {
-                    if isEditing {
-                        editorState.editingMaskLayerID = nil
-                        editorState.activeTool = .move
-                    } else {
-                        editorState.editingMaskLayerID = layer.id
-                        editorState.activeTool = .brush
+                if let pattern = mask.pattern {
+                    Picker("Pattern", selection: Binding(
+                        get: { pattern.generator },
+                        set: { generator in
+                            document.setPatternMask(on: layer.id, generator: generator,
+                                                    renderStore: renderStore, undoManager: undoManager)
+                        })) {
+                        ForEach(GeneratorType.allCases, id: \.self) { type in
+                            Text(type.displayName).tag(type)
+                        }
+                    }
+                    ParamControls(document: document,
+                                  specs: pattern.generator.generator.specs,
+                                  values: pattern.params) { model, key, value in
+                        model.modifyLayer(id: layer.id) { layer in
+                            layer.mask?.pattern?.params.set(key, value)
+                        }
+                    }
+                    Button("Reroll Pattern Mask") {
+                        document.rerollPatternMask(on: layer.id, undoManager: undoManager)
+                    }
+                } else {
+                    let isEditing = editorState.editingMaskLayerID == layer.id
+                    Button(isEditing ? "Done Editing Mask" : "Edit Mask (Paint)") {
+                        if isEditing {
+                            editorState.editingMaskLayerID = nil
+                            editorState.activeTool = .move
+                        } else {
+                            editorState.editingMaskLayerID = layer.id
+                            editorState.activeTool = .brush
+                        }
                     }
                 }
                 Button("Delete Mask", role: .destructive) {
@@ -300,6 +498,14 @@ struct InspectorView: View {
                     }
                     Button("Add Hiding Mask") {
                         document.addMask(to: layer.id, hideAll: true, renderStore: renderStore, undoManager: undoManager)
+                    }
+                }
+                Menu("Pattern Mask") {
+                    ForEach(GeneratorType.allCases, id: \.self) { type in
+                        Button(type.displayName) {
+                            document.setPatternMask(on: layer.id, generator: type,
+                                                    renderStore: renderStore, undoManager: undoManager)
+                        }
                     }
                 }
                 Text("Masks hide parts of the layer: paint black to hide, white to reveal.")
@@ -354,6 +560,91 @@ struct InspectorView: View {
                            target: .canvas,
                            effects: document.model.canvasEffects,
                            footnote: "Applied to the whole composite. Affects PNG export and the preview; SVG export skips them.")
+
+        workspaceSection
+    }
+
+    @ViewBuilder
+    private var workspaceSection: some View {
+        Section("Workspace") {
+            Toggle("Rulers", isOn: workspaceBinding(\.showsRulers, action: "Toggle Rulers"))
+            Toggle("Smart Guides", isOn: workspaceBinding(\.smartGuidesEnabled,
+                                                           action: "Toggle Smart Guides"))
+            Toggle("Navigator", isOn: workspaceBinding(\.showsNavigator,
+                                                        action: "Toggle Navigator"))
+            Toggle("Grid", isOn: Binding(
+                get: { document.model.workspace.grid.isVisible },
+                set: { value in
+                    document.update(undoManager, actionName: "Toggle Grid") { $0.workspace.grid.isVisible = value }
+                }))
+            if document.model.workspace.grid.isVisible {
+                LabeledContent("Grid Spacing") {
+                    TextField("px", value: Binding(
+                        get: { document.model.workspace.grid.spacing },
+                        set: { value in
+                            document.update(undoManager, actionName: "Grid Spacing") {
+                                $0.workspace.grid.spacing = min(max(value, 4), 2000)
+                            }
+                        }), format: .number.precision(.fractionLength(0)))
+                    .frame(width: 70)
+                }
+                Stepper("Subdivisions: \(document.model.workspace.grid.subdivisions)",
+                        value: Binding(
+                            get: { document.model.workspace.grid.subdivisions },
+                            set: { value in
+                                document.update(undoManager, actionName: "Grid Subdivisions") {
+                                    $0.workspace.grid.subdivisions = min(max(value, 1), 10)
+                                }
+                            }), in: 1...10)
+                Toggle("Snap to Grid", isOn: Binding(
+                    get: { document.model.workspace.grid.snapsToGrid },
+                    set: { value in
+                        document.update(undoManager, actionName: "Snap to Grid") {
+                            $0.workspace.grid.snapsToGrid = value
+                        }
+                    }))
+            }
+        }
+
+        if !document.model.workspace.guides.isEmpty {
+            Section("Guides") {
+                ForEach(document.model.workspace.guides) { guide in
+                    HStack {
+                        Image(systemName: guide.orientation == .vertical
+                              ? "line.vertical" : "line.horizontal")
+                        TextField("Position", value: Binding(
+                            get: { document.model.workspace.guides.first(where: { $0.id == guide.id })?.position ?? guide.position },
+                            set: { value in
+                                document.update(undoManager, actionName: "Move Guide") { model in
+                                    guard let index = model.workspace.guides.firstIndex(where: { $0.id == guide.id }) else { return }
+                                    model.workspace.guides[index].position = value
+                                }
+                            }), format: .number.precision(.fractionLength(0)))
+                        Button {
+                            document.update(undoManager, actionName: "Delete Guide") {
+                                $0.workspace.guides.removeAll { $0.id == guide.id }
+                            }
+                        } label: { Image(systemName: "trash") }
+                            .buttonStyle(.borderless)
+                    }
+                }
+                Button("Clear Guides") {
+                    document.update(undoManager, actionName: "Clear Guides") {
+                        $0.workspace.guides.removeAll()
+                    }
+                }
+            }
+        }
+    }
+
+    private func workspaceBinding(_ keyPath: WritableKeyPath<WorkspaceSettings, Bool>,
+                                  action: String) -> Binding<Bool> {
+        Binding(get: { document.model.workspace[keyPath: keyPath] },
+                set: { value in
+                    document.update(undoManager, actionName: action) {
+                        $0.workspace[keyPath: keyPath] = value
+                    }
+                })
     }
 
     private var draftSizeDiffers: Bool {

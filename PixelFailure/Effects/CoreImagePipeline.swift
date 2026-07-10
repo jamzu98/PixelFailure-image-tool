@@ -14,6 +14,37 @@ extension EffectType {
                 .slider("contrast", "Contrast", min: 0.5, max: 2, initial: 1),
                 .slider("saturation", "Saturation", min: 0, max: 2, initial: 1),
             ]
+        case .curves:
+            return []
+        case .levels:
+            return [
+                .slider("inputBlack", "Input Black", min: 0, max: 0.95, initial: 0),
+                .slider("gamma", "Gamma", min: 0.2, max: 3, initial: 1),
+                .slider("inputWhite", "Input White", min: 0.05, max: 1, initial: 1),
+                .slider("outputBlack", "Output Black", min: 0, max: 0.95, initial: 0),
+                .slider("outputWhite", "Output White", min: 0.05, max: 1, initial: 1),
+            ]
+        case .targetedHSL:
+            return [
+                .slider("targetHue", "Target Hue", min: 0, max: 360, initial: 0),
+                .slider("range", "Hue Range", min: 5, max: 180, initial: 45),
+                .slider("hueShift", "Hue Shift", min: -180, max: 180, initial: 0),
+                .slider("saturation", "Saturation", min: 0, max: 2, initial: 1),
+                .slider("lightness", "Lightness", min: -0.5, max: 0.5, initial: 0),
+            ]
+        case .whiteBalance:
+            return [
+                .slider("temperature", "Temperature", min: 2500, max: 10000, initial: 6500),
+                .slider("tint", "Tint", min: -150, max: 150, initial: 0),
+            ]
+        case .vibrance:
+            return [.slider("amount", "Amount", min: -1, max: 2, initial: 0)]
+        case .shadowsHighlights:
+            return [
+                .slider("shadows", "Shadows", min: -1, max: 1, initial: 0),
+                .slider("highlights", "Highlights", min: -1, max: 1, initial: 0),
+                .slider("radius", "Radius", min: 0, max: 0.2, initial: 0.05),
+            ]
         case .pixelate:
             return [.slider("size", "Block Size", min: 0.002, max: 0.15, initial: 0.02)]
         case .hexPixelate:
@@ -73,7 +104,13 @@ extension EffectType {
         }
     }
 
-    var defaultParams: ParamValues { ParamValues(defaults: specs) }
+    var defaultParams: ParamValues {
+        var values = ParamValues(defaults: specs)
+        if self == .curves {
+            values.setArray("points", [0, 0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1, 1])
+        }
+        return values
+    }
 }
 
 /// Renders an image layer's effect stack with Core Image.
@@ -127,6 +164,66 @@ final class EffectPipeline {
             controls.contrast = Float(p.double("contrast", 1))
             controls.saturation = Float(p.double("saturation", 1))
             return controls.outputImage ?? image
+
+        case .curves:
+            let raw = p.array("points", [0, 0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1, 1])
+            let points = stride(from: 0, to: min(raw.count, 10), by: 2).map {
+                CIVector(x: raw[$0], y: raw[$0 + 1])
+            }
+            guard points.count == 5 else { return image }
+            return image.applyingFilter("CIToneCurve", parameters: [
+                "inputPoint0": points[0], "inputPoint1": points[1],
+                "inputPoint2": points[2], "inputPoint3": points[3],
+                "inputPoint4": points[4],
+            ])
+
+        case .levels:
+            let black = min(p.double("inputBlack", 0), p.double("inputWhite", 1) - 0.001)
+            let white = max(p.double("inputWhite", 1), black + 0.001)
+            let scale = 1 / (white - black)
+            var output = image.applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: scale, y: 0, z: 0, w: 0),
+                "inputGVector": CIVector(x: 0, y: scale, z: 0, w: 0),
+                "inputBVector": CIVector(x: 0, y: 0, z: scale, w: 0),
+                "inputBiasVector": CIVector(x: -black * scale, y: -black * scale,
+                                              z: -black * scale, w: 0),
+            ]).applyingFilter("CIColorClamp", parameters: [
+                "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1),
+            ])
+            output = output.applyingFilter("CIGammaAdjust",
+                                           parameters: ["inputPower": 1 / max(0.01, p.double("gamma", 1))])
+            let outBlack = p.double("outputBlack", 0)
+            let outWhite = max(outBlack, p.double("outputWhite", 1))
+            let outScale = outWhite - outBlack
+            return output.applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: outScale, y: 0, z: 0, w: 0),
+                "inputGVector": CIVector(x: 0, y: outScale, z: 0, w: 0),
+                "inputBVector": CIVector(x: 0, y: 0, z: outScale, w: 0),
+                "inputBiasVector": CIVector(x: outBlack, y: outBlack, z: outBlack, w: 0),
+            ])
+
+        case .targetedHSL:
+            return targetedHSL(image, params: p)
+
+        case .whiteBalance:
+            let temperature = p.double("temperature", 6500)
+            let tint = p.double("tint", 0)
+            return image.applyingFilter("CITemperatureAndTint", parameters: [
+                "inputNeutral": CIVector(x: 6500, y: 0),
+                "inputTargetNeutral": CIVector(x: temperature, y: tint),
+            ])
+
+        case .vibrance:
+            return image.applyingFilter("CIVibrance",
+                                        parameters: ["inputAmount": p.double("amount", 0)])
+
+        case .shadowsHighlights:
+            return image.applyingFilter("CIHighlightShadowAdjust", parameters: [
+                "inputShadowAmount": p.double("shadows", 0),
+                "inputHighlightAmount": p.double("highlights", 0),
+                "inputRadius": p.double("radius", 0.05) * minDim,
+            ])
 
         case .pixelate:
             let filter = CIFilter.pixellate()
@@ -205,6 +302,75 @@ final class EffectPipeline {
     }
 
     // MARK: - Custom passes
+
+    private func targetedHSL(_ image: CIImage, params: ParamValues) -> CIImage {
+        let dimension = 24
+        let target = params.double("targetHue", 0) / 360
+        let range = max(params.double("range", 45) / 360, 0.001)
+        let shift = params.double("hueShift", 0) / 360
+        let saturation = params.double("saturation", 1)
+        let lightness = params.double("lightness", 0)
+        var cube = [Float]()
+        cube.reserveCapacity(dimension * dimension * dimension * 4)
+        for b in 0..<dimension {
+            for g in 0..<dimension {
+                for r in 0..<dimension {
+                    let rgb = (Double(r) / Double(dimension - 1),
+                               Double(g) / Double(dimension - 1),
+                               Double(b) / Double(dimension - 1))
+                    var hsv = rgbToHSV(rgb)
+                    let rawDistance = abs(hsv.h - target)
+                    let distance = min(rawDistance, 1 - rawDistance)
+                    let weight = max(0, 1 - distance / range)
+                    hsv.h = (hsv.h + shift * weight).truncatingRemainder(dividingBy: 1)
+                    if hsv.h < 0 { hsv.h += 1 }
+                    hsv.s = min(max(hsv.s * (1 + (saturation - 1) * weight), 0), 1)
+                    hsv.v = min(max(hsv.v + lightness * weight, 0), 1)
+                    let out = hsvToRGB(hsv)
+                    cube += [Float(out.r), Float(out.g), Float(out.b), 1]
+                }
+            }
+        }
+        let data = cube.withUnsafeBufferPointer { Data(buffer: $0) }
+        return image.applyingFilter("CIColorCube", parameters: [
+            "inputCubeDimension": dimension,
+            "inputCubeData": data,
+        ])
+    }
+
+    private func rgbToHSV(_ rgb: (r: Double, g: Double, b: Double))
+        -> (h: Double, s: Double, v: Double) {
+        let maximum = max(rgb.r, rgb.g, rgb.b)
+        let minimum = min(rgb.r, rgb.g, rgb.b)
+        let delta = maximum - minimum
+        var hue = 0.0
+        if delta > 0 {
+            if maximum == rgb.r { hue = ((rgb.g - rgb.b) / delta).truncatingRemainder(dividingBy: 6) }
+            else if maximum == rgb.g { hue = (rgb.b - rgb.r) / delta + 2 }
+            else { hue = (rgb.r - rgb.g) / delta + 4 }
+            hue /= 6
+            if hue < 0 { hue += 1 }
+        }
+        return (hue, maximum == 0 ? 0 : delta / maximum, maximum)
+    }
+
+    private func hsvToRGB(_ hsv: (h: Double, s: Double, v: Double))
+        -> (r: Double, g: Double, b: Double) {
+        let scaled = hsv.h * 6
+        let sector = Int(floor(scaled)) % 6
+        let fraction = scaled - floor(scaled)
+        let p = hsv.v * (1 - hsv.s)
+        let q = hsv.v * (1 - fraction * hsv.s)
+        let t = hsv.v * (1 - (1 - fraction) * hsv.s)
+        switch sector {
+        case 0: return (hsv.v, t, p)
+        case 1: return (q, hsv.v, p)
+        case 2: return (p, hsv.v, t)
+        case 3: return (p, q, hsv.v)
+        case 4: return (t, p, hsv.v)
+        default: return (hsv.v, p, q)
+        }
+    }
 
     /// Remaps image tones onto the document palette via a gradient color map.
     private func paletteMap(_ image: CIImage, extent: CGRect, palette: Palette, colorCount: Int, mix: Double) -> CIImage {

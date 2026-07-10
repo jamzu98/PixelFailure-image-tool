@@ -92,6 +92,19 @@ struct PalettePanel: View {
             }
 
             HStack(spacing: 4) {
+                Menu {
+                    ForEach(PaletteHarmony.allCases, id: \.self) { harmony in
+                        Button(harmony.displayName) {
+                            document.update(undoManager, actionName: "Palette Harmony") {
+                                $0.palette = $0.palette.harmony(harmony)
+                            }
+                        }
+                    }
+                } label: {
+                    Label("Harmony", systemImage: "circle.hexagongrid")
+                        .font(.caption)
+                }
+
                 Button {
                     extractFromLayer()
                 } label: {

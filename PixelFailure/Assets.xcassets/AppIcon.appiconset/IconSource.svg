@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#25211f"/>
+      <stop offset="1" stop-color="#151312"/>
+    </linearGradient>
+    <linearGradient id="hot" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f2c086"/>
+      <stop offset="0.52" stop-color="#c4744f"/>
+      <stop offset="1" stop-color="#9c4a2f"/>
+    </linearGradient>
+  </defs>
+  <rect x="24" y="24" width="976" height="976" rx="220" fill="url(#bg)"/>
+  <rect x="52" y="52" width="920" height="920" rx="190" fill="none" stroke="#efe8d8" stroke-opacity=".08" stroke-width="4"/>
+  <g fill="url(#hot)">
+    <rect x="204" y="188" width="196" height="196" rx="38"/>
+    <rect x="424" y="188" width="196" height="196" rx="38" opacity=".86"/>
+    <rect x="644" y="188" width="196" height="196" rx="38" opacity=".68"/>
+    <rect x="204" y="408" width="196" height="196" rx="38" opacity=".78"/>
+    <path d="M424 446q0-38 38-38h120q38 0 38 38v120q0 38-38 38H462q-38 0-38-38z" opacity=".48"/>
+    <rect x="644" y="408" width="196" height="196" rx="38" opacity=".9"/>
+    <rect x="204" y="628" width="196" height="196" rx="38" opacity=".58"/>
+    <rect x="424" y="628" width="196" height="196" rx="38" opacity=".92"/>
+  </g>
+  <path d="M672 628h168v72h-96v124H628V708h44z" fill="#efe8d8"/>
+  <path d="M424 408h196v196H424z" fill="none" stroke="#efe8d8" stroke-width="20" stroke-dasharray="28 18" opacity=".9"/>
+</svg>

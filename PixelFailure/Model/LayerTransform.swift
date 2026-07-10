@@ -75,6 +75,29 @@ nonisolated struct LayerTransform: Codable, Hashable, Sendable {
             flippedVertically: parent.flippedVertically != flippedVertically)
     }
 
+    /// Re-expresses a canvas-space transform in a destination parent's local
+    /// coordinate space. The model only permits similarity transforms, so the
+    /// affine can be decomposed without skew loss.
+    static func rebased(world: LayerTransform, destinationParent: CGAffineTransform) -> LayerTransform? {
+        guard destinationParent.isInvertible else { return nil }
+        let local = world.affine(naturalSize: .zero)
+            .concatenating(destinationParent.inverted())
+        let determinant = local.a * local.d - local.b * local.c
+        let horizontalFlip = determinant < 0
+        let xA = horizontalFlip ? -local.a : local.a
+        let xB = horizontalFlip ? -local.b : local.b
+        let xScale = hypot(local.a, local.b)
+        let yScale = hypot(local.c, local.d)
+        let scale = (xScale + yScale) / 2
+        guard scale.isFinite, scale > 1e-12 else { return nil }
+        return LayerTransform(
+            position: CGPoint(x: local.tx, y: local.ty),
+            scale: scale,
+            rotationDegrees: atan2(xB, xA) * 180 / .pi,
+            flippedHorizontally: horizontalFlip,
+            flippedVertically: false)
+    }
+
     /// Whether a canvas-space point falls inside the transformed content rect.
     func contains(_ point: CGPoint, naturalSize: CGSize) -> Bool {
         let t = affine(naturalSize: naturalSize)

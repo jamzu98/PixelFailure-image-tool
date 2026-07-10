@@ -34,6 +34,12 @@ struct AddLayerMenuItems: View {
         Button("Paint Layer") {
             editorState.selectedLayerID = document.addPaintLayer(undoManager: undoManager)
         }
+        Button("Adjustment Layer") {
+            editorState.selectedLayerID = document.addAdjustmentLayer(undoManager: undoManager)
+        }
+        Button("Path") {
+            editorState.selectedLayerID = document.addPathLayer(undoManager: undoManager)
+        }
     }
 }
 
@@ -43,42 +49,43 @@ struct ToolStrip: View {
     @Bindable var editorState: EditorState
 
     var body: some View {
-        VStack(spacing: 4) {
-            ForEach(EditorTool.allCases) { tool in
-                Button {
-                    editorState.activeTool = tool
-                    if tool != .crop { editorState.cropDraft = nil }
+        ScrollView(.vertical) {
+            VStack(spacing: 4) {
+                ForEach(EditorTool.allCases) { tool in
+                    Button {
+                        editorState.activeTool = tool
+                        if tool != .crop { editorState.cropDraft = nil }
+                    } label: {
+                        Image(systemName: tool.systemImage)
+                            .font(.system(size: 14))
+                            .frame(width: 30, height: 28)
+                            .background(editorState.activeTool == tool ? Color.accentColor.opacity(0.28) : Color.clear,
+                                        in: RoundedRectangle(cornerRadius: 6))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("\(tool.displayName) (\(String(tool.shortcutKey).uppercased()))")
+                }
+
+                Divider()
+                    .frame(width: 24)
+                    .padding(.vertical, 2)
+
+                Menu {
+                    AddLayerMenuItems(document: document, editorState: editorState)
                 } label: {
-                    Image(systemName: tool.systemImage)
+                    Image(systemName: "plus")
                         .font(.system(size: 14))
                         .frame(width: 30, height: 28)
-                        .background(editorState.activeTool == tool ? Color.accentColor.opacity(0.28) : Color.clear,
-                                    in: RoundedRectangle(cornerRadius: 6))
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .help("\(tool.displayName) (\(String(tool.shortcutKey).uppercased()))")
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .frame(width: 30)
+                .help("Add layer")
             }
-
-            Divider()
-                .frame(width: 24)
-                .padding(.vertical, 2)
-
-            Menu {
-                AddLayerMenuItems(document: document, editorState: editorState)
-            } label: {
-                Image(systemName: "plus")
-                    .font(.system(size: 14))
-                    .frame(width: 30, height: 28)
-                    .contentShape(Rectangle())
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .frame(width: 30)
-            .help("Add layer")
-
-            Spacer()
         }
+        .scrollIndicators(.hidden)
         .padding(.vertical, 8)
         .padding(.horizontal, 5)
         .background(Color(nsColor: .windowBackgroundColor))
@@ -92,9 +99,13 @@ struct ToolOptionsBar: View {
     @Environment(\.undoManager) private var undoManager
 
     var body: some View {
-        HStack(spacing: 14) {
-            switch editorState.activeTool {
-            case .brush, .eraser:
+        VStack(alignment: .leading, spacing: 2) {
+            Text(editorState.activeTool.displayName)
+                .font(.caption.weight(.semibold))
+
+            HStack(spacing: 14) {
+                switch editorState.activeTool {
+            case .brush, .eraser, .clone, .heal, .smudge, .dodge, .burn:
                 brushOptions
             case .crop:
                 Text("Drag the crop rectangle, then Apply — or press Return. Esc cancels.")
@@ -140,10 +151,10 @@ struct ToolOptionsBar: View {
                 HStack(spacing: 4) {
                     Text("Tolerance")
                         .font(.caption)
-                    Slider(value: Binding(
+                    NumericSlider(value: Binding(
                         get: { editorState.wandTolerance },
                         set: { editorState.wandTolerance = $0 }
-                    ), in: 0.02...0.9)
+                    ), range: 0.02...0.9, defaultValue: 0.25)
                     .frame(width: 110)
                 }
                 featherControl
@@ -156,13 +167,20 @@ struct ToolOptionsBar: View {
                 Text("Drag to pan the canvas.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            case .pen:
+                Text("Click to create path nodes · Return to close the path.")
+                    .font(.caption).foregroundStyle(.secondary)
+            case .node:
+                Text("Drag anchors and control handles on the selected path.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            Spacer(minLength: 0)
+                Spacer(minLength: 0)
+            }
         }
         .padding(.horizontal, 12)
         // Fixed height: the bar's contents change per tool, but the bar
         // itself never grows, shrinks, or disappears — no layout jumps.
-        .frame(height: 34)
+        .frame(height: 52)
         .frame(maxWidth: .infinity)
         .background(.bar)
         .clipped()
@@ -174,13 +192,13 @@ struct ToolOptionsBar: View {
         HStack(spacing: 4) {
             Text("Feather")
                 .font(.caption)
-            Slider(value: Binding(
+            NumericSlider(value: Binding(
                 get: { editorState.selection?.feather ?? editorState.featherDefault },
                 set: { newValue in
                     editorState.featherDefault = newValue
                     editorState.selection?.feather = newValue
                 }
-            ), in: 0...80)
+            ), range: 0...80, defaultValue: 0, fractionDigits: 0)
             .frame(width: 100)
             Text("\(Int((editorState.selection?.feather ?? editorState.featherDefault).rounded()))")
                 .font(.caption.monospacedDigit())
@@ -224,6 +242,17 @@ struct ToolOptionsBar: View {
     private var brushOptions: some View {
         let brush = editorState.brush
 
+        Picker("Preset", selection: Binding(
+            get: { brush.selectedPresetID },
+            set: { id in
+                if let preset = BrushPreset.builtIns.first(where: { $0.id == id }) {
+                    brush.apply(preset)
+                }
+            })) {
+            ForEach(BrushPreset.builtIns) { preset in Text(preset.name).tag(preset.id) }
+        }
+        .frame(width: 130)
+
         if editorState.editingMaskLayerID != nil {
             Label("Editing Mask", systemImage: "circle.lefthalf.filled")
                 .font(.caption.weight(.semibold))
@@ -248,22 +277,61 @@ struct ToolOptionsBar: View {
         HStack(spacing: 4) {
             Text("Size")
                 .font(.caption)
-            Slider(value: Binding(get: { brush.size }, set: { brush.size = $0 }), in: 4...600)
+            NumericSlider(value: Binding(get: { brush.size }, set: { brush.size = $0 }),
+                          range: 4...600, defaultValue: 120, fractionDigits: 0)
                 .frame(width: 120)
             Text("\(Int(brush.size))")
                 .font(.caption.monospacedDigit())
                 .frame(width: 30, alignment: .leading)
         }
+        Menu("Dynamics") {
+            LabeledContent("Spacing") {
+                NumericSlider(value: Binding(get: { brush.spacing }, set: { brush.spacing = $0 }),
+                              range: 0.03...1, defaultValue: 0.15)
+                    .frame(width: 130)
+            }
+            LabeledContent("Smoothing") {
+                NumericSlider(value: Binding(get: { brush.smoothing }, set: { brush.smoothing = $0 }),
+                              range: 0...0.95, defaultValue: 0.25)
+                    .frame(width: 130)
+            }
+            LabeledContent("Scatter") {
+                NumericSlider(value: Binding(get: { brush.scatter }, set: { brush.scatter = $0 }),
+                              range: 0...2, defaultValue: 0)
+                    .frame(width: 130)
+            }
+            LabeledContent("Size Jitter") {
+                NumericSlider(value: Binding(get: { brush.sizeJitter }, set: { brush.sizeJitter = $0 }),
+                              range: 0...1, defaultValue: 0)
+                    .frame(width: 130)
+            }
+            LabeledContent("Opacity Jitter") {
+                NumericSlider(value: Binding(get: { brush.opacityJitter }, set: { brush.opacityJitter = $0 }),
+                              range: 0...1, defaultValue: 0)
+                    .frame(width: 130)
+            }
+            Toggle("Pressure → Size", isOn: Binding(get: { brush.pressureControlsSize },
+                                                     set: { brush.pressureControlsSize = $0 }))
+            Toggle("Pressure → Opacity", isOn: Binding(get: { brush.pressureControlsOpacity },
+                                                        set: { brush.pressureControlsOpacity = $0 }))
+        }
+        if editorState.activeTool == .clone || editorState.activeTool == .heal {
+            Text(editorState.cloneSourceCanvas == nil
+                 ? "⌥-click to set source" : "Source set · ⌥-click to replace")
+                .font(.caption).foregroundStyle(editorState.cloneSourceCanvas == nil ? .orange : .secondary)
+        }
         HStack(spacing: 4) {
             Text("Hardness")
                 .font(.caption)
-            Slider(value: Binding(get: { brush.hardness }, set: { brush.hardness = $0 }), in: 0...1)
+            NumericSlider(value: Binding(get: { brush.hardness }, set: { brush.hardness = $0 }),
+                          range: 0...1, defaultValue: 0.6)
                 .frame(width: 90)
         }
         HStack(spacing: 4) {
             Text("Opacity")
                 .font(.caption)
-            Slider(value: Binding(get: { brush.opacity }, set: { brush.opacity = $0 }), in: 0.05...1)
+            NumericSlider(value: Binding(get: { brush.opacity }, set: { brush.opacity = $0 }),
+                          range: 0.05...1, defaultValue: 1)
                 .frame(width: 90)
         }
         if editorState.activeTool == .brush && editorState.editingMaskLayerID == nil {

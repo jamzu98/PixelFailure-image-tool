@@ -54,7 +54,27 @@ enum PNGExporter {
 
         let naturalRect = CGRect(origin: .zero, size: item.naturalSize)
 
-        switch item.content {
+        for style in item.styles where style.isEnabled {
+            drawStyle(style, content: item.content, naturalRect: naturalRect, context: ctx)
+        }
+        drawContent(item.content, naturalRect: naturalRect, context: ctx)
+
+        // Mask inside the layer's transparency layer: keep only the pixels
+        // where the mask's alpha is set.
+        if let mask = item.mask {
+            ctx.saveGState()
+            ctx.setBlendMode(.destinationIn)
+            drawUpright(mask.alpha, in: naturalRect, context: ctx)
+            ctx.restoreGState()
+        }
+
+        ctx.endTransparencyLayer()
+        ctx.restoreGState()
+    }
+
+    private static func drawContent(_ content: RenderItem.Content, naturalRect: CGRect,
+                                    context ctx: CGContext) {
+        switch content {
         case .primitives(let primitives):
             for primitive in primitives {
                 let cgPath = primitive.path.cgPath
@@ -82,18 +102,29 @@ enum PNGExporter {
                 drawItem(child, context: ctx)
             }
         }
+    }
 
-        // Mask inside the layer's transparency layer: keep only the pixels
-        // where the mask's alpha is set.
-        if let mask = item.mask {
+    private static func drawStyle(_ style: LayerStyle, content: RenderItem.Content,
+                                  naturalRect: CGRect, context ctx: CGContext) {
+        let color = style.color.withAlpha(style.color.a * style.opacity).cgColor
+        func drawShadow(offset: CGSize, blur: CGFloat) {
             ctx.saveGState()
-            ctx.setBlendMode(.destinationIn)
-            drawUpright(mask.alpha, in: naturalRect, context: ctx)
+            ctx.setShadow(offset: offset, blur: blur, color: color)
+            drawContent(content, naturalRect: naturalRect, context: ctx)
             ctx.restoreGState()
         }
-
-        ctx.endTransparencyLayer()
-        ctx.restoreGState()
+        switch style.type {
+        case .dropShadow:
+            drawShadow(offset: CGSize(width: style.offsetX, height: style.offsetY), blur: style.size)
+        case .outerGlow:
+            drawShadow(offset: .zero, blur: style.size)
+        case .stroke:
+            for index in 0..<8 {
+                let angle = Double(index) * .pi / 4
+                drawShadow(offset: CGSize(width: cos(angle) * style.size,
+                                          height: sin(angle) * style.size), blur: 0)
+            }
+        }
     }
 
     /// Draws a CGImage upright inside our y-down coordinate space.

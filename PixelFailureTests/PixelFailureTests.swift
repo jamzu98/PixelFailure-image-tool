@@ -195,9 +195,29 @@ struct BackCompatTests {
         """
         let model = try JSONDecoder().decode(ProjectModel.self, from: Data(old.utf8))
         #expect(model.layers.count == 1)
+        #expect(model.schemaVersion == 1)
         #expect(model.canvasEffects.isEmpty)
+        #expect(model.workspace.guides.isEmpty)
         #expect(model.layers[0].mask == nil)
         #expect(model.layers[0].patternConfig?.seed == 42)
+    }
+
+    @Test func obsoleteSeedHistoryDecodesButIsNotReencoded() throws {
+        let old = """
+        {
+          "generator": "flowField",
+          "seed": 42,
+          "params": {"storage": {}},
+          "seedHistory": [12, 24, 42],
+          "seedHistoryIndex": 2
+        }
+        """
+        let config = try JSONDecoder().decode(PatternConfig.self, from: Data(old.utf8))
+        #expect(config.seed == 42)
+        let data = try JSONEncoder().encode(config)
+        let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        #expect(object["seedHistory"] == nil)
+        #expect(object["seedHistoryIndex"] == nil)
     }
 
     @Test func newFieldsRoundTrip() throws {
@@ -692,5 +712,629 @@ struct GroupTests {
         let gap1 = centers[1] - centers[0]
         let gap2 = centers[2] - centers[1]
         #expect(abs(gap1 - gap2) < 0.5)
+    }
+}
+
+// MARK: - Foundation closeout regression tests
+
+@MainActor
+struct FoundationCloseoutTests {
+    private func shape(_ name: String, at point: CGPoint) -> Layer {
+        Layer(name: name, transform: LayerTransform(position: point),
+              kind: .shape(ShapeConfig(kind: .rectangle,
+                                       size: CGSize(width: 60, height: 40))))
+    }
+
+    @Test func currentManifestWritesSchemaVersion() throws {
+        let model = ProjectModel()
+        let encoded = try JSONEncoder().encode(model)
+        let object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        #expect(object["schemaVersion"] as? Int == ProjectModel.currentSchemaVersion)
+    }
+
+    @Test func nestedDeleteReallyRemovesChild() throws {
+        let document = PixelDocument()
+        let child = shape("Child", at: CGPoint(x: 80, y: 90))
+        let group = Layer(name: "Group",
+                          transform: LayerTransform(position: document.model.canvasCenter),
+                          kind: .group(GroupConfig(children: [child])))
+        document.update(nil) { $0.layers = [group] }
+
+        document.deleteLayer(id: child.id, undoManager: nil)
+        #expect(document.model.layer(id: child.id) == nil)
+        #expect(document.model.layer(id: group.id)?.groupConfig?.children.isEmpty == true)
+    }
+
+    @Test func reparentPreservesRenderingAndRejectsCycles() throws {
+        let document = PixelDocument()
+        let store = RenderStore(document: document)
+        let child = shape("Child", at: CGPoint(x: 90, y: 110))
+        var groupTransform = LayerTransform(position: CGPoint(x: 220, y: 180), scale: 1.3,
+                                            rotationDegrees: 20)
+        groupTransform.flippedHorizontally = true
+        let group = Layer(name: "Group", transform: groupTransform,
+                          kind: .group(GroupConfig(children: [child])))
+        document.update(nil) {
+            $0.canvasSize = CGSize(width: 400, height: 400)
+            $0.layers = [group]
+        }
+
+        #expect(!document.moveLayer(id: group.id, to: child.id, at: 0, undoManager: nil))
+        func pixels() throws -> Data {
+            let items = store.renderItems(model: document.model, quality: .full)
+            let image = try #require(PNGExporter.render(items: items, background: .black,
+                                                        canvasSize: document.model.canvasSize,
+                                                        targetPixelSize: CGSize(width: 400, height: 400)))
+            return try #require(PNGExporter.pngData(image))
+        }
+        let before = try pixels()
+        #expect(document.moveLayer(id: child.id, to: nil, at: 1, undoManager: nil))
+        #expect(document.model.parentGroupID(of: child.id) == nil)
+        #expect(try pixels() == before)
+    }
+
+    @Test func ancestorLockBlocksTransformAndReparent() throws {
+        let document = PixelDocument()
+        let child = shape("Child", at: CGPoint(x: 100, y: 100))
+        let group = Layer(name: "Locked Group", transform: LayerTransform(position: document.model.canvasCenter),
+                          kind: .group(GroupConfig(children: [child])), isLocked: true)
+        document.update(nil) { $0.layers = [group] }
+        let original = try #require(document.model.layer(id: child.id)?.transform)
+
+        document.flipLayer(id: child.id, horizontally: true, undoManager: nil)
+        #expect(document.model.layer(id: child.id)?.transform == original)
+        #expect(!document.moveLayer(id: child.id, to: nil, at: 0, undoManager: nil))
+    }
+
+    @Test func selectionTransferContainsOnlyCroppedPixelsAndDoesNotMutateStore() throws {
+        let document = PixelDocument()
+        let store = RenderStore(document: document)
+        let ctx = try #require(CGContext(data: nil, width: 100, height: 100,
+                                         bitsPerComponent: 8, bytesPerRow: 0,
+                                         space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        ctx.setFillColor(CGColor(srgbRed: 1, green: 0, blue: 0, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: 100, height: 100))
+        let png = try #require(ctx.makeImage().flatMap(PNGExporter.pngData))
+        let key = document.storeImage(data: png, fileExtension: "png")
+        let layer = Layer(name: "Pixels", transform: LayerTransform(position: CGPoint(x: 50, y: 50)),
+                          kind: .image(ImageConfig(imageKey: key,
+                                                   pixelSize: CGSize(width: 100, height: 100))))
+        document.update(nil) {
+            $0.canvasSize = CGSize(width: 100, height: 100)
+            $0.layers = [layer]
+        }
+        let selection = CanvasSelection(path: Path(CGRect(x: 0, y: 0, width: 50, height: 100)))
+        let beforeKeys = Set(document.images.keys)
+        let transfer = try #require(document.transferPayload(for: selection, layerID: layer.id,
+                                                              renderStore: store))
+        #expect(Set(document.images.keys) == beforeKeys)
+        #expect(transfer.images?.count == 1)
+        #expect(transfer.layer.imageConfig?.pixelSize.width ?? 100 < 60)
+        #expect(transfer.flattenedPNG != nil)
+    }
+}
+
+@MainActor
+struct CoreAdjustmentTests {
+    @Test func paramArraysAreBackwardCompatible() throws {
+        let legacy = Data(#"{"storage":{"exposure":1.25}}"#.utf8)
+        var values = try JSONDecoder().decode(ParamValues.self, from: legacy)
+        #expect(values.double("exposure") == 1.25)
+        #expect(values.array("points").isEmpty)
+        values.setArray("points", [0, 0, 1, 1])
+        let roundTrip = try JSONDecoder().decode(ParamValues.self,
+                                                 from: JSONEncoder().encode(values))
+        #expect(roundTrip.array("points") == [0, 0, 1, 1])
+    }
+
+    @Test func coreAdjustmentsRenderAtInputSize() throws {
+        let width = 32, height = 32
+        let context = try #require(CGContext(data: nil, width: width, height: height,
+                                             bitsPerComponent: 8, bytesPerRow: 0,
+                                             space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        let colors = [CGColor(gray: 0.15, alpha: 1), CGColor(gray: 0.85, alpha: 1)] as CFArray
+        let gradient = try #require(CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                                               colors: colors, locations: [0, 1]))
+        context.drawLinearGradient(gradient, start: .zero, end: CGPoint(x: width, y: height), options: [])
+        let input = try #require(context.makeImage())
+
+        var curves = EffectType.curves.defaultParams
+        curves.setArray("points", [0, 0.1, 0.25, 0.35, 0.5, 0.65, 0.75, 0.85, 1, 1])
+        var levels = EffectType.levels.defaultParams
+        levels.set("gamma", 1.4)
+        var hsl = EffectType.targetedHSL.defaultParams
+        hsl.set("saturation", 1.4)
+        let effects = [
+            Effect(type: .curves, params: curves),
+            Effect(type: .levels, params: levels),
+            Effect(type: .targetedHSL, params: hsl),
+            Effect(type: .whiteBalance, params: EffectType.whiteBalance.defaultParams),
+            Effect(type: .vibrance, params: EffectType.vibrance.defaultParams),
+            Effect(type: .shadowsHighlights, params: EffectType.shadowsHighlights.defaultParams),
+        ]
+        let output = EffectPipeline.shared.apply(effects: effects, to: input,
+                                                 palette: BuiltInPalettes.default)
+        #expect(output.width == width)
+        #expect(output.height == height)
+    }
+}
+
+@MainActor
+struct WorkspaceAndCompositingTests {
+    @Test func workspaceSettingsPersist() throws {
+        var model = ProjectModel()
+        model.workspace.guides = [CanvasGuide(orientation: .vertical, position: 123),
+                                  CanvasGuide(orientation: .horizontal, position: 456)]
+        model.workspace.grid = GridSettings(isVisible: true, spacing: 64,
+                                            subdivisions: 4, snapsToGrid: true)
+        model.workspace.showsNavigator = false
+        let decoded = try JSONDecoder().decode(ProjectModel.self,
+                                                from: JSONEncoder().encode(model))
+        #expect(decoded.workspace == model.workspace)
+    }
+
+    @Test func adjustmentLayerResolvesAboveExistingStack() throws {
+        let document = PixelDocument()
+        let store = RenderStore(document: document)
+        let base = Layer(name: "Base", transform: LayerTransform(position: CGPoint(x: 50, y: 50)),
+                         kind: .fill(FillConfig(style: .solid,
+                                               colors: [RGBAColor(hex: "#808080")])))
+        var params = EffectType.adjust.defaultParams
+        params.set("exposure", 1)
+        let adjustment = Layer(name: "Brighten", transform: LayerTransform(position: CGPoint(x: 50, y: 50)),
+                               kind: .adjustment(AdjustmentConfig(effects: [Effect(type: .adjust,
+                                                                                  params: params)])))
+        document.update(nil) {
+            $0.canvasSize = CGSize(width: 100, height: 100)
+            $0.layers = [base, adjustment]
+        }
+        let items = store.renderItems(model: document.model, quality: .full)
+        #expect(items.count == 2)
+        #expect(items.last?.svgWarning != nil)
+        let svg = SVGExporter.svg(items: items, background: .clear,
+                                  canvasSize: document.model.canvasSize)
+        #expect(svg.contains("Adjustment layer rendered as a raster overlay"))
+    }
+
+    @Test func clippingUsesAlphaOfSiblingBelow() throws {
+        let document = PixelDocument()
+        let store = RenderStore(document: document)
+        let base = Layer(name: "Base", transform: LayerTransform(position: CGPoint(x: 50, y: 50)),
+                         kind: .shape(ShapeConfig(kind: .rectangle,
+                                                 size: CGSize(width: 40, height: 40),
+                                                 fill: RGBAColor(hex: "#FF0000"))))
+        let clipped = Layer(name: "Clipped", transform: LayerTransform(position: CGPoint(x: 50, y: 50)),
+                            kind: .fill(FillConfig(style: .solid,
+                                                  colors: [RGBAColor(hex: "#00FF00")])),
+                            clipsToBelow: true)
+        document.update(nil) {
+            $0.canvasSize = CGSize(width: 100, height: 100)
+            $0.layers = [base, clipped]
+        }
+        let items = store.renderItems(model: document.model, quality: .full)
+        let output = try #require(PNGExporter.render(items: items, background: .clear,
+                                                     canvasSize: document.model.canvasSize,
+                                                     targetPixelSize: document.model.canvasSize))
+        let sampler = try #require(ImageSampler(cgImage: output, maxDimension: 100))
+        #expect(sampler.color(atUnitX: 0.5, y: 0.5).a > 0.9)
+        #expect(sampler.color(atUnitX: 0.05, y: 0.05).a < 0.1)
+    }
+
+    @Test func layerStylesAreRetainedByRasterAndSVGRenderers() {
+        let style = LayerStyle(type: .dropShadow, color: RGBAColor(hex: "#000000"),
+                               size: 6, opacity: 0.8, offsetX: 4, offsetY: 4)
+        let item = RenderItem(id: UUID(), opacity: 1, blendMode: .normal,
+                              transform: .identity, naturalSize: CGSize(width: 40, height: 40),
+                              content: .fill(FillConfig(style: .solid,
+                                                        colors: [RGBAColor(hex: "#FF0000")])),
+                              mask: nil, styles: [style])
+        let svg = SVGExporter.svg(items: [item], background: .clear,
+                                  canvasSize: CGSize(width: 80, height: 80))
+        #expect(svg.contains("<filter id=\"style"))
+        #expect(svg.contains("<feDropShadow"))
+    }
+}
+
+@MainActor
+struct SignatureFeatureTests {
+    @Test func completeVariationAppliesSeedAndParametersTogether() throws {
+        let document = PixelDocument()
+        let layerID = try #require(document.model.layers.first?.id)
+        var params = try #require(document.model.layer(id: layerID)?.patternConfig?.params)
+        params.set("curl", 1.75)
+        document.applyPatternVariation(seed: 999, params: params,
+                                       layerID: layerID, undoManager: nil)
+        let config = try #require(document.model.layer(id: layerID)?.patternConfig)
+        #expect(config.seed == 999)
+        #expect(config.params.double("curl") == 1.75)
+    }
+
+    @Test func variationRandomizationIsDeterministicAndPreservesUnsafeParameters() {
+        let specs = GeneratorType.flowField.generator.specs
+        var existing = ParamValues(defaults: specs)
+        existing.set("lineCount", 777)
+        let first = ParamValues.randomized(specs: specs, seed: 123, keeping: existing)
+        let second = ParamValues.randomized(specs: specs, seed: 123, keeping: existing)
+        #expect(first == second)
+        #expect(first.int("lineCount") == 777)
+        #expect(first.storage != existing.storage)
+    }
+
+    @Test func numericSliderValuesClampAndRoundToStep() {
+        #expect(NumericSliderValue.normalized(12, range: 0...10, step: nil) == 10)
+        #expect(NumericSliderValue.normalized(-2, range: 0...10, step: nil) == 0)
+        #expect(NumericSliderValue.normalized(4.6, range: 0...10, step: 1) == 5)
+        #expect(NumericSliderValue.normalized(0.24, range: 0...1, step: 0.1) == 0.2)
+    }
+
+    @Test func everyPaletteHarmonyProducesFiveValidColors() {
+        for harmony in PaletteHarmony.allCases {
+            let palette = BuiltInPalettes.default.harmony(harmony)
+            #expect(palette.colors.count == Palette.swatchCount)
+            #expect(palette.colors.allSatisfy {
+                (0...1).contains($0.r) && (0...1).contains($0.g)
+                    && (0...1).contains($0.b) && (0...1).contains($0.a)
+            })
+        }
+    }
+
+    @Test func proceduralPatternMaskResolvesWithoutStoredImage() throws {
+        let document = PixelDocument()
+        let store = RenderStore(document: document)
+        let layer = Layer(name: "Masked", transform: LayerTransform(position: CGPoint(x: 100, y: 100)),
+                          kind: .shape(ShapeConfig(kind: .rectangle,
+                                                  size: CGSize(width: 100, height: 100))))
+        document.update(nil) {
+            $0.canvasSize = CGSize(width: 200, height: 200)
+            $0.layers = [layer]
+        }
+        document.setPatternMask(on: layer.id, generator: .rings,
+                                renderStore: store, undoManager: nil)
+        let mask = try #require(document.model.layer(id: layer.id)?.mask)
+        #expect(mask.imageKey.isEmpty)
+        #expect(mask.pattern?.generator == .rings)
+        let item = try #require(store.renderItems(model: document.model, quality: .full).first)
+        #expect(item.mask != nil)
+    }
+}
+
+@MainActor
+struct BrushV2Tests {
+    private func splitImage() throws -> CGImage {
+        let context = try #require(CGContext(data: nil, width: 32, height: 32,
+                                             bitsPerComponent: 8, bytesPerRow: 0,
+                                             space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.setFillColor(RGBAColor(hex: "#FF0000").cgColor)
+        context.fill(CGRect(x: 0, y: 0, width: 16, height: 32))
+        context.setFillColor(RGBAColor(hex: "#0000FF").cgColor)
+        context.fill(CGRect(x: 16, y: 0, width: 16, height: 32))
+        return try #require(context.makeImage())
+    }
+
+    @Test func builtInBrushPresetsCoverSoftHardScatterAndInk() {
+        #expect(BrushPreset.builtIns.count >= 4)
+        #expect(BrushPreset.builtIns.contains { $0.scatter > 0 })
+        #expect(BrushPreset.builtIns.contains { $0.smoothing > 0.7 })
+    }
+
+    @Test func dynamicsStrokeAndEveryRetouchModeProducePixels() throws {
+        let base = try splitImage()
+        let baseData = try #require(PNGExporter.pngData(base))
+        let paint = try #require(PaintSession(target: .content(layerID: UUID()), base: base,
+                                              pixelSize: CGSize(width: 32, height: 32)))
+        paint.stroke(to: CGPoint(x: 16, y: 16), radius: 7, hardness: 0.5,
+                     opacity: 0.8, color: .white, erase: false,
+                     spacing: 0.25, smoothing: 0.7, scatter: 0.5,
+                     sizeJitter: 0.4, opacityJitter: 0.4)
+        #expect(paint.currentImage.flatMap(PNGExporter.pngData) != baseData)
+
+        for mode in [PaintSession.RetouchMode.clone, .heal, .smudge, .dodge, .burn] {
+            let session = try #require(PaintSession(target: .content(layerID: UUID()), base: base,
+                                                    pixelSize: CGSize(width: 32, height: 32)))
+            session.retouch(to: CGPoint(x: 24, y: 16), source: CGPoint(x: 8, y: 16),
+                            mode: mode, radius: 6, hardness: 0.5, opacity: 1,
+                            spacing: 0.15, smoothing: 0.2)
+            if mode == .smudge {
+                session.retouch(to: CGPoint(x: 14, y: 16), source: nil,
+                                mode: mode, radius: 8, hardness: 0.5, opacity: 1,
+                                spacing: 0.15, smoothing: 0.1)
+            }
+            #expect(session.currentImage.flatMap(PNGExporter.pngData) != baseData,
+                    "\(mode) did not alter the buffer")
+        }
+    }
+}
+
+@MainActor
+struct TypographyVectorTests {
+    @Test func paragraphRangeStylesAndTextPathStayVector() {
+        let red = RGBAColor(hex: "#FF0000")
+        let blue = RGBAColor(hex: "#0000FF")
+        let paragraph = TextConfig(text: "Red blue words wrap inside a paragraph box",
+                                   size: 28, color: red,
+                                   boxSize: CGSize(width: 180, height: 120),
+                                   styleRuns: [TextStyleRun(location: 4, length: 4, color: blue)])
+        let boxed = TextOutliner.render(paragraph)
+        #expect(boxed.size == CGSize(width: 180, height: 120))
+        #expect(boxed.primitives.contains { $0.fill == red })
+        let ranged = TextOutliner.render(TextConfig(text: "RedBlue", size: 28, tracking: 0,
+                                                    color: red, allCaps: false,
+                                                    styleRuns: [TextStyleRun(location: 3, length: 4,
+                                                                                   color: blue)]))
+        #expect(ranged.primitives.contains { $0.fill == red })
+        #expect(ranged.primitives.contains { $0.fill == blue },
+                "fills: \(ranged.primitives.map(\.fill))")
+
+        var baseline = Path()
+        baseline.move(to: CGPoint(x: 0, y: 60))
+        baseline.addCurve(to: CGPoint(x: 300, y: 60),
+                          control1: CGPoint(x: 100, y: 0),
+                          control2: CGPoint(x: 200, y: 120))
+        let onPath = TextOutliner.render(TextConfig(text: "Text on a curve", size: 24), path: baseline)
+        #expect(!onPath.primitives.isEmpty)
+        #expect(onPath.primitives.allSatisfy { !$0.path.isEmpty })
+    }
+
+    @Test func editablePathRoundTripsAndExportsAsSVGPath() throws {
+        let config = PathConfig(size: CGSize(width: 300, height: 200), nodes: [
+            BezierNode(anchor: CGPoint(x: 10, y: 100), outControl: CGPoint(x: 80, y: 10)),
+            BezierNode(anchor: CGPoint(x: 290, y: 100), inControl: CGPoint(x: 220, y: 190)),
+        ], stroke: RGBAColor(hex: "#00FFAA"), strokeWidth: 5)
+        let decoded = try JSONDecoder().decode(PathConfig.self, from: JSONEncoder().encode(config))
+        #expect(decoded == config)
+
+        let item = RenderItem(id: UUID(), opacity: 1, blendMode: .normal,
+                              transform: .identity, naturalSize: config.size,
+                              content: .primitives(PathGeometry.primitives(for: config)))
+        let svg = SVGExporter.svg(items: [item], background: .clear, canvasSize: config.size)
+        #expect(svg.contains("<path d="))
+        #expect(!svg.contains("<image"))
+    }
+
+    @Test func booleanOperationProducesEditablePathLayer() throws {
+        let document = PixelDocument()
+        let a = Layer(name: "A", transform: LayerTransform(position: CGPoint(x: 90, y: 100)),
+                      kind: .shape(ShapeConfig(kind: .rectangle,
+                                               size: CGSize(width: 120, height: 120))))
+        let b = Layer(name: "B", transform: LayerTransform(position: CGPoint(x: 150, y: 100)),
+                      kind: .shape(ShapeConfig(kind: .ellipse,
+                                               size: CGSize(width: 120, height: 120))))
+        document.update(nil) {
+            $0.canvasSize = CGSize(width: 300, height: 200)
+            $0.layers = [a, b]
+        }
+        let resultID = try #require(document.booleanPath(ids: [a.id, b.id], operation: .union,
+                                                         undoManager: nil))
+        #expect(document.model.layers.count == 1)
+        #expect(document.model.layer(id: resultID)?.kind.isPath == true)
+        #expect((document.model.layer(id: resultID)?.pathConfig?.commands?.count ?? 0) > 0)
+    }
+}
+
+@MainActor
+struct PlatformMLPerformanceTests {
+    private func layeredPSD() -> Data {
+        func u16(_ value: UInt16) -> [UInt8] {
+            [UInt8(value >> 8), UInt8(value & 0xff)]
+        }
+        func u32(_ value: UInt32) -> [UInt8] {
+            [UInt8(value >> 24), UInt8((value >> 16) & 0xff),
+             UInt8((value >> 8) & 0xff), UInt8(value & 0xff)]
+        }
+        var record = Data()
+        for value: UInt32 in [0, 0, 1, 2] { record.append(contentsOf: u32(value)) }
+        record.append(contentsOf: u16(4))
+        for id: UInt16 in [0, 1, 2, UInt16.max] {
+            record.append(contentsOf: u16(id))
+            record.append(contentsOf: u32(4))
+        }
+        record.append(Data("8BIMnorm".utf8))
+        record.append(contentsOf: [128, 0, 0, 0])
+        var extra = Data()
+        extra.append(contentsOf: u32(0))
+        extra.append(contentsOf: u32(0))
+        extra.append(4)
+        extra.append(Data("Test".utf8))
+        extra.append(contentsOf: [0, 0, 0])
+        record.append(contentsOf: u32(UInt32(extra.count)))
+        record.append(extra)
+        var layerInfo = Data(u16(1))
+        layerInfo.append(record)
+        for plane: [UInt8] in [[255, 0], [0, 255], [0, 0], [255, 255]] {
+            layerInfo.append(contentsOf: u16(0))
+            layerInfo.append(contentsOf: plane)
+        }
+        var layerMask = Data(u32(UInt32(layerInfo.count)))
+        layerMask.append(layerInfo)
+        var psd = Data("8BPS".utf8)
+        psd.append(contentsOf: u16(1))
+        psd.append(contentsOf: [UInt8](repeating: 0, count: 6))
+        psd.append(contentsOf: u16(4))
+        psd.append(contentsOf: u32(1))
+        psd.append(contentsOf: u32(2))
+        psd.append(contentsOf: u16(8))
+        psd.append(contentsOf: u16(3))
+        psd.append(contentsOf: u32(0))
+        psd.append(contentsOf: u32(0))
+        psd.append(contentsOf: u32(UInt32(layerMask.count)))
+        psd.append(layerMask)
+        return psd
+    }
+
+    private func testImage(width: Int = 64, height: Int = 64) throws -> CGImage {
+        let context = try #require(CGContext(data: nil, width: width, height: height,
+                                             bitsPerComponent: 8, bytesPerRow: 0,
+                                             space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.setFillColor(RGBAColor(hex: "#203040").cgColor)
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.setFillColor(RGBAColor(hex: "#F08040").cgColor)
+        context.fillEllipse(in: CGRect(x: width / 4, y: height / 4,
+                                       width: width / 2, height: height / 2))
+        return try #require(context.makeImage())
+    }
+
+    @Test func pdfRoundTripUsesExplicitFlattenedImportPath() throws {
+        let image = try testImage()
+        let pdf = try #require(PDFExporter.data(image: image,
+                                                pageSize: CGSize(width: 64, height: 64)))
+        #expect(pdf.starts(with: Data("%PDF".utf8)))
+        let document = PixelDocument()
+        let outcome = try #require(document.importAsset(data: pdf, fileExtension: "pdf",
+                                                        suggestedName: "Test", undoManager: nil))
+        #expect(document.model.layer(id: outcome.layerID)?.kind.isImage == true)
+        #expect(outcome.warning?.contains("rasterized page 1") == true)
+    }
+
+    @Test func layeredPSDImportsNamesOpacityBlendAndPixels() throws {
+        let psd = layeredPSD()
+        let decoded = try PSDImporter.decode(psd)
+        #expect(decoded.size == CGSize(width: 2, height: 1))
+        #expect(decoded.layers.count == 1)
+        #expect(decoded.layers[0].name == "Test")
+        #expect(abs(decoded.layers[0].opacity - Double(128) / 255) < 0.0001)
+        #expect(decoded.layers[0].blendMode == .normal)
+
+        let document = PixelDocument()
+        let outcome = try #require(document.importAsset(data: psd, fileExtension: "psd",
+                                                        suggestedName: "Layers", undoManager: nil))
+        let group = try #require(document.model.layer(id: outcome.layerID)?.groupConfig)
+        #expect(group.children.count == 1)
+        #expect(group.children[0].name == "Test")
+        #expect(outcome.warning?.contains("Imported 1 PSD layers") == true)
+    }
+
+    @Test func featureDetectedWebPAndUpscaleEncodeAtExpectedSize() throws {
+        let image = try testImage()
+        let upscaled = try #require(ImageUpscaler.upscale2x(image))
+        #expect(upscaled.width == image.width * 2)
+        #expect(upscaled.height == image.height * 2)
+        if ImageEncoder.Format.webp.isAvailable {
+            #expect(ImageEncoder.encode(image, format: .webp) != nil)
+        }
+    }
+
+    @Test func contentAwareFillReplacesMaskedPixelsDeterministically() throws {
+        let image = try testImage()
+        let maskContext = try #require(CGContext(data: nil, width: image.width, height: image.height,
+                                                 bitsPerComponent: 8, bytesPerRow: 0,
+                                                 space: CGColorSpaceCreateDeviceGray(),
+                                                 bitmapInfo: CGImageAlphaInfo.none.rawValue))
+        maskContext.setFillColor(CGColor(gray: 0, alpha: 1))
+        maskContext.fill(CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        maskContext.setFillColor(CGColor(gray: 1, alpha: 1))
+        maskContext.fillEllipse(in: CGRect(x: 12, y: 12, width: 40, height: 40))
+        let mask = try #require(maskContext.makeImage())
+        let a = try #require(ContentAwareInpainting.fill(image, mask: mask))
+        let b = try #require(ContentAwareInpainting.fill(image, mask: mask))
+        #expect(PNGExporter.pngData(a) == PNGExporter.pngData(b))
+        #expect(PNGExporter.pngData(a) != PNGExporter.pngData(image))
+    }
+
+    @Test func representativeLargeDocumentRenderBenchmark() throws {
+        let canvas = CGSize(width: 2000, height: 1400)
+        let context = GeneratorContext(size: canvas, palette: BuiltInPalettes.default, sampler: nil)
+        var params = ParamValues(defaults: GeneratorType.gridLattice.generator.specs)
+        params.set("columns", 60)
+        params.set("rows", 42)
+        let primitives = GeneratorType.gridLattice.generator.generate(params: params, seed: 44,
+                                                                        context: context)
+        let item = RenderItem(id: UUID(), opacity: 1, blendMode: .normal,
+                              transform: .identity, naturalSize: canvas,
+                              content: .primitives(primitives))
+        let clock = ContinuousClock()
+        let start = clock.now
+        let image = PNGExporter.render(items: [item], background: .black,
+                                       canvasSize: canvas, targetPixelSize: canvas)
+        let elapsed = start.duration(to: clock.now)
+        #expect(image?.width == 2000)
+        #expect(elapsed < .seconds(8), "2K representative render took \(elapsed)")
+    }
+}
+
+@MainActor
+struct AnimationTests {
+    @Test func keyframesRoundTripAndInterpolateDeterministically() throws {
+        var model = ProjectModel.starter()
+        let layerID = try #require(model.layers.first?.id)
+        model.animation = AnimationSettings(duration: 2, framesPerSecond: 12, keyframes: [
+            AnimationKeyframe(time: 0, layerID: layerID, seed: 10,
+                              parameters: ["curl": 0, "step": 4]),
+            AnimationKeyframe(time: 2, layerID: layerID, seed: 20,
+                              parameters: ["curl": 2, "step": 12]),
+        ])
+        let middleA = model.model(at: 1)
+        let middleB = model.model(at: 1)
+        #expect(middleA == middleB)
+        #expect(middleA.layer(id: layerID)?.patternConfig?.seed == 20)
+        #expect(middleA.layer(id: layerID)?.patternConfig?.params.double("curl") == 1)
+        #expect(middleA.layer(id: layerID)?.patternConfig?.params.double("step") == 8)
+        let decoded = try JSONDecoder().decode(ProjectModel.self, from: JSONEncoder().encode(model))
+        #expect(decoded.animation == model.animation)
+        #expect(decoded.schemaVersion == ProjectModel.currentSchemaVersion)
+    }
+
+    @Test func directKeyframeEditingDoesNotMutateBaseLayer() throws {
+        let document = PixelDocument()
+        let layerID = try #require(document.model.layers.first?.id)
+        let base = try #require(document.model.layer(id: layerID)?.patternConfig)
+        document.captureAnimationKeyframe(layerID: layerID, time: 0, undoManager: nil)
+        let id = try #require(document.model.animation.keyframes.first?.id)
+        document.updateAnimationKeyframe(id, seed: 999, parameter: "curl", value: 1.5,
+                                         undoManager: nil, actionName: "Test Keyframe Edit")
+        let frame = try #require(document.model.animation.keyframes.first)
+        #expect(frame.seed == 999)
+        #expect(frame.parameters["curl"] == 1.5)
+        #expect(document.model.layer(id: layerID)?.patternConfig == base)
+    }
+
+    @Test func insertionAtPlayheadCapturesEvaluatedAnimationState() throws {
+        let document = PixelDocument()
+        let layerID = try #require(document.model.layers.first?.id)
+        document.update(nil, actionName: "Test Setup") { model in
+            model.animation = AnimationSettings(duration: 2, framesPerSecond: 12, keyframes: [
+                AnimationKeyframe(time: 0, layerID: layerID, seed: 10,
+                                  parameters: ["curl": 0, "steps": 4]),
+                AnimationKeyframe(time: 2, layerID: layerID, seed: 20,
+                                  parameters: ["curl": 2, "steps": 12]),
+            ])
+        }
+        document.captureAnimationKeyframe(layerID: layerID, time: 1, undoManager: nil)
+        let middle = try #require(document.model.animation.keyframes.first { abs($0.time - 1) < 0.0001 })
+        #expect(middle.seed == 20)
+        #expect(middle.parameters["curl"] == 1)
+        #expect(middle.parameters["steps"] == 8)
+    }
+
+    @Test func gifExporterWritesEveryDeterministicFrame() async throws {
+        var model = ProjectModel.starter()
+        let layerID = try #require(model.layers.first?.id)
+        model.canvasSize = CGSize(width: 64, height: 64)
+        model.animation = AnimationSettings(duration: 0.5, framesPerSecond: 4, keyframes: [
+            AnimationKeyframe(time: 0, layerID: layerID, seed: 1, parameters: [:]),
+            AnimationKeyframe(time: 0.5, layerID: layerID, seed: 2, parameters: [:]),
+        ])
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("animation-test-\(UUID().uuidString).gif")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try await AnimationExporter.export(format: .gif, to: url, model: model,
+                                           size: model.canvasSize, render: { frame, size in
+            let layer = frame.layers[0]
+            let config = layer.patternConfig!
+            let primitives = config.generator.generator.generate(
+                params: config.params, seed: config.seed,
+                context: GeneratorContext(size: frame.canvasSize, palette: frame.palette,
+                                          sampler: nil))
+            let item = RenderItem(id: layer.id, opacity: 1, blendMode: .normal,
+                                  transform: .identity, naturalSize: frame.canvasSize,
+                                  content: .primitives(primitives))
+            return PNGExporter.render(items: [item], background: frame.background,
+                                      canvasSize: frame.canvasSize, targetPixelSize: size)
+        }, progress: { _ in })
+        let source = try #require(CGImageSourceCreateWithURL(url as CFURL, nil))
+        #expect(CGImageSourceGetCount(source) == model.animation.frameCount)
     }
 }

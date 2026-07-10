@@ -29,7 +29,35 @@ enum CanvasRenderer {
                     maskContext.draw(Image(decorative: mask.alpha, scale: 1), in: naturalRect)
                 }
             }
+            for style in item.styles where style.isEnabled {
+                drawStyle(style, content: item.content, naturalRect: naturalRect, in: inner)
+            }
             draw(item.content, naturalRect: naturalRect, in: inner)
+        }
+    }
+
+    private static func drawStyle(_ style: LayerStyle, content: RenderItem.Content,
+                                  naturalRect: CGRect, in context: GraphicsContext) {
+        let color = style.color.withAlpha(style.color.a * style.opacity).color
+        switch style.type {
+        case .dropShadow:
+            var styled = context
+            styled.addFilter(.shadow(color: color, radius: style.size,
+                                     x: style.offsetX, y: style.offsetY))
+            draw(content, naturalRect: naturalRect, in: styled)
+        case .outerGlow:
+            var styled = context
+            styled.addFilter(.shadow(color: color, radius: style.size, x: 0, y: 0))
+            draw(content, naturalRect: naturalRect, in: styled)
+        case .stroke:
+            for index in 0..<8 {
+                let angle = Double(index) * .pi / 4
+                var styled = context
+                styled.addFilter(.shadow(color: color, radius: 0,
+                                         x: cos(angle) * style.size,
+                                         y: sin(angle) * style.size))
+                draw(content, naturalRect: naturalRect, in: styled)
+            }
         }
     }
 

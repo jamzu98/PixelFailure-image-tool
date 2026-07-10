@@ -56,6 +56,26 @@ nonisolated extension Layer {
         if case .group(let config) = kind { config } else { nil }
     }
 
+    var adjustmentConfig: AdjustmentConfig? {
+        if case .adjustment(let config) = kind { config } else { nil }
+    }
+
+    mutating func modifyAdjustment(_ change: (inout AdjustmentConfig) -> Void) {
+        guard case .adjustment(var config) = kind else { return }
+        change(&config)
+        kind = .adjustment(config)
+    }
+
+    var pathConfig: PathConfig? {
+        if case .path(let config) = kind { config } else { nil }
+    }
+
+    mutating func modifyPath(_ change: (inout PathConfig) -> Void) {
+        guard case .path(var config) = kind else { return }
+        change(&config)
+        kind = .path(config)
+    }
+
     mutating func modifyGroup(_ change: (inout GroupConfig) -> Void) {
         guard case .group(var config) = kind else { return }
         change(&config)
@@ -67,6 +87,21 @@ nonisolated extension Layer {
     func withFreshIDs() -> Layer {
         var copy = self
         copy.id = UUID()
+        copy.styles = copy.styles.map {
+            var style = $0; style.id = UUID(); return style
+        }
+        if case .path(var path) = copy.kind {
+            path.nodes = path.nodes.map { node in
+                var fresh = node; fresh.id = UUID(); return fresh
+            }
+            copy.kind = .path(path)
+        }
+        if case .text(var text) = copy.kind, let runs = text.styleRuns {
+            text.styleRuns = runs.map { run in
+                var fresh = run; fresh.id = UUID(); return fresh
+            }
+            copy.kind = .text(text)
+        }
         if case .group(var group) = copy.kind {
             group.children = group.children.map { $0.withFreshIDs() }
             copy.kind = .group(group)
@@ -79,7 +114,7 @@ nonisolated extension Layer {
     var referencedImageKeys: [String] {
         var keys: [String] = []
         if let config = imageConfig { keys.append(config.imageKey) }
-        if let mask { keys.append(mask.imageKey) }
+        if let mask, !mask.imageKey.isEmpty { keys.append(mask.imageKey) }
         if case .group(let group) = kind {
             keys += group.children.flatMap(\.referencedImageKeys)
         }

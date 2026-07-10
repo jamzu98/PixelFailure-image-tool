@@ -1,10 +1,16 @@
 import AppKit
 import Foundation
 import ImageIO
+import SwiftUI
 import UniformTypeIdentifiers
 
 /// Higher-level, undoable document operations used by the UI.
 extension PixelDocument {
+    nonisolated struct AssetImportOutcome: Sendable {
+        var layerID: UUID
+        var warning: String?
+    }
+
     @MainActor
     @discardableResult
     func addPatternLayer(_ type: GeneratorType, undoManager: UndoManager?) -> UUID {
@@ -34,7 +40,157 @@ extension PixelDocument {
         return layer.id
     }
 
+    @MainActor
+    @discardableResult
+    func addAdjustmentLayer(undoManager: UndoManager?) -> UUID {
+        let layer = Layer(name: "Adjustment",
+                          transform: LayerTransform(position: model.canvasCenter),
+                          kind: .adjustment(AdjustmentConfig()))
+        update(undoManager, actionName: "Add Adjustment Layer") { $0.layers.append(layer) }
+        return layer.id
+    }
+
+    @MainActor
+    @discardableResult
+    func addPathLayer(firstPoint: CGPoint? = nil, undoManager: UndoManager?) -> UUID {
+        let nodes = firstPoint.map { [BezierNode(anchor: $0)] } ?? []
+        let config = PathConfig(size: model.canvasSize, nodes: nodes)
+        let layer = Layer(name: "Path", transform: LayerTransform(position: model.canvasCenter),
+                          kind: .path(config))
+        update(undoManager, actionName: "Add Path") { $0.layers.append(layer) }
+        return layer.id
+    }
+
+    @MainActor
+    func addPathNode(to layerID: UUID, canvasPoint: CGPoint, undoManager: UndoManager?) {
+        guard let layer = model.layer(id: layerID), layer.kind.isPath,
+              !model.isEffectivelyLocked(layerID) else { return }
+        let affine = layer.transform.affine(naturalSize: layer.pathConfig?.size ?? model.canvasSize)
+            .concatenating(model.parentAffine(of: layerID))
+        guard affine.isInvertible else { return }
+        let local = canvasPoint.applying(affine.inverted())
+        update(undoManager, actionName: "Add Path Node") { model in
+            model.modifyLayer(id: layerID) { layer in
+                layer.modifyPath {
+                    $0.commands = nil
+                    $0.nodes.append(BezierNode(anchor: local))
+                }
+            }
+        }
+    }
+
+    enum BooleanPathOperation: String, CaseIterable {
+        case union, subtract, intersect
+        var displayName: String { rawValue.capitalized }
+    }
+
+    @MainActor
+    @discardableResult
+    func booleanPath(ids: Set<UUID>, operation: BooleanPathOperation,
+                     undoManager: UndoManager?) -> UUID? {
+        let sources = model.allLayers.filter { ids.contains($0.id) && ($0.kind.isPath || $0.kind.isShape) }
+        guard sources.count >= 2 else { return nil }
+        let paths: [CGPath] = sources.compactMap { layer in
+            let local: Path
+            let size: CGSize
+            if let config = layer.pathConfig { local = PathGeometry.path(for: config); size = config.size }
+            else if let config = layer.shapeConfig { local = ShapeGeometry.path(for: config); size = config.size }
+            else { return nil }
+            var transform = layer.transform.affine(naturalSize: size)
+                .concatenating(model.parentAffine(of: layer.id))
+            return local.cgPath.copy(using: &transform)
+        }
+        guard var result = paths.first else { return nil }
+        for path in paths.dropFirst() {
+            switch operation {
+            case .union: result = result.union(path, using: .evenOdd)
+            case .subtract: result = result.subtracting(path, using: .evenOdd)
+            case .intersect: result = result.intersection(path, using: .evenOdd)
+            }
+        }
+        let layer = Layer(name: operation.displayName,
+                          transform: LayerTransform(position: model.canvasCenter),
+                          kind: .path(PathConfig(size: model.canvasSize,
+                                                commands: PathGeometry.commands(from: result),
+                                                isClosed: true,
+                                                fill: model.palette.color(1), stroke: nil)))
+        update(undoManager, actionName: "Boolean \(operation.displayName)") { model in
+            _ = model.removeLayers(ids: ids)
+            model.layers.append(layer)
+        }
+        return layer.id
+    }
+
     /// Stores the image data in the bundle and adds a layer scaled to fit the canvas.
+    @MainActor
+    func importAsset(data: Data, fileExtension: String, suggestedName: String,
+                     undoManager: UndoManager?) -> AssetImportOutcome? {
+        let ext = fileExtension.lowercased()
+        if ext == "pdf" {
+            guard let image = Self.rasterizeFirstPDFPage(data),
+                  let png = PNGExporter.pngData(image),
+                  let id = addImageLayer(data: png, suggestedName: suggestedName + " — Page 1",
+                                         undoManager: undoManager) else { return nil }
+            return AssetImportOutcome(layerID: id,
+                                      warning: "PDF import rasterized page 1. Additional pages and editable PDF objects are not imported.")
+        }
+        if ext == "psd", let decoded = try? PSDImporter.decode(data) {
+            let offset = CGPoint(x: (model.canvasSize.width - decoded.size.width) / 2,
+                                 y: (model.canvasSize.height - decoded.size.height) / 2)
+            let children: [Layer] = decoded.layers.reversed().compactMap { imported in
+                guard let png = PNGExporter.pngData(imported.image) else { return nil }
+                let key = storeImage(data: png, fileExtension: "png")
+                return Layer(name: imported.name, opacity: imported.opacity,
+                             blendMode: imported.blendMode,
+                             transform: LayerTransform(position: CGPoint(
+                                x: imported.rect.midX + offset.x,
+                                y: imported.rect.midY + offset.y)),
+                             kind: .image(ImageConfig(imageKey: key,
+                                                      pixelSize: imported.rect.size)))
+            }
+            guard !children.isEmpty else { return nil }
+            let group = Layer(name: suggestedName,
+                              transform: LayerTransform(position: model.canvasCenter),
+                              kind: .group(GroupConfig(children: children)))
+            update(undoManager, actionName: "Import Layered PSD") { $0.layers.append(group) }
+            return AssetImportOutcome(
+                layerID: group.id,
+                warning: "Imported \(children.count) PSD layers with names, positions, opacity, and supported blend modes. Text, smart objects, layer effects, and unsupported PSD metadata are rasterized per layer.")
+        }
+        let importedName = ext == "psd" ? suggestedName + " — Flattened PSD" : suggestedName
+        guard let id = addImageLayer(data: data, suggestedName: importedName,
+                                     undoManager: undoManager) else { return nil }
+        if ext == "psd" {
+            return AssetImportOutcome(layerID: id,
+                                      warning: "This PSD uses an unsupported layered construct and was imported through ImageIO as a flattened composite. The layer name records the degradation.")
+        }
+        if ["dng", "cr2", "cr3", "nef", "arw", "orf", "rw2", "raf"].contains(ext) {
+            return AssetImportOutcome(layerID: id,
+                                      warning: "RAW data was decoded using the system ImageIO pipeline and stored as an editable image layer.")
+        }
+        return AssetImportOutcome(layerID: id, warning: nil)
+    }
+
+    nonisolated private static func rasterizeFirstPDFPage(_ data: Data) -> CGImage? {
+        guard let provider = CGDataProvider(data: data as CFData),
+              let pdf = CGPDFDocument(provider), let page = pdf.page(at: 1) else { return nil }
+        let box = page.getBoxRect(.mediaBox)
+        let scale = min(2, 8192 / max(box.width, box.height))
+        let width = max(1, Int((box.width * scale).rounded()))
+        let height = max(1, Int((box.height * scale).rounded()))
+        guard let context = CGContext(data: nil, width: width, height: height,
+                                      bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        context.setFillColor(CGColor(gray: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.scaleBy(x: scale, y: scale)
+        context.translateBy(x: 0, y: box.height)
+        context.scaleBy(x: 1, y: -1)
+        context.drawPDFPage(page)
+        return context.makeImage()
+    }
+
     @MainActor
     @discardableResult
     func addImageLayer(data: Data, suggestedName: String, undoManager: UndoManager?) -> UUID? {
@@ -87,7 +243,7 @@ extension PixelDocument {
     @MainActor
     func deleteLayer(id: UUID, undoManager: UndoManager?) {
         update(undoManager, actionName: "Delete Layer") { model in
-            model.layers.removeAll { $0.id == id }
+            _ = model.removeLayers(ids: [id])
         }
     }
 
@@ -159,7 +315,8 @@ extension PixelDocument {
     /// Reveal-all = white, hide-all = black.
     @MainActor
     func addMask(to layerID: UUID, hideAll: Bool, renderStore: RenderStore, undoManager: UndoManager?) {
-        guard let layer = model.layer(id: layerID), layer.mask == nil else { return }
+        guard let layer = model.layer(id: layerID), layer.mask == nil,
+              !model.isEffectivelyLocked(layerID) else { return }
         let naturalSize = renderStore.naturalSize(for: layer, model: model)
         guard naturalSize.width > 0, naturalSize.height > 0 else { return }
 
@@ -185,6 +342,7 @@ extension PixelDocument {
 
     @MainActor
     func deleteMask(from layerID: UUID, undoManager: UndoManager?) {
+        guard !model.isEffectivelyLocked(layerID) else { return }
         update(undoManager, actionName: "Delete Mask") { model in
             model.modifyLayer(id: layerID) { $0.mask = nil }
         }
@@ -256,17 +414,47 @@ extension PixelDocument {
     @MainActor
     @discardableResult
     func groupLayers(ids: Set<UUID>, undoManager: UndoManager?) -> UUID? {
-        guard !ids.isEmpty else { return nil }
+        let topmostIDs = ids.filter { id in
+            !model.ancestorGroupIDs(of: id).contains(where: ids.contains)
+        }
+        guard !topmostIDs.isEmpty,
+              topmostIDs.allSatisfy({ !model.isEffectivelyLocked($0) }) else { return nil }
+
+        let directParents = Set(topmostIDs.map { model.parentGroupID(of: $0) })
+        let sameContainer = directParents.count == 1
+        let sharedParent: UUID? = sameContainer ? directParents.first! : nil
+        let originalContainer = sameContainer
+            ? (model.containerLayers(parentGroupID: sharedParent) ?? []) : []
+        let selectedIndices = originalContainer.indices.filter { topmostIDs.contains(originalContainer[$0].id) }
+        let insertionIndex: Int
+        if let top = selectedIndices.max() {
+            insertionIndex = top + 1 - selectedIndices.filter { $0 <= top }.count
+        } else {
+            insertionIndex = model.layers.count
+        }
+
+        let worldTransforms = Dictionary(uniqueKeysWithValues: topmostIDs.compactMap { id in
+            model.worldTransform(of: id).map { (id, $0) }
+        })
         var newModel = model
-        let insertionIndex = newModel.layers.lastIndex { ids.contains($0.id) }
-        let removed = newModel.removeLayers(ids: ids)
+        var removed = newModel.removeLayers(ids: Set(topmostIDs))
         guard !removed.isEmpty else { return nil }
+
+        // Cross-container grouping moves the selected roots to a new root
+        // group, so rebase each child into canvas space first.
+        let destinationParent = sameContainer ? sharedParent : nil
+        if !sameContainer {
+            for i in removed.indices {
+                if let world = worldTransforms[removed[i].id] { removed[i].transform = world }
+            }
+        }
 
         let group = Layer(name: "Group",
                           transform: LayerTransform(position: newModel.canvasCenter),
                           kind: .group(GroupConfig(children: removed)))
-        let index = min(insertionIndex ?? newModel.layers.count, newModel.layers.count)
-        newModel.layers.insert(group, at: index)
+        let targetIndex = destinationParent == nil && !sameContainer
+            ? newModel.layers.count : insertionIndex
+        guard newModel.insertLayer(group, into: destinationParent, at: targetIndex) else { return nil }
 
         update(undoManager, actionName: "Group Layers") { model in
             model = newModel
@@ -303,6 +491,40 @@ extension PixelDocument {
         update(undoManager, actionName: "Delete Layers") { model in
             _ = model.removeLayers(ids: ids)
         }
+    }
+
+    /// Moves a layer to a root/group container while preserving its canvas
+    /// appearance. `index` is the final bottom-to-top destination index.
+    @MainActor
+    @discardableResult
+    func moveLayer(id: UUID, to parentGroupID: UUID?, at index: Int,
+                   undoManager: UndoManager?) -> Bool {
+        guard let original = model.layer(id: id),
+              !model.isEffectivelyLocked(id),
+              parentGroupID != id else { return false }
+        if let parentGroupID {
+            guard model.layer(id: parentGroupID)?.kind.isGroup == true,
+                  !model.isEffectivelyLocked(parentGroupID),
+                  !model.ancestorGroupIDs(of: parentGroupID).contains(id) else { return false }
+        }
+        guard let world = model.worldTransform(of: id) else { return false }
+
+        var next = model
+        guard var moved = next.removeLayers(ids: [id]).first else { return false }
+        let destinationAffine: CGAffineTransform
+        if let parentGroupID,
+           let parentWorld = next.worldTransform(of: parentGroupID) {
+            destinationAffine = parentWorld.affine(naturalSize: next.canvasSize)
+        } else {
+            destinationAffine = .identity
+        }
+        guard let rebased = LayerTransform.rebased(world: world,
+                                                   destinationParent: destinationAffine) else { return false }
+        moved.transform = rebased
+        guard next.insertLayer(moved, into: parentGroupID, at: index) else { return false }
+        guard next != model else { return true }
+        update(undoManager, actionName: "Move Layer") { $0 = next }
+        return original.id == moved.id
     }
 
     /// Canvas-space bounding box of a layer (through any parent groups).
@@ -419,6 +641,7 @@ extension PixelDocument {
 
     @MainActor
     func flipLayer(id: UUID, horizontally: Bool, undoManager: UndoManager?) {
+        guard !model.isEffectivelyLocked(id) else { return }
         update(undoManager, actionName: horizontally ? "Flip Horizontal" : "Flip Vertical") { model in
             model.modifyLayer(id: id) { layer in
                 if horizontally {
@@ -510,6 +733,7 @@ extension PixelDocument {
     /// toward the front, -1 = one step toward the back, .max/.min = ends.
     @MainActor
     func reorderLayer(id: UUID, offset: Int, undoManager: UndoManager?) {
+        guard !model.isEffectivelyLocked(id) else { return }
         update(undoManager, actionName: "Reorder Layer") { model in
             model.modifyContainer(of: id) { container in
                 guard let index = container.firstIndex(where: { $0.id == id }) else { return }
@@ -528,7 +752,8 @@ extension PixelDocument {
         update(undoManager, actionName: randomizeParams ? "Randomize" : "Reroll Seed") { model in
             model.modifyLayer(id: layerID) { layer in
                 layer.modifyPattern { config in
-                    config.seed = SeededRNG.randomSeed()
+                    let seed = SeededRNG.randomSeed()
+                    config.seed = seed
                     if randomizeParams {
                         config.params = ParamValues.randomized(specs: config.generator.generator.specs,
                                                                seed: config.seed,
@@ -536,6 +761,96 @@ extension PixelDocument {
                     }
                 }
             }
+        }
+    }
+
+    @MainActor
+    func applyPatternVariation(seed: UInt64, params: ParamValues,
+                               layerID: UUID, undoManager: UndoManager?) {
+        update(undoManager, actionName: "Choose Variation") { model in
+            model.modifyLayer(id: layerID) { layer in
+                layer.modifyPattern { config in
+                    config.seed = seed
+                    config.params = params
+                }
+            }
+        }
+    }
+
+    @MainActor
+    func applyAnimationVariation(seed: UInt64, params: ParamValues,
+                                 keyframeID: UUID, undoManager: UndoManager?) {
+        update(undoManager, actionName: "Choose Keyframe Variation") { model in
+            guard let index = model.animation.keyframes.firstIndex(where: { $0.id == keyframeID }) else { return }
+            model.animation.keyframes[index].seed = seed
+            model.animation.keyframes[index].parameters = params.storage
+        }
+    }
+
+    @MainActor
+    func setPatternMask(on layerID: UUID, generator: GeneratorType,
+                        renderStore: RenderStore, undoManager: UndoManager?) {
+        guard let layer = model.layer(id: layerID), !model.isEffectivelyLocked(layerID) else { return }
+        let natural = renderStore.naturalSize(for: layer, model: model)
+        let cap = 2048.0
+        let scale = min(1, cap / Double(max(natural.width, natural.height)))
+        let pixelSize = CGSize(width: max(8, (natural.width * scale).rounded()),
+                               height: max(8, (natural.height * scale).rounded()))
+        let config = PatternConfig(generator: generator,
+                                   params: ParamValues(defaults: generator.generator.specs))
+        update(undoManager, actionName: "Pattern Mask") { model in
+            model.modifyLayer(id: layerID) {
+                $0.mask = LayerMask(imageKey: "", pixelSize: pixelSize, pattern: config)
+            }
+        }
+    }
+
+    @MainActor
+    func rerollPatternMask(on layerID: UUID, undoManager: UndoManager?) {
+        guard !model.isEffectivelyLocked(layerID) else { return }
+        update(undoManager, actionName: "Reroll Pattern Mask") { model in
+            model.modifyLayer(id: layerID) { layer in
+                guard var pattern = layer.mask?.pattern else { return }
+                pattern.seed = SeededRNG.randomSeed()
+                layer.mask?.pattern = pattern
+            }
+        }
+    }
+
+    @MainActor
+    func captureAnimationKeyframe(layerID: UUID, time: Double,
+                                  undoManager: UndoManager?) {
+        let clampedTime = min(max(time, 0), model.animation.duration)
+        guard let config = model.model(at: clampedTime).layer(id: layerID)?.patternConfig else { return }
+        let keyframe = AnimationKeyframe(time: clampedTime,
+                                         layerID: layerID, seed: config.seed,
+                                         parameters: config.params.storage)
+        update(undoManager, actionName: "Add Keyframe") { model in
+            model.animation.keyframes.removeAll {
+                $0.layerID == layerID && abs($0.time - keyframe.time) < 0.0001
+            }
+            model.animation.keyframes.append(keyframe)
+            model.animation.keyframes.sort { $0.time < $1.time }
+        }
+    }
+
+    @MainActor
+    func updateAnimationKeyframe(_ id: UUID, seed: UInt64? = nil,
+                                 parameter key: String? = nil, value: Double? = nil,
+                                 parameters: ParamValues? = nil,
+                                 undoManager: UndoManager?, actionName: String) {
+        update(undoManager, actionName: actionName) { model in
+            guard let index = model.animation.keyframes.firstIndex(where: { $0.id == id }) else { return }
+            if let seed { model.animation.keyframes[index].seed = seed }
+            if let key, let value { model.animation.keyframes[index].parameters[key] = value }
+            if let parameters { model.animation.keyframes[index].parameters = parameters.storage }
+        }
+    }
+
+    @MainActor
+    func removeAnimationKeyframe(_ id: UUID, undoManager: UndoManager?) {
+        update(undoManager, actionName: "Delete Keyframe") {
+            $0.animation.keyframes.removeAll { $0.id == id }
         }
     }
 

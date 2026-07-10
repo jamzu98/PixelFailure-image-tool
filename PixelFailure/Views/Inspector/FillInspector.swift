@@ -21,7 +21,7 @@ struct FillInspector: View {
 
             if config.style == .linearGradient {
                 LabeledContent("Angle") {
-                    Slider(value: Binding(
+                    NumericSlider(value: Binding(
                         get: { config.angle },
                         set: { newValue in
                             document.updateDuringGesture { model in
@@ -30,7 +30,7 @@ struct FillInspector: View {
                                 }
                             }
                         }
-                    ), in: 0...360) { editing in
+                    ), range: 0...360, defaultValue: 90, fractionDigits: 0) { editing in
                         if editing { document.beginGesture() } else { document.endGesture(undoManager, actionName: "Gradient Angle") }
                     }
                 }

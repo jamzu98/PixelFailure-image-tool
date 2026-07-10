@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 @main
@@ -8,8 +9,28 @@ struct PixelFailureApp: App {
         }
         .commands {
             EditorCommands()
+            ViewCommands()
             LayerCommands()
             SelectCommands()
+        }
+    }
+}
+
+struct ViewCommands: Commands {
+    @FocusedValue(\.editorFocus) private var focus
+
+    var body: some Commands {
+        CommandGroup(after: .sidebar) {
+            Toggle("Show Navigator", isOn: Binding(
+                get: { focus?.document.model.workspace.showsNavigator ?? false },
+                set: { value in
+                    guard let focus else { return }
+                    focus.document.update(focus.undoManager, actionName: "Toggle Navigator") {
+                        $0.workspace.showsNavigator = value
+                    }
+                }
+            ))
+            .disabled(focus == nil)
         }
     }
 }
@@ -35,7 +56,8 @@ struct SelectCommands: Commands {
     private var selectedImageLayer: Layer? {
         guard let focus,
               let layer = focus.document.model.layer(id: focus.editorState.selectedLayerID),
-              layer.kind.isImage, !layer.isLocked else { return nil }
+              layer.kind.isImage,
+              !focus.document.model.isEffectivelyLocked(layer.id) else { return nil }
         return layer
     }
 
@@ -45,6 +67,7 @@ struct SelectCommands: Commands {
                 guard let focus else { return }
                 focus.editorState.selection = .all(canvasSize: focus.document.model.canvasSize)
             }
+            .keyboardShortcut("a", modifiers: .command)
             .disabled(focus == nil)
 
             Button("Deselect") {
@@ -58,6 +81,13 @@ struct SelectCommands: Commands {
             }
             .keyboardShortcut("i", modifiers: [.command, .shift])
             .disabled(!hasSelection)
+
+            Divider()
+
+            Button("Select Subject") { selectForeground(inverted: false) }
+                .disabled(focus == nil)
+            Button("Select Background") { selectForeground(inverted: true) }
+                .disabled(focus == nil)
 
             Divider()
 
@@ -133,6 +163,33 @@ struct SelectCommands: Commands {
                                             undoManager: focus.undoManager)
             }
             .disabled(!hasSelection || selectedImageLayer == nil)
+
+            Button("Content-Aware Fill") {
+                guard let focus, let selection = focus.editorState.selection,
+                      let layer = selectedImageLayer else { return }
+                focus.document.contentAwareFill(selection: selection, layerID: layer.id,
+                                                renderStore: focus.renderStore,
+                                                undoManager: focus.undoManager)
+            }
+            .disabled(!hasSelection || selectedImageLayer == nil)
+        }
+    }
+
+    private func selectForeground(inverted: Bool) {
+        guard let focus,
+              let image = PNGExporter.render(
+                items: focus.renderStore.renderItems(model: focus.document.model, quality: .preview),
+                background: focus.document.model.background,
+                canvasSize: focus.document.model.canvasSize,
+                targetPixelSize: focus.document.model.canvasSize) else { return }
+        do {
+            let foreground = try SmartSelection.foreground(in: image,
+                                                            canvasSize: focus.document.model.canvasSize)
+            focus.editorState.selection = inverted
+                ? foreground.inverted(canvasSize: focus.document.model.canvasSize)
+                : foreground
+        } catch {
+            NSSound.beep()
         }
     }
 }
@@ -171,6 +228,12 @@ struct LayerCommands: Commands {
                     }
                     Button("Paint Layer") {
                         focus.editorState.selectedLayerID = focus.document.addPaintLayer(undoManager: focus.undoManager)
+                    }
+                    Button("Adjustment Layer") {
+                        focus.editorState.selectedLayerID = focus.document.addAdjustmentLayer(undoManager: focus.undoManager)
+                    }
+                    Button("Path") {
+                        focus.editorState.selectedLayerID = focus.document.addPathLayer(undoManager: focus.undoManager)
                     }
                 }
             }
@@ -238,6 +301,15 @@ struct LayerCommands: Commands {
                 focus.document.rasterizeLayer(id: id, renderStore: focus.renderStore, undoManager: focus.undoManager)
             }
             .disabled(focus?.editorState.selectedLayerID == nil)
+
+            Button("Super Resolution 2×") {
+                guard let focus, let id = focus.editorState.selectedLayerID else { return }
+                focus.document.superResolveLayer(layerID: id, renderStore: focus.renderStore,
+                                                 undoManager: focus.undoManager)
+            }
+            .disabled(focus?.editorState.selectedLayerID.flatMap {
+                focus?.document.model.layer(id: $0)?.kind.isImage
+            } != true)
 
             Button("Flip Horizontal") {
                 guard let focus, let id = focus.editorState.selectedLayerID else { return }

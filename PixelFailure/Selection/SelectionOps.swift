@@ -80,7 +80,7 @@ extension PixelDocument {
     private func applyToLayerBuffer(selection: CanvasSelection, layerID: UUID,
                                     renderStore: RenderStore, undoManager: UndoManager?,
                                     actionName: String, blendMode: CGBlendMode, color: RGBAColor) {
-        guard let layer = model.layer(id: layerID), !layer.isLocked,
+        guard let layer = model.layer(id: layerID), !model.isEffectivelyLocked(layerID),
               let config = layer.imageConfig,
               let base = renderStore.originalImage(key: config.imageKey) else { return }
         let naturalSize = renderStore.naturalSize(for: layer, model: model)
@@ -113,12 +113,97 @@ extension PixelDocument {
         }
     }
 
+    @MainActor
+    func contentAwareFill(selection: CanvasSelection, layerID: UUID,
+                          renderStore: RenderStore, undoManager: UndoManager?) {
+        guard let layer = model.layer(id: layerID), !model.isEffectivelyLocked(layerID),
+              let config = layer.imageConfig,
+              let base = renderStore.originalImage(key: config.imageKey),
+              let transform = SelectionRasterizer.canvasToContentBuffer(
+                layer: layer, naturalSize: renderStore.naturalSize(for: layer, model: model),
+                config: config, parentAffine: model.parentAffine(of: layerID)),
+              let mask = SelectionRasterizer.grayMask(selection: selection, transform: transform,
+                                                       pixelSize: config.pixelSize),
+              let result = ContentAwareInpainting.fill(base, mask: mask),
+              let data = PNGExporter.pngData(result) else { return }
+        let key = storeImage(data: data, fileExtension: "png")
+        update(undoManager, actionName: "Content-Aware Fill") { model in
+            model.modifyLayer(id: layerID) { $0.modifyImage { $0.imageKey = key } }
+        }
+    }
+
+    @MainActor
+    func superResolveLayer(layerID: UUID, renderStore: RenderStore,
+                           undoManager: UndoManager?) {
+        guard let layer = model.layer(id: layerID), !model.isEffectivelyLocked(layerID),
+              let config = layer.imageConfig,
+              let base = renderStore.originalImage(key: config.imageKey),
+              let result = ImageUpscaler.upscale2x(base),
+              let data = PNGExporter.pngData(result) else { return }
+        let key = storeImage(data: data, fileExtension: "png")
+        update(undoManager, actionName: "Super Resolution 2×") { model in
+            model.modifyLayer(id: layerID) { layer in
+                layer.modifyImage {
+                    $0.imageKey = key
+                    $0.pixelSize = CGSize(width: result.width, height: result.height)
+                }
+                layer.transform.scale *= 0.5
+            }
+        }
+    }
+
     /// Copies the selected region of an image layer into a new layer
     /// ("layer via copy"): what you see — crop and effects baked in.
     @MainActor
     @discardableResult
     func layerFromSelection(_ selection: CanvasSelection, layerID: UUID,
                             renderStore: RenderStore, undoManager: UndoManager?) -> UUID? {
+        guard var payload = selectionLayerPayload(selection, layerID: layerID,
+                                                  renderStore: renderStore) else { return nil }
+        let key = storeImage(data: payload.data, fileExtension: "png")
+        payload.layer.modifyImage { $0.imageKey = key }
+        let newLayer = payload.layer
+        update(undoManager, actionName: "Layer from Selection") { model in
+            model.layers.append(newLayer)
+        }
+        return newLayer.id
+    }
+
+    /// Clipboard representation of only the selected pixels. The generated
+    /// key is self-contained in the transfer and does not mutate this document.
+    @MainActor
+    func transferPayload(for selection: CanvasSelection, layerID: UUID,
+                         renderStore: RenderStore) -> LayerTransfer? {
+        guard let payload = selectionLayerPayload(selection, layerID: layerID,
+                                                  renderStore: renderStore),
+              let key = payload.layer.imageConfig?.imageKey else { return nil }
+        return LayerTransfer(layer: payload.layer,
+                             images: [key: payload.data],
+                             flattenedPNG: payload.data)
+    }
+
+    @MainActor
+    func copySelection(_ selection: CanvasSelection, layerID: UUID,
+                       renderStore: RenderStore) {
+        guard let transfer = transferPayload(for: selection, layerID: layerID,
+                                             renderStore: renderStore) else { return }
+        LayerPasteboard.write(transfer)
+    }
+
+    @MainActor
+    func cutSelection(_ selection: CanvasSelection, layerID: UUID,
+                      renderStore: RenderStore, undoManager: UndoManager?) {
+        guard !model.isEffectivelyLocked(layerID),
+              let transfer = transferPayload(for: selection, layerID: layerID,
+                                             renderStore: renderStore) else { return }
+        LayerPasteboard.write(transfer)
+        deletePixels(selection: selection, layerID: layerID,
+                     renderStore: renderStore, undoManager: undoManager)
+    }
+
+    @MainActor
+    private func selectionLayerPayload(_ selection: CanvasSelection, layerID: UUID,
+                                       renderStore: RenderStore) -> (layer: Layer, data: Data)? {
         guard let layer = model.layer(id: layerID),
               let config = layer.imageConfig,
               let resolved = renderStore.resolvedImage(for: layer, config: config,
@@ -165,20 +250,18 @@ extension PixelDocument {
         // Position the new layer so the copied pixels stay in place.
         let localCenter = CGPoint(x: (bufferRect.midX) / scale, y: (bufferRect.midY) / scale)
         let canvasCenter = localCenter.applying(affine)
-        let key = storeImage(data: data, fileExtension: "png")
+        let world = model.worldTransform(of: layerID) ?? layer.transform
+        let key = UUID().uuidString + ".png"
         let newLayer = Layer(name: layer.name + " Selection",
                              transform: LayerTransform(position: canvasCenter,
-                                                       scale: layer.transform.scale * naturalSize.width / bufferSize.width,
-                                                       rotationDegrees: layer.transform.rotationDegrees,
-                                                       flippedHorizontally: layer.transform.flippedHorizontally,
-                                                       flippedVertically: layer.transform.flippedVertically),
+                                                       scale: world.scale * naturalSize.width / bufferSize.width,
+                                                       rotationDegrees: world.rotationDegrees,
+                                                       flippedHorizontally: world.flippedHorizontally,
+                                                       flippedVertically: world.flippedVertically),
                              kind: .image(ImageConfig(imageKey: key,
                                                       pixelSize: CGSize(width: bufferRect.width,
                                                                         height: bufferRect.height))))
-        update(undoManager, actionName: "Layer from Selection") { model in
-            model.layers.append(newLayer)
-        }
-        return newLayer.id
+        return (newLayer, data)
     }
 
     /// Converts the selection into the layer's mask (replacing any existing
@@ -186,7 +269,7 @@ extension PixelDocument {
     @MainActor
     func maskFromSelection(_ selection: CanvasSelection, layerID: UUID,
                            renderStore: RenderStore, undoManager: UndoManager?) {
-        guard let layer = model.layer(id: layerID) else { return }
+        guard let layer = model.layer(id: layerID), !model.isEffectivelyLocked(layerID) else { return }
         let naturalSize = renderStore.naturalSize(for: layer, model: model)
         guard naturalSize.width > 0, naturalSize.height > 0 else { return }
 

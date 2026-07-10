@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -6,6 +7,8 @@ struct EditorView: View {
     @State private var editorState = EditorState()
     @State private var renderStore: RenderStore
     @Environment(\.undoManager) private var undoManager
+    @AppStorage("didCompleteOnboarding") private var didCompleteOnboarding = false
+    @State private var importNotice: String?
 
     init(document: PixelDocument) {
         self.document = document
@@ -25,7 +28,14 @@ struct EditorView: View {
                 HStack(spacing: 0) {
                     ToolStrip(document: document, editorState: editorState)
                     Divider()
-                    CanvasViewport(document: document, editorState: editorState, renderStore: renderStore)
+                    CanvasViewport(document: document, editorState: editorState, renderStore: renderStore,
+                                   animationTime: editorState.animationLayerID == nil
+                                       ? nil : editorState.animationPlayhead)
+                }
+                if let animationLayerID = editorState.animationLayerID {
+                    Divider()
+                    AnimationTimelineDock(document: document, editorState: editorState,
+                                          layerID: animationLayerID, renderStore: renderStore)
                 }
             }
             .frame(minWidth: 460, maxWidth: .infinity, maxHeight: .infinity)
@@ -44,10 +54,20 @@ struct EditorView: View {
                                     set: { editorState.showExportSheet = $0 })) {
             ExportSheet(document: document, renderStore: renderStore)
         }
+        .sheet(isPresented: Binding(get: { !didCompleteOnboarding },
+                                    set: { if !$0 { didCompleteOnboarding = true } })) {
+            OnboardingView { didCompleteOnboarding = true }
+        }
         .fileImporter(isPresented: Binding(get: { editorState.showImageImporter },
                                            set: { editorState.showImageImporter = $0 }),
-                      allowedContentTypes: [.image]) { result in
+                      allowedContentTypes: importTypes) { result in
             importImage(result)
+        }
+        .alert("Import notice", isPresented: Binding(get: { importNotice != nil },
+                                                      set: { if !$0 { importNotice = nil } })) {
+            Button("OK") { importNotice = nil }
+        } message: {
+            Text(importNotice ?? "")
         }
         .onDrop(of: [.fileURL, .image], isTargeted: nil) { providers in
             handleDrop(providers)
@@ -100,7 +120,17 @@ struct EditorView: View {
                 Label("Export", systemImage: "square.and.arrow.up")
             }
             .keyboardShortcut("e", modifiers: .command)
-            .help("Export PNG or SVG (⌘E)")
+            .help("Export artwork (⌘E)")
+
+            Menu {
+                Button("Share Rendered PNG…") { shareRenderedArtwork() }
+                Button("Print…") { printArtwork() }
+                    .keyboardShortcut("p", modifiers: .command)
+                Divider()
+                Button("Show Welcome") { didCompleteOnboarding = false }
+            } label: {
+                Label("Share", systemImage: "square.and.arrow.up.on.square")
+            }
         }
     }
 
@@ -129,14 +159,22 @@ struct EditorView: View {
 
     // MARK: - Image import
 
+    private var importTypes: [UTType] {
+        var types: [UTType] = [.image, .pdf]
+        if let psd = UTType(filenameExtension: "psd") { types.append(psd) }
+        return types
+    }
+
     private func importImage(_ result: Result<URL, Error>) {
         guard case .success(let url) = result else { return }
         let accessing = url.startAccessingSecurityScopedResource()
         defer { if accessing { url.stopAccessingSecurityScopedResource() } }
         guard let data = try? Data(contentsOf: url) else { return }
         let name = url.deletingPathExtension().lastPathComponent
-        if let id = document.addImageLayer(data: data, suggestedName: name, undoManager: undoManager) {
-            editorState.selectedLayerID = id
+        if let outcome = document.importAsset(data: data, fileExtension: url.pathExtension,
+                                              suggestedName: name, undoManager: undoManager) {
+            editorState.selectedLayerID = outcome.layerID
+            importNotice = outcome.warning
         }
     }
 
@@ -149,9 +187,12 @@ struct EditorView: View {
                     Task { @MainActor in
                         guard let imageData = try? Data(contentsOf: url) else { return }
                         let name = url.deletingPathExtension().lastPathComponent
-                        if let id = document.addImageLayer(data: imageData, suggestedName: name,
-                                                           undoManager: undoManager) {
-                            editorState.selectedLayerID = id
+                        if let outcome = document.importAsset(data: imageData,
+                                                              fileExtension: url.pathExtension,
+                                                              suggestedName: name,
+                                                              undoManager: undoManager) {
+                            editorState.selectedLayerID = outcome.layerID
+                            importNotice = outcome.warning
                         }
                     }
                 }
@@ -159,5 +200,80 @@ struct EditorView: View {
             }
         }
         return false
+    }
+
+    private func renderedArtwork() -> CGImage? {
+        var image = PNGExporter.render(items: renderStore.renderItems(model: document.model, quality: .full),
+                                       background: document.model.background,
+                                       canvasSize: document.model.canvasSize,
+                                       targetPixelSize: document.model.canvasSize)
+        if let current = image, !document.model.canvasEffects.isEmpty {
+            image = EffectPipeline.shared.apply(effects: document.model.canvasEffects,
+                                                to: current, palette: document.model.palette)
+        }
+        return image
+    }
+
+    private func shareRenderedArtwork() {
+        guard let image = renderedArtwork(), let data = PNGExporter.pngData(image),
+              let anchor = NSApp.keyWindow?.contentView else { return }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PixelFailure-\(UUID().uuidString).png")
+        do {
+            try data.write(to: url, options: .atomic)
+            NSSharingServicePicker(items: [url])
+                .show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
+        } catch {
+            importNotice = "Sharing failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func printArtwork() {
+        guard let image = renderedArtwork() else { return }
+        let view = NSImageView(frame: CGRect(origin: .zero, size: document.model.canvasSize))
+        view.image = NSImage(cgImage: image, size: document.model.canvasSize)
+        view.imageScaling = .scaleProportionallyUpOrDown
+        let operation = NSPrintOperation(view: view, printInfo: NSPrintInfo.shared)
+        operation.showsPrintPanel = true
+        operation.showsProgressPanel = true
+        operation.run()
+    }
+}
+
+private struct OnboardingView: View {
+    let complete: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Image(systemName: "circle.grid.cross")
+                .font(.system(size: 48, weight: .medium))
+                .foregroundStyle(.tint)
+            Text("Welcome to PixelFailure")
+                .font(.largeTitle.bold())
+            Text("Build deterministic generative artwork, combine it with images and editable vectors, then finish it with selections, masks, adjustments, and retouching.")
+                .foregroundStyle(.secondary)
+            Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 12) {
+                onboardingRow("sidebar.left", "Layers", "Drag layers into groups; Shift-click selects several.")
+                onboardingRow("cursorarrow.motionlines", "Canvas", "Use V to move, B to paint, and P for editable paths.")
+                onboardingRow("dice", "Generative", "⌘R rerolls a seed; the variations grid explores complete parameter combinations.")
+                onboardingRow("square.and.arrow.up", "Export", "⌘E exports PNG, JPEG, TIFF, HEIC, WebP, PDF, or SVG.")
+            }
+            HStack {
+                Spacer()
+                Button("Start Creating", action: complete)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(32)
+        .frame(width: 620)
+    }
+
+    @ViewBuilder
+    private func onboardingRow(_ icon: String, _ title: String, _ detail: String) -> some View {
+        GridRow {
+            Image(systemName: icon).frame(width: 28)
+            Text(title).fontWeight(.semibold)
+            Text(detail).foregroundStyle(.secondary)
+        }
     }
 }

@@ -69,3 +69,57 @@ nonisolated enum ShapeGeometry {
                 CGPoint(x: center.x + dir.x * CGFloat(half), y: center.y + dir.y * CGFloat(half)))
     }
 }
+
+nonisolated enum PathGeometry {
+    static func path(for config: PathConfig) -> Path {
+        var path = Path()
+        if let commands = config.commands {
+            for command in commands {
+                switch command {
+                case .move(let point): path.move(to: point)
+                case .line(let point): path.addLine(to: point)
+                case .quad(let control, let point): path.addQuadCurve(to: point, control: control)
+                case .cubic(let c1, let c2, let point): path.addCurve(to: point, control1: c1, control2: c2)
+                case .close: path.closeSubpath()
+                }
+            }
+            return path
+        }
+        guard let first = config.nodes.first else { return path }
+        path.move(to: first.anchor)
+        for index in 1..<config.nodes.count {
+            let previous = config.nodes[index - 1]
+            let current = config.nodes[index]
+            path.addCurve(to: current.anchor,
+                          control1: previous.outControl,
+                          control2: current.inControl)
+        }
+        if config.isClosed, let last = config.nodes.last {
+            path.addCurve(to: first.anchor, control1: last.outControl, control2: first.inControl)
+            path.closeSubpath()
+        }
+        return path
+    }
+
+    static func primitives(for config: PathConfig) -> [VectorPrimitive] {
+        [VectorPrimitive(path: path(for: config), fill: config.fill,
+                         stroke: config.stroke, lineWidth: config.strokeWidth,
+                         lineCap: .round, lineJoin: .round)]
+    }
+
+    static func commands(from path: CGPath) -> [PathCommand] {
+        var commands: [PathCommand] = []
+        path.applyWithBlock { pointer in
+            let element = pointer.pointee
+            switch element.type {
+            case .moveToPoint: commands.append(.move(element.points[0]))
+            case .addLineToPoint: commands.append(.line(element.points[0]))
+            case .addQuadCurveToPoint: commands.append(.quad(element.points[0], element.points[1]))
+            case .addCurveToPoint: commands.append(.cubic(element.points[0], element.points[1], element.points[2]))
+            case .closeSubpath: commands.append(.close)
+            @unknown default: break
+            }
+        }
+        return commands
+    }
+}

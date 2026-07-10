@@ -41,6 +41,9 @@ enum SVGExporter {
         idCounter += 1
         let index = idCounter
         var body = ""
+        if let warning = item.svgWarning {
+            body += "<!-- \(warning) -->\n"
+        }
 
         let t = item.transform
         let transform = "matrix(\(fmt(t.a)),\(fmt(t.b)),\(fmt(t.c)),\(fmt(t.d)),\(fmt(t.tx)),\(fmt(t.ty)))"
@@ -49,7 +52,8 @@ enum SVGExporter {
             style = " style=\"mix-blend-mode:\(item.blendMode.svgName)\""
         }
         let opacity = item.opacity < 0.999 ? " opacity=\"\(fmt(item.opacity))\"" : ""
-        body += "<g transform=\"\(transform)\"\(opacity)\(style)>\n"
+        let filter = styleFilter(item.styles, index: index, defs: &defs)
+        body += "<g transform=\"\(transform)\"\(opacity)\(style)\(filter)>\n"
 
         // Masks live on an untransformed inner group so their coordinates
         // are the layer's local space.
@@ -87,6 +91,40 @@ enum SVGExporter {
         }
         body += "</g>\n"
         return body
+    }
+
+    private static func styleFilter(_ styles: [LayerStyle], index: Int,
+                                    defs: inout String) -> String {
+        let active = styles.filter(\.isEnabled)
+        guard !active.isEmpty else { return "" }
+        let id = "style\(index)"
+        var filter = "<filter id=\"\(id)\" x=\"-50%\" y=\"-50%\" width=\"200%\" height=\"200%\">\n"
+        var results: [String] = []
+        for (styleIndex, layerStyle) in active.enumerated() {
+            let result = "styleResult\(styleIndex)"
+            let color = "rgb(\(Int(layerStyle.color.r * 255)),\(Int(layerStyle.color.g * 255)),\(Int(layerStyle.color.b * 255)))"
+            let alpha = layerStyle.color.a * layerStyle.opacity
+            switch layerStyle.type {
+            case .dropShadow:
+                filter += "<feDropShadow dx=\"\(fmt(layerStyle.offsetX))\" dy=\"\(fmt(layerStyle.offsetY))\" stdDeviation=\"\(fmt(layerStyle.size / 2))\" flood-color=\"\(color)\" flood-opacity=\"\(fmt(alpha))\" result=\"\(result)\"/>\n"
+            case .outerGlow:
+                let blur = "glowBlur\(styleIndex)", flood = "glowFlood\(styleIndex)"
+                filter += "<feGaussianBlur in=\"SourceAlpha\" stdDeviation=\"\(fmt(layerStyle.size / 2))\" result=\"\(blur)\"/>\n"
+                filter += "<feFlood flood-color=\"\(color)\" flood-opacity=\"\(fmt(alpha))\" result=\"\(flood)\"/>\n"
+                filter += "<feComposite in=\"\(flood)\" in2=\"\(blur)\" operator=\"in\" result=\"\(result)\"/>\n"
+            case .stroke:
+                let grown = "strokeAlpha\(styleIndex)", flood = "strokeFlood\(styleIndex)"
+                filter += "<feMorphology in=\"SourceAlpha\" operator=\"dilate\" radius=\"\(fmt(layerStyle.size))\" result=\"\(grown)\"/>\n"
+                filter += "<feFlood flood-color=\"\(color)\" flood-opacity=\"\(fmt(alpha))\" result=\"\(flood)\"/>\n"
+                filter += "<feComposite in=\"\(flood)\" in2=\"\(grown)\" operator=\"in\" result=\"\(result)\"/>\n"
+            }
+            results.append(result)
+        }
+        filter += "<feMerge>\n"
+        for result in results { filter += "<feMergeNode in=\"\(result)\"/>\n" }
+        filter += "<feMergeNode in=\"SourceGraphic\"/>\n</feMerge>\n</filter>\n"
+        defs += filter
+        return " filter=\"url(#\(id))\""
     }
 
     private static func fillElement(_ config: FillConfig, size: CGSize, index: Int, defs: inout String) -> String {

@@ -10,6 +10,7 @@ nonisolated enum ImageEncoder {
         case jpeg = "JPEG"
         case tiff = "TIFF"
         case heic = "HEIC"
+        case webp = "WebP"
 
         var utType: UTType {
             switch self {
@@ -17,6 +18,7 @@ nonisolated enum ImageEncoder {
             case .jpeg: .jpeg
             case .tiff: .tiff
             case .heic: .heic
+            case .webp: .webP
             }
         }
 
@@ -26,11 +28,22 @@ nonisolated enum ImageEncoder {
             case .jpeg: "jpg"
             case .tiff: "tiff"
             case .heic: "heic"
+            case .webp: "webp"
             }
         }
 
         var isLossy: Bool {
-            self == .jpeg || self == .heic
+            self == .jpeg || self == .heic || self == .webp
+        }
+
+        var isAvailable: Bool {
+            let destinations = CGImageDestinationCopyTypeIdentifiers() as! [String]
+            return destinations.contains(utType.identifier)
+        }
+
+        static var allCases: [Format] {
+            let standard: [Format] = [.png, .jpeg, .tiff, .heic]
+            return Format.webp.isAvailable ? standard + [.webp] : standard
         }
     }
 
@@ -62,5 +75,22 @@ nonisolated enum ImageEncoder {
         ctx.fill(rect)
         ctx.draw(image, in: rect)
         return ctx.makeImage()
+    }
+}
+
+/// A deliberately explicit PDF degradation path: the complete composited
+/// result is embedded as one page, preserving appearance when the document
+/// contains effects that PDF cannot represent as editable objects.
+nonisolated enum PDFExporter {
+    static func data(image: CGImage, pageSize: CGSize) -> Data? {
+        let result = NSMutableData()
+        guard let consumer = CGDataConsumer(data: result as CFMutableData) else { return nil }
+        var mediaBox = CGRect(origin: .zero, size: pageSize)
+        guard let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else { return nil }
+        context.beginPDFPage(nil)
+        context.draw(image, in: mediaBox)
+        context.endPDFPage()
+        context.closePDF()
+        return result as Data
     }
 }

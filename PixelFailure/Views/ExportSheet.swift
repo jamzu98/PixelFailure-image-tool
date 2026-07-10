@@ -25,7 +25,8 @@ struct ExportSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     private enum Format: String, CaseIterable {
-        case png = "PNG", jpeg = "JPEG", tiff = "TIFF", heic = "HEIC", svg = "SVG"
+        case png = "PNG", jpeg = "JPEG", tiff = "TIFF", heic = "HEIC", webp = "WebP"
+        case pdf = "PDF", svg = "SVG"
 
         var raster: ImageEncoder.Format? {
             switch self {
@@ -33,9 +34,15 @@ struct ExportSheet: View {
             case .jpeg: .jpeg
             case .tiff: .tiff
             case .heic: .heic
-            case .svg: nil
+            case .webp: .webp
+            case .pdf, .svg: nil
             }
         }
+
+        var isAvailable: Bool { raster?.isAvailable ?? true }
+
+        var utType: UTType { raster?.utType ?? (self == .pdf ? .pdf : .svg) }
+        var fileExtension: String { raster?.fileExtension ?? (self == .pdf ? "pdf" : "svg") }
     }
 
     @State private var format: Format = .png
@@ -54,6 +61,7 @@ struct ExportSheet: View {
             Picker("Format", selection: $format) {
                 ForEach(Format.allCases, id: \.self) { format in
                     Text(format.rawValue).tag(format)
+                        .disabled(!format.isAvailable)
                 }
             }
             .pickerStyle(.segmented)
@@ -78,7 +86,8 @@ struct ExportSheet: View {
                 if format.raster?.isLossy == true {
                     LabeledContent("Quality") {
                         HStack {
-                            Slider(value: $quality, in: 0.5...1)
+                            NumericSlider(value: $quality, range: 0.5...1,
+                                          defaultValue: 0.9)
                             Text("\(Int((quality * 100).rounded()))%")
                                 .font(.caption.monospacedDigit())
                                 .frame(width: 36, alignment: .trailing)
@@ -89,6 +98,11 @@ struct ExportSheet: View {
                     Text("JPEG has no transparency — the artwork is flattened onto the background color.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+                if format == .pdf {
+                    Text("PDF preserves the rendered appearance as a single composited page. Layers and raster-only effects are explicitly flattened.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 }
 
                 if targetSize() != document.model.canvasSize {
@@ -137,8 +151,8 @@ struct ExportSheet: View {
 
     private func export() {
         let panel = NSSavePanel()
-        let ext = format.raster?.fileExtension ?? "svg"
-        panel.allowedContentTypes = [format.raster?.utType ?? .svg]
+        let ext = format.fileExtension
+        panel.allowedContentTypes = [format.utType]
         panel.nameFieldStringValue = "Artwork.\(ext)"
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
@@ -168,6 +182,23 @@ struct ExportSheet: View {
                                                      quality: quality,
                                                      background: model.background) else {
                     errorMessage = "Encoding failed."
+                    return
+                }
+                try data.write(to: url)
+            } else if format == .pdf {
+                guard var image = PNGExporter.render(items: items,
+                                                     background: model.background,
+                                                     canvasSize: model.canvasSize,
+                                                     targetPixelSize: targetSize()) else {
+                    errorMessage = "Rendering failed."
+                    return
+                }
+                if !model.canvasEffects.isEmpty {
+                    image = EffectPipeline.shared.apply(effects: model.canvasEffects,
+                                                        to: image, palette: model.palette)
+                }
+                guard let data = PDFExporter.data(image: image, pageSize: targetSize()) else {
+                    errorMessage = "PDF encoding failed."
                     return
                 }
                 try data.write(to: url)

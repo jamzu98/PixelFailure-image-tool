@@ -4,6 +4,12 @@ import Foundation
 /// and rendering live in Effects/CoreImagePipeline.
 nonisolated enum EffectType: String, Codable, CaseIterable, Hashable, Sendable {
     case adjust
+    case curves
+    case levels
+    case targetedHSL
+    case whiteBalance
+    case vibrance
+    case shadowsHighlights
     case pixelate
     case hexPixelate
     case halftone
@@ -21,6 +27,12 @@ nonisolated enum EffectType: String, Codable, CaseIterable, Hashable, Sendable {
     var displayName: String {
         switch self {
         case .adjust: "Adjust"
+        case .curves: "Curves"
+        case .levels: "Levels"
+        case .targetedHSL: "Targeted HSL"
+        case .whiteBalance: "White Balance"
+        case .vibrance: "Vibrance"
+        case .shadowsHighlights: "Shadows / Highlights"
         case .pixelate: "Pixelate"
         case .hexPixelate: "Hex Pixelate"
         case .halftone: "Halftone"

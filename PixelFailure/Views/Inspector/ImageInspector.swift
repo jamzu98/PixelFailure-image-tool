@@ -39,7 +39,7 @@ struct ImageInspector: View {
     private func cropSlider(_ label: String, key: KeyPath<CGRect, CGFloat>) -> some View {
         let crop = config.crop ?? CGRect(x: 0, y: 0, width: 1, height: 1)
         return LabeledContent(label) {
-            Slider(value: Binding(
+            NumericSlider(value: Binding(
                 get: { Double(crop[keyPath: key]) },
                 set: { newValue in
                     document.updateDuringGesture { model in
@@ -61,7 +61,8 @@ struct ImageInspector: View {
                         }
                     }
                 }
-            ), in: 0...1) { editing in
+            ), range: 0...1,
+               defaultValue: (key == \.width || key == \.height) ? 1 : 0) { editing in
                 if editing { document.beginGesture() } else { document.endGesture(undoManager, actionName: "Crop") }
             }
         }

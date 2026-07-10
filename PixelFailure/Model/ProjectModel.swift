@@ -3,6 +3,11 @@ import Foundation
 
 /// The serialized document state: everything needed to regenerate the artwork.
 nonisolated struct ProjectModel: Codable, Hashable, Sendable {
+    static let currentSchemaVersion = 4
+
+    /// Explicit manifest version. Documents written before versioning decode
+    /// as v1; new migrations can branch on this without guessing from fields.
+    var schemaVersion: Int
     var canvasSize: CGSize
     var background: RGBAColor
     /// Bottom-to-top: index 0 draws first.
@@ -10,31 +15,42 @@ nonisolated struct ProjectModel: Codable, Hashable, Sendable {
     var palette: Palette
     /// Global adjustment stack applied to the whole composite (PNG/preview only).
     var canvasEffects: [Effect]
+    var workspace: WorkspaceSettings
+    var animation: AnimationSettings
 
-    init(canvasSize: CGSize = CGSize(width: 3000, height: 3000),
+    init(schemaVersion: Int = ProjectModel.currentSchemaVersion,
+         canvasSize: CGSize = CGSize(width: 3000, height: 3000),
          background: RGBAColor = RGBAColor(hex: "#211E1B"),
          layers: [Layer] = [],
          palette: Palette = BuiltInPalettes.default,
-         canvasEffects: [Effect] = []) {
+         canvasEffects: [Effect] = [],
+         workspace: WorkspaceSettings = WorkspaceSettings(),
+         animation: AnimationSettings = AnimationSettings()) {
+        self.schemaVersion = schemaVersion
         self.canvasSize = canvasSize
         self.background = background
         self.layers = layers
         self.palette = palette
         self.canvasEffects = canvasEffects
+        self.workspace = workspace
+        self.animation = animation
     }
 
     // Custom decoding so documents saved before canvasEffects existed still open.
     private enum CodingKeys: String, CodingKey {
-        case canvasSize, background, layers, palette, canvasEffects
+        case schemaVersion, canvasSize, background, layers, palette, canvasEffects, workspace, animation
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
         canvasSize = try container.decode(CGSize.self, forKey: .canvasSize)
         background = try container.decode(RGBAColor.self, forKey: .background)
         layers = try container.decode([Layer].self, forKey: .layers)
         palette = try container.decode(Palette.self, forKey: .palette)
         canvasEffects = try container.decodeIfPresent([Effect].self, forKey: .canvasEffects) ?? []
+        workspace = try container.decodeIfPresent(WorkspaceSettings.self, forKey: .workspace) ?? WorkspaceSettings()
+        animation = try container.decodeIfPresent(AnimationSettings.self, forKey: .animation) ?? AnimationSettings()
     }
 
     var canvasCenter: CGPoint { CGPoint(x: canvasSize.width / 2, y: canvasSize.height / 2) }
@@ -129,6 +145,42 @@ nonisolated struct ProjectModel: Codable, Hashable, Sendable {
         Self.parentGroupID(of: id, in: layers)
     }
 
+    /// Direct ancestors, nearest first.
+    func ancestorGroupIDs(of id: UUID) -> [UUID] {
+        Self.ancestorPath(to: id, in: layers) ?? []
+    }
+
+    private static func ancestorPath(to id: UUID, in layers: [Layer]) -> [UUID]? {
+        for layer in layers {
+            if layer.id == id { return [] }
+            if case .group(let group) = layer.kind,
+               let path = ancestorPath(to: id, in: group.children) {
+                return [layer.id] + path
+            }
+        }
+        return nil
+    }
+
+    /// A child of a locked group is effectively locked even when its own
+    /// lock bit is clear.
+    func isEffectivelyLocked(_ id: UUID) -> Bool {
+        guard let layer = layer(id: id) else { return false }
+        return layer.isLocked || ancestorGroupIDs(of: id).contains {
+            self.layer(id: $0)?.isLocked == true
+        }
+    }
+
+    /// Transform from the layer's immediate coordinate space to the canvas.
+    func worldTransform(of id: UUID) -> LayerTransform? {
+        guard var result = layer(id: id)?.transform else { return nil }
+        for ancestorID in ancestorGroupIDs(of: id).reversed() {
+            guard let parent = layer(id: ancestorID) else { continue }
+            result = result.composed(withParent: parent.transform,
+                                     parentNaturalSize: canvasSize)
+        }
+        return result
+    }
+
     private static func parentGroupID(of id: UUID, in layers: [Layer]) -> UUID? {
         for layer in layers {
             if case .group(let group) = layer.kind {
@@ -171,6 +223,29 @@ nonisolated struct ProjectModel: Codable, Hashable, Sendable {
         return removed
     }
 
+    /// Inserts into root or directly into a group. Index is bottom-to-top and
+    /// clamps to the destination bounds.
+    @discardableResult
+    mutating func insertLayer(_ layer: Layer, into parentGroupID: UUID?, at index: Int) -> Bool {
+        if let parentGroupID {
+            var inserted = false
+            modifyLayer(id: parentGroupID) { parent in
+                guard case .group(var group) = parent.kind else { return }
+                group.children.insert(layer, at: min(max(index, 0), group.children.count))
+                parent.kind = .group(group)
+                inserted = true
+            }
+            return inserted
+        }
+        layers.insert(layer, at: min(max(index, 0), layers.count))
+        return true
+    }
+
+    func containerLayers(parentGroupID: UUID?) -> [Layer]? {
+        guard let parentGroupID else { return layers }
+        return layer(id: parentGroupID)?.groupConfig?.children
+    }
+
     private static func remove(ids: Set<UUID>, from layers: inout [Layer], removed: inout [Layer]) {
         var kept: [Layer] = []
         for var layer in layers {
@@ -196,5 +271,117 @@ nonisolated struct ProjectModel: Codable, Hashable, Sendable {
                           kind: .pattern(config))
         model.layers = [layer]
         return model
+    }
+}
+
+nonisolated struct AnimationKeyframe: Identifiable, Codable, Hashable, Sendable {
+    var id: UUID
+    var time: Double
+    var layerID: UUID
+    var seed: UInt64
+    var parameters: [String: Double]
+
+    init(id: UUID = UUID(), time: Double, layerID: UUID, seed: UInt64,
+         parameters: [String: Double]) {
+        self.id = id
+        self.time = time
+        self.layerID = layerID
+        self.seed = seed
+        self.parameters = parameters
+    }
+}
+
+nonisolated struct AnimationSettings: Codable, Hashable, Sendable {
+    var duration: Double
+    var framesPerSecond: Int
+    var keyframes: [AnimationKeyframe]
+
+    init(duration: Double = 4, framesPerSecond: Int = 24,
+         keyframes: [AnimationKeyframe] = []) {
+        self.duration = duration
+        self.framesPerSecond = framesPerSecond
+        self.keyframes = keyframes
+    }
+
+    var frameCount: Int { max(1, Int((duration * Double(framesPerSecond)).rounded())) }
+}
+
+extension ProjectModel {
+    /// Resolves a deterministic frame. Scalars interpolate linearly; seeds
+    /// step at the midpoint because generator randomness is intentionally discrete.
+    func model(at animationTime: Double) -> ProjectModel {
+        var result = self
+        let time = min(max(animationTime, 0), animation.duration)
+        let layerIDs = Set(animation.keyframes.map(\.layerID))
+        for layerID in layerIDs {
+            let frames = animation.keyframes.filter { $0.layerID == layerID }
+                .sorted { $0.time < $1.time }
+            guard let first = frames.first else { continue }
+            let before = frames.last(where: { $0.time <= time }) ?? first
+            let after = frames.first(where: { $0.time >= time }) ?? frames.last!
+            let span = after.time - before.time
+            let t = span > 0 ? (time - before.time) / span : 0
+            result.modifyLayer(id: layerID) { layer in
+                layer.modifyPattern { pattern in
+                    pattern.seed = t < 0.5 ? before.seed : after.seed
+                    let keys = Set(before.parameters.keys).union(after.parameters.keys)
+                    for key in keys {
+                        let a = before.parameters[key] ?? pattern.params.storage[key] ?? 0
+                        let b = after.parameters[key] ?? a
+                        pattern.params.storage[key] = a + (b - a) * t
+                    }
+                }
+            }
+        }
+        return result
+    }
+}
+
+nonisolated enum GuideOrientation: String, Codable, Hashable, Sendable {
+    case horizontal, vertical
+}
+
+nonisolated struct CanvasGuide: Identifiable, Codable, Hashable, Sendable {
+    var id: UUID
+    var orientation: GuideOrientation
+    var position: Double
+
+    init(id: UUID = UUID(), orientation: GuideOrientation, position: Double) {
+        self.id = id
+        self.orientation = orientation
+        self.position = position
+    }
+}
+
+nonisolated struct GridSettings: Codable, Hashable, Sendable {
+    var isVisible: Bool
+    var spacing: Double
+    var subdivisions: Int
+    var snapsToGrid: Bool
+
+    init(isVisible: Bool = false, spacing: Double = 100,
+         subdivisions: Int = 2, snapsToGrid: Bool = false) {
+        self.isVisible = isVisible
+        self.spacing = spacing
+        self.subdivisions = subdivisions
+        self.snapsToGrid = snapsToGrid
+    }
+}
+
+nonisolated struct WorkspaceSettings: Codable, Hashable, Sendable {
+    var guides: [CanvasGuide]
+    var grid: GridSettings
+    var showsRulers: Bool
+    var smartGuidesEnabled: Bool
+    var showsNavigator: Bool
+
+    init(guides: [CanvasGuide] = [], grid: GridSettings = GridSettings(),
+         showsRulers: Bool = true, smartGuidesEnabled: Bool = true,
+         showsNavigator: Bool = true) {
+        self.guides = guides
+        self.grid = grid
+        self.showsRulers = showsRulers
+        self.smartGuidesEnabled = smartGuidesEnabled
+        self.showsNavigator = showsNavigator
     }
 }

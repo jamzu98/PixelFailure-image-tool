@@ -47,12 +47,15 @@ struct LayerListView: View {
                                  }
                              })
                         .tag(entry.layer.id)
+                        .draggable(entry.layer.id.uuidString)
+                        .dropDestination(for: String.self) { identifiers, _ in
+                            guard let raw = identifiers.first,
+                                  let sourceID = UUID(uuidString: raw) else { return false }
+                            return dropLayer(sourceID, onto: entry.layer)
+                        }
                         .contextMenu {
                             rowContextMenu(entry.layer)
                         }
-                }
-                .onMove { source, destination in
-                    moveDisplayed(from: source, to: destination)
                 }
             }
             .listStyle(.sidebar)
@@ -81,6 +84,13 @@ struct LayerListView: View {
                             in: RoundedRectangle(cornerRadius: 6))
             }
             .buttonStyle(.plain)
+            .dropDestination(for: String.self) { identifiers, _ in
+                guard let raw = identifiers.first,
+                      let sourceID = UUID(uuidString: raw) else { return false }
+                return document.moveLayer(id: sourceID, to: nil,
+                                          at: document.model.layers.count,
+                                          undoManager: undoManager)
+            }
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
             .help("Canvas settings (size, background color)")
@@ -121,11 +131,24 @@ struct LayerListView: View {
     @ViewBuilder
     private func rowContextMenu(_ layer: Layer) -> some View {
         Button("Copy") {
-            document.copyLayer(id: layer.id, renderStore: renderStore)
+            if let selection = editorState.selection,
+               editorState.selectedLayerID == layer.id,
+               layer.kind.isImage {
+                document.copySelection(selection, layerID: layer.id, renderStore: renderStore)
+            } else {
+                document.copyLayer(id: layer.id, renderStore: renderStore)
+            }
         }
         Button("Cut") {
-            document.cutLayer(id: layer.id, renderStore: renderStore, undoManager: undoManager)
-            editorState.selectedLayerIDs.remove(layer.id)
+            if let selection = editorState.selection,
+               editorState.selectedLayerID == layer.id,
+               layer.kind.isImage {
+                document.cutSelection(selection, layerID: layer.id,
+                                      renderStore: renderStore, undoManager: undoManager)
+            } else {
+                document.cutLayer(id: layer.id, renderStore: renderStore, undoManager: undoManager)
+                editorState.selectedLayerIDs.remove(layer.id)
+            }
         }
         Button("Paste") {
             switch LayerPasteboard.readAny() {
@@ -178,28 +201,27 @@ struct LayerListView: View {
         }
     }
 
-    /// Drag reorder: top-level rows only (nested layers reorder via the
-    /// Arrange context menu, which is container-aware).
-    private func moveDisplayed(from source: IndexSet, to destination: Int) {
-        let rows = displayedRows
-        guard let sourceIndex = source.first,
-              rows.indices.contains(sourceIndex),
-              rows[sourceIndex].depth == 0 else { return }
-        // Only allow drops at top-level boundaries.
-        let boundaryOK = destination == rows.count
-            || (rows.indices.contains(destination) && rows[destination].depth == 0)
-        guard boundaryOK else { return }
-
-        var topLevel = Array(document.model.layers.reversed())
-        guard let fromIndex = topLevel.firstIndex(where: { $0.id == rows[sourceIndex].layer.id }) else { return }
-        // Map the flat destination to a top-level index.
-        let before = rows[..<destination].filter { $0.depth == 0 }.count
-        var moved = topLevel
-        moved.move(fromOffsets: IndexSet(integer: fromIndex), toOffset: min(before, topLevel.count))
-        let reordered = Array(moved.reversed())
-        document.update(undoManager, actionName: "Reorder Layers") { model in
-            model.layers = reordered
+    /// Dropping on a group places the source at the top of that group.
+    /// Dropping on any other row places it immediately above that row in the
+    /// row's current container. Dropping on Canvas moves it to root/top.
+    private func dropLayer(_ sourceID: UUID, onto target: Layer) -> Bool {
+        guard sourceID != target.id else { return false }
+        if let group = target.groupConfig {
+            return document.moveLayer(id: sourceID, to: target.id,
+                                      at: group.children.count,
+                                      undoManager: undoManager)
         }
+        let parentID = document.model.parentGroupID(of: target.id)
+        guard let container = document.model.containerLayers(parentGroupID: parentID),
+              let targetIndex = container.firstIndex(where: { $0.id == target.id }) else { return false }
+        var destination = targetIndex + 1
+        if document.model.parentGroupID(of: sourceID) == parentID,
+           let sourceIndex = container.firstIndex(where: { $0.id == sourceID }),
+           sourceIndex < destination {
+            destination -= 1
+        }
+        return document.moveLayer(id: sourceID, to: parentID,
+                                  at: destination, undoManager: undoManager)
     }
 }
 

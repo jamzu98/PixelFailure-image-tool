@@ -6,6 +6,7 @@ struct CanvasViewport: View {
     @ObservedObject var document: PixelDocument
     @Bindable var editorState: EditorState
     let renderStore: RenderStore
+    let animationTime: Double?
     @Environment(\.undoManager) private var undoManager
 
     /// nil = fit to window.
@@ -19,7 +20,6 @@ struct CanvasViewport: View {
     @State private var paintTick = 0
     @State private var isHoveringViewport = false
     @State private var viewportSize: CGSize = .zero
-    @State private var scrollMonitor: Any?
     @FocusState private var isFocused: Bool
 
     private enum DragMode {
@@ -29,6 +29,10 @@ struct CanvasViewport: View {
         case pan(startPan: CGSize)
         case scale(layerID: UUID, startScale: Double, startDistance: CGFloat)
         case rotate(layerID: UUID, startRotation: Double, startAngle: Double)
+        case multiScale(entries: [(id: UUID, world: LayerTransform, parent: CGAffineTransform)],
+                        center: CGPoint, startDistance: CGFloat)
+        case multiRotate(entries: [(id: UUID, world: LayerTransform, parent: CGAffineTransform)],
+                         center: CGPoint, startAngle: Double)
         case paint
         case marquee(startCanvasPoint: CGPoint)
         case lassoFreehand(points: [CGPoint])
@@ -36,7 +40,8 @@ struct CanvasViewport: View {
 
     private func moveEntries(for ids: Set<UUID>) -> [(id: UUID, start: CGPoint, parentInverse: CGAffineTransform)] {
         ids.compactMap { id in
-            guard let layer = document.model.layer(id: id), !layer.isLocked else { return nil }
+            guard let layer = document.model.layer(id: id),
+                  !document.model.isEffectivelyLocked(id) else { return nil }
             let parent = document.model.parentAffine(of: id)
             let inverse = parent.isInvertible ? parent.inverted() : .identity
             return (id, layer.transform.position, inverse)
@@ -49,11 +54,21 @@ struct CanvasViewport: View {
             let scale = effectiveZoom(viewSize: viewSize)
             let canvasTransform = self.canvasTransform(viewSize: viewSize, scale: scale)
             let _ = paintTick
-            let items = renderStore.renderItems(model: document.model, quality: .preview)
-            let composite = renderStore.compositePreview(model: document.model, extraHash: paintTick)
+            let displayModel = animationTime.map { document.model.model(at: $0) } ?? document.model
+            let items = renderStore.renderItems(model: displayModel, quality: .preview)
+            let composite = renderStore.compositePreview(model: displayModel, extraHash: paintTick)
 
             ZStack {
                 Color(nsColor: .underPageBackgroundColor)
+
+                PointerEventBridge(onPointer: { sample in
+                    editorState.pointerSample = sample
+                }, onScroll: { dx, dy, location, modifiers in
+                    handlePreciseScroll(dx: dx, dy: dy, location: location,
+                                        modifiers: modifiers)
+                })
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .allowsHitTesting(false)
 
                 Canvas { context, _ in
                     context.concatenate(canvasTransform)
@@ -66,12 +81,17 @@ struct CanvasViewport: View {
                         clipped.draw(Image(decorative: composite, scale: 1), in: canvasRect)
                     } else {
                         CanvasRenderer.draw(items: items,
-                                            background: document.model.background,
-                                            canvasSize: document.model.canvasSize,
+                                            background: displayModel.background,
+                                            canvasSize: displayModel.canvasSize,
                                             in: context)
                     }
                 }
                 .allowsHitTesting(false)
+
+                WorkspaceOverlay(document: document,
+                                 editorState: editorState,
+                                 canvasTransform: canvasTransform,
+                                 scale: scale)
 
                 if editorState.activeTool == .move,
                    let layer = document.model.layer(id: editorState.selectedLayerID) {
@@ -82,8 +102,27 @@ struct CanvasViewport: View {
                                      canvasTransform: canvasTransform,
                                      onScaleDrag: { phase in handleScaleDrag(phase, layer: layer, parentAffine: parentAffine, canvasTransform: canvasTransform) },
                                      onRotateDrag: { phase in handleRotateDrag(phase, layer: layer, parentAffine: parentAffine, canvasTransform: canvasTransform) })
-                        .allowsHitTesting(!layer.isLocked)
-                        .opacity(layer.isLocked ? 0.4 : 1)
+                        .allowsHitTesting(!document.model.isEffectivelyLocked(layer.id))
+                        .opacity(document.model.isEffectivelyLocked(layer.id) ? 0.4 : 1)
+                }
+
+                if editorState.activeTool == .node,
+                   let layer = document.model.layer(id: editorState.selectedLayerID),
+                   let path = layer.pathConfig {
+                    PathNodeOverlay(document: document, layer: layer, config: path,
+                                    canvasTransform: canvasTransform,
+                                    parentAffine: document.model.parentAffine(of: layer.id))
+                }
+
+                if editorState.activeTool == .move,
+                   editorState.selectedLayerIDs.count > 1,
+                   let bounds = multiSelectionBounds {
+                    MultiSelectionOverlay(bounds: bounds,
+                                          canvasTransform: canvasTransform,
+                                          onScaleDrag: { handleMultiScaleDrag($0, bounds: bounds,
+                                                                              canvasTransform: canvasTransform) },
+                                          onRotateDrag: { handleMultiRotateDrag($0, bounds: bounds,
+                                                                                canvasTransform: canvasTransform) })
                 }
 
                 SelectionAntsView(editorState: editorState,
@@ -98,6 +137,12 @@ struct CanvasViewport: View {
                                 canvasTransform: canvasTransform,
                                 onApply: { applyCrop() },
                                 onCancel: { cancelCrop() })
+                }
+
+                if document.model.workspace.showsNavigator {
+                    NavigatorView(document: document, renderStore: renderStore,
+                                  canvasTransform: canvasTransform, viewportSize: viewSize,
+                                  zoomScale: scale, pan: $pan)
                 }
 
                 zoomControls(scale: scale)
@@ -153,6 +198,15 @@ struct CanvasViewport: View {
                     closePolygonalLasso()
                     return .handled
                 }
+                if editorState.activeTool == .pen,
+                   let id = editorState.selectedLayerID,
+                   document.model.layer(id: id)?.kind.isPath == true {
+                    document.update(undoManager, actionName: "Close Path") {
+                        $0.modifyLayer(id: id) { $0.modifyPath { $0.isClosed = true } }
+                    }
+                    editorState.activeTool = .node
+                    return .handled
+                }
                 guard editorState.activeTool == .crop, editorState.cropDraft != nil else { return .ignored }
                 applyCrop()
                 return .handled
@@ -191,6 +245,15 @@ struct CanvasViewport: View {
             }
             .copyable(copyableItems())
             .cuttable(for: LayerTransfer.self) {
+                if let selection = editorState.selection,
+                   let id = editorState.selectedLayerID,
+                   !document.model.isEffectivelyLocked(id),
+                   let payload = document.transferPayload(for: selection, layerID: id,
+                                                          renderStore: renderStore) {
+                    document.deletePixels(selection: selection, layerID: id,
+                                          renderStore: renderStore, undoManager: undoManager)
+                    return [payload]
+                }
                 guard let id = editorState.selectedLayerID,
                       let payload = document.transferPayload(for: id, renderStore: renderStore) else { return [] }
                 document.deleteLayer(id: id, undoManager: undoManager)
@@ -207,8 +270,6 @@ struct CanvasViewport: View {
             }
         }
         .clipped()
-        .onAppear { installScrollMonitor() }
-        .onDisappear { removeScrollMonitor() }
     }
 
     /// Pastes whatever the pasteboard holds: one of our layers, or any
@@ -228,44 +289,37 @@ struct CanvasViewport: View {
 
     // MARK: - Scroll navigation
 
-    /// Two-finger scroll pans; ⌥- or ⌘-scroll zooms anchored at the pointer.
-    private func installScrollMonitor() {
-        guard scrollMonitor == nil else { return }
-        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
-            guard isHoveringViewport else { return event }
-            // Read the live keyboard state too: some event streams (and
-            // synthetic events) don't stamp flags on every scroll tick.
-            let modifiers = event.modifierFlags.union(NSEvent.modifierFlags)
-            if modifiers.contains(.option) || modifiers.contains(.command) {
-                let currentScale = effectiveZoom(viewSize: viewportSize)
-                let factor = 1 + event.scrollingDeltaY * 0.01
-                let newScale = min(max(currentScale * factor, 0.02), 12)
-                // Keep the canvas point under the pointer stationary.
-                let canvas = document.model.canvasSize
-                let transform = canvasTransform(viewSize: viewportSize, scale: currentScale)
-                guard transform.isInvertible else { return nil }
-                let canvasPoint = hoverLocation.applying(transform.inverted())
-                pan = CGSize(width: (hoverLocation.x - canvasPoint.x * newScale) - (viewportSize.width - canvas.width * newScale) / 2,
-                             height: (hoverLocation.y - canvasPoint.y * newScale) - (viewportSize.height - canvas.height * newScale) / 2)
-                zoomLevel = newScale
-            } else {
-                pan = CGSize(width: pan.width + event.scrollingDeltaX,
-                             height: pan.height + event.scrollingDeltaY)
-            }
-            return nil
+    /// AppKit supplies precise deltas and tablet metadata while SwiftUI keeps
+    /// ownership of the higher-level tool gestures.
+    private func handlePreciseScroll(dx: CGFloat, dy: CGFloat, location: CGPoint,
+                                     modifiers: NSEvent.ModifierFlags) {
+        if modifiers.contains(.option) || modifiers.contains(.command) {
+            let currentScale = effectiveZoom(viewSize: viewportSize)
+            let factor = 1 + dy * 0.01
+            let newScale = min(max(currentScale * factor, 0.02), 12)
+            let canvas = document.model.canvasSize
+            let transform = canvasTransform(viewSize: viewportSize, scale: currentScale)
+            guard transform.isInvertible else { return }
+            let canvasPoint = location.applying(transform.inverted())
+            pan = CGSize(width: (location.x - canvasPoint.x * newScale)
+                            - (viewportSize.width - canvas.width * newScale) / 2,
+                         height: (location.y - canvasPoint.y * newScale)
+                            - (viewportSize.height - canvas.height * newScale) / 2)
+            zoomLevel = newScale
+        } else {
+            pan = CGSize(width: pan.width + dx, height: pan.height + dy)
         }
-    }
-
-    private func removeScrollMonitor() {
-        if let scrollMonitor {
-            NSEvent.removeMonitor(scrollMonitor)
-        }
-        scrollMonitor = nil
     }
 
     // MARK: - Copy / paste / context menu
 
     private func copyableItems() -> [LayerTransfer] {
+        if let selection = editorState.selection,
+           let id = editorState.selectedLayerID,
+           let payload = document.transferPayload(for: selection, layerID: id,
+                                                  renderStore: renderStore) {
+            return [payload]
+        }
         guard let id = editorState.selectedLayerID,
               let payload = document.transferPayload(for: id, renderStore: renderStore) else { return [] }
         return [payload]
@@ -282,11 +336,20 @@ struct CanvasViewport: View {
             Section(layer.name) {
                 Button("Copy") {
                     editorState.selectedLayerID = layer.id
-                    document.copyLayer(id: layer.id, renderStore: renderStore)
+                    if let selection = editorState.selection, layer.kind.isImage {
+                        document.copySelection(selection, layerID: layer.id, renderStore: renderStore)
+                    } else {
+                        document.copyLayer(id: layer.id, renderStore: renderStore)
+                    }
                 }
                 Button("Cut") {
-                    document.cutLayer(id: layer.id, renderStore: renderStore, undoManager: undoManager)
-                    if editorState.selectedLayerID == layer.id { editorState.selectedLayerID = nil }
+                    if let selection = editorState.selection, layer.kind.isImage {
+                        document.cutSelection(selection, layerID: layer.id,
+                                              renderStore: renderStore, undoManager: undoManager)
+                    } else {
+                        document.cutLayer(id: layer.id, renderStore: renderStore, undoManager: undoManager)
+                        if editorState.selectedLayerID == layer.id { editorState.selectedLayerID = nil }
+                    }
                 }
                 Button("Duplicate") {
                     editorState.selectedLayerID = document.duplicateLayer(id: layer.id, undoManager: undoManager)
@@ -360,10 +423,12 @@ struct CanvasViewport: View {
                 if dragMode == nil {
                     isFocused = true
                     switch editorState.activeTool {
-                    case .brush, .eraser:
+                    case .brush, .eraser, .clone, .heal, .smudge, .dodge, .burn:
+                        if (editorState.activeTool == .clone || editorState.activeTool == .heal),
+                           editorState.cloneSourceCanvas == nil { break }
                         dragMode = .paint
                         startPaintSession()
-                    case .hand, .zoom, .eyedropper, .crop, .wand:
+                    case .hand, .zoom, .eyedropper, .crop, .wand, .pen, .node:
                         dragMode = .pan(startPan: pan)
                     case .marquee:
                         dragMode = .marquee(startCanvasPoint: value.startLocation.applying(canvasTransform.inverted()))
@@ -408,7 +473,8 @@ struct CanvasViewport: View {
                             var newPosition = CGPoint(x: entry.start.x + local.dx,
                                                       y: entry.start.y + local.dy)
                             if entries.count == 1 {
-                                newPosition = snapped(newPosition, tolerance: 8 / scale)
+                                newPosition = snapped(newPosition, layerID: entry.id,
+                                                      tolerance: 8 / scale)
                             }
                             model.modifyLayer(id: entry.id) { $0.transform.position = newPosition }
                         }
@@ -439,6 +505,8 @@ struct CanvasViewport: View {
                 switch dragMode {
                 case .move:
                     document.endGesture(undoManager, actionName: "Move Layer")
+                    editorState.smartGuideX = nil
+                    editorState.smartGuideY = nil
                 case .paint:
                     commitPaintSession()
                 case .marquee(let start):
@@ -553,7 +621,11 @@ struct CanvasViewport: View {
             return Cursors.eyedropper
         case .marquee, .lasso, .wand:
             return .crosshair
-        case .brush, .eraser:
+        case .pen:
+            return .crosshair
+        case .node:
+            return .arrow
+        case .brush, .eraser, .clone, .heal, .smudge, .dodge, .burn:
             return Cursors.brush(diameter: editorState.brush.size * scale)
         case .crop:
             return cropCursor(at: location, canvasTransform: canvasTransform)
@@ -610,6 +682,13 @@ struct CanvasViewport: View {
 
     private func handleTap(at location: CGPoint, viewSize: CGSize, scale: CGFloat, canvasTransform: CGAffineTransform) {
         let canvasPoint = location.applying(canvasTransform.inverted())
+        if editorState.activeTool == .clone || editorState.activeTool == .heal {
+            if NSEvent.modifierFlags.contains(.option) {
+                editorState.cloneSourceCanvas = canvasPoint
+                return
+            }
+            guard editorState.cloneSourceCanvas != nil else { return }
+        }
         switch editorState.activeTool {
         case .move:
             selectAt(canvasPoint)
@@ -623,7 +702,7 @@ struct CanvasViewport: View {
             zoomLevel = newScale
         case .eyedropper:
             pickColor(at: canvasPoint)
-        case .brush, .eraser:
+        case .brush, .eraser, .clone, .heal, .smudge, .dodge, .burn:
             // A click without a drag is a single dab.
             startPaintSession()
             extendPaintStroke(to: location, canvasTransform: canvasTransform)
@@ -632,6 +711,15 @@ struct CanvasViewport: View {
             polygonalLassoClick(at: canvasPoint, scale: scale)
         case .wand:
             wandClick(at: canvasPoint)
+        case .pen:
+            if let layer = document.model.layer(id: editorState.selectedLayerID), layer.kind.isPath {
+                document.addPathNode(to: layer.id, canvasPoint: canvasPoint, undoManager: undoManager)
+            } else {
+                editorState.selectedLayerID = document.addPathLayer(firstPoint: canvasPoint,
+                                                                    undoManager: undoManager)
+            }
+        case .node:
+            selectAt(canvasPoint)
         case .hand, .crop, .marquee, .lasso:
             break
         }
@@ -655,6 +743,7 @@ struct CanvasViewport: View {
         // Mask editing takes priority over content painting.
         if let maskID = editorState.editingMaskLayerID,
            let layer = document.model.layer(id: maskID),
+           !document.model.isEffectivelyLocked(maskID),
            let mask = layer.mask {
             let base = renderStore.originalImage(key: mask.imageKey)
             var clip: CGPath?
@@ -672,8 +761,11 @@ struct CanvasViewport: View {
         } else {
             var targetID = editorState.selectedLayerID
             let targetLayer = document.model.layer(id: targetID ?? UUID())
-            let paintable = (targetLayer?.kind.isImage ?? false) && targetLayer?.isLocked != true
+            let paintable = (targetLayer?.kind.isImage ?? false)
+                && targetLayer.map { !document.model.isEffectivelyLocked($0.id) } == true
             if !paintable {
+                let retouch = [.clone, .heal, .smudge, .dodge, .burn].contains(editorState.activeTool)
+                if retouch { return }
                 targetID = document.addPaintLayer(undoManager: undoManager)
                 editorState.selectedLayerID = targetID
             }
@@ -733,13 +825,44 @@ struct CanvasViewport: View {
             color = reveals ? .white : .black
         }
 
+        let pressure = min(max(editorState.pointerSample.pressure, 0.05), 1)
         let radius = brush.size / 2 / layerScale * bufferPerLocal
-        session.stroke(to: bufferPoint,
-                       radius: radius,
-                       hardness: brush.hardness,
-                       opacity: brush.opacity,
-                       color: color,
-                       erase: erase && !session.isMask)
+            * (brush.pressureControlsSize ? pressure : 1)
+        let opacity = brush.opacity * (brush.pressureControlsOpacity ? pressure : 1)
+        let isRetouch = [.clone, .heal, .smudge, .dodge, .burn].contains(editorState.activeTool)
+        if isRetouch && !session.isMask {
+            let sourcePoint: CGPoint? = editorState.cloneSourceCanvas.map { sourceCanvas in
+                let sourceLocal = sourceCanvas.applying(affine.inverted())
+                if let config = layer.imageConfig, let crop = config.crop {
+                    return CGPoint(x: crop.minX * config.pixelSize.width + sourceLocal.x,
+                                   y: crop.minY * config.pixelSize.height + sourceLocal.y)
+                }
+                return sourceLocal
+            }
+            let mode: PaintSession.RetouchMode
+            switch editorState.activeTool {
+            case .clone: mode = .clone
+            case .heal: mode = .heal
+            case .smudge: mode = .smudge
+            case .dodge: mode = .dodge
+            default: mode = .burn
+            }
+            session.retouch(to: bufferPoint, source: sourcePoint, mode: mode,
+                            radius: radius, hardness: brush.hardness, opacity: opacity,
+                            spacing: brush.spacing, smoothing: brush.smoothing)
+        } else {
+            session.stroke(to: bufferPoint,
+                           radius: radius,
+                           hardness: brush.hardness,
+                           opacity: opacity,
+                           color: color,
+                           erase: erase && !session.isMask,
+                           spacing: brush.spacing,
+                           smoothing: brush.smoothing,
+                           scatter: brush.scatter,
+                           sizeJitter: brush.sizeJitter,
+                           opacityJitter: brush.opacityJitter)
+        }
         paintTick += 1
     }
 
@@ -756,7 +879,7 @@ struct CanvasViewport: View {
         let key = document.storeImage(data: data, fileExtension: "png")
         switch session.target {
         case .content(let id):
-            document.update(undoManager, actionName: "Paint") { model in
+            document.update(undoManager, actionName: editorState.activeTool.displayName) { model in
                 model.modifyLayer(id: id) { layer in
                     layer.modifyImage { $0.imageKey = key }
                 }
@@ -928,6 +1051,110 @@ struct CanvasViewport: View {
         }
     }
 
+    private var topmostSelectedIDs: Set<UUID> {
+        Set(editorState.selectedLayerIDs.filter { id in
+            !document.model.ancestorGroupIDs(of: id).contains(where: editorState.selectedLayerIDs.contains)
+        })
+    }
+
+    private var multiSelectionBounds: CGRect? {
+        let bounds = topmostSelectedIDs.compactMap { id -> CGRect? in
+            guard let layer = document.model.layer(id: id),
+                  !document.model.isEffectivelyLocked(id) else { return nil }
+            return document.worldBounds(of: layer, renderStore: renderStore)
+        }
+        guard !bounds.isEmpty else { return nil }
+        return bounds.reduce(.null) { $0.union($1) }
+    }
+
+    private func multiTransformEntries() -> [(id: UUID, world: LayerTransform, parent: CGAffineTransform)] {
+        topmostSelectedIDs.compactMap { id in
+            guard !document.model.isEffectivelyLocked(id),
+                  let world = document.model.worldTransform(of: id) else { return nil }
+            return (id, world, document.model.parentAffine(of: id))
+        }
+    }
+
+    private func handleMultiScaleDrag(_ phase: HandleDragPhase, bounds: CGRect,
+                                      canvasTransform: CGAffineTransform) {
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let screenCenter = center.applying(canvasTransform)
+        switch phase {
+        case .changed(let value):
+            let distance = hypot(value.location.x - screenCenter.x,
+                                 value.location.y - screenCenter.y)
+            if case .multiScale(let entries, let startCenter, let startDistance) = dragMode {
+                let factor = startDistance > 1 ? max(distance / startDistance, 0.02) : 1
+                document.updateDuringGesture { model in
+                    for entry in entries {
+                        var world = entry.world
+                        world.position = CGPoint(
+                            x: startCenter.x + (world.position.x - startCenter.x) * factor,
+                            y: startCenter.y + (world.position.y - startCenter.y) * factor)
+                        world.scale = min(max(world.scale * Double(factor), 0.02), 60)
+                        if let local = LayerTransform.rebased(world: world,
+                                                             destinationParent: entry.parent) {
+                            model.modifyLayer(id: entry.id) { $0.transform = local }
+                        }
+                    }
+                }
+            } else {
+                let startDistance = hypot(value.startLocation.x - screenCenter.x,
+                                          value.startLocation.y - screenCenter.y)
+                let entries = multiTransformEntries()
+                guard !entries.isEmpty else { return }
+                document.beginGesture()
+                dragMode = .multiScale(entries: entries, center: center,
+                                       startDistance: startDistance)
+            }
+        case .ended:
+            document.endGesture(undoManager, actionName: "Scale Layers")
+            dragMode = nil
+        }
+    }
+
+    private func handleMultiRotateDrag(_ phase: HandleDragPhase, bounds: CGRect,
+                                       canvasTransform: CGAffineTransform) {
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let screenCenter = center.applying(canvasTransform)
+        switch phase {
+        case .changed(let value):
+            let currentAngle = atan2(Double(value.location.y - screenCenter.y),
+                                     Double(value.location.x - screenCenter.x))
+            if case .multiRotate(let entries, let startCenter, let startAngle) = dragMode {
+                var delta = (currentAngle - startAngle) * 180 / .pi
+                let snapped = (delta / 15).rounded() * 15
+                if abs(delta - snapped) < 2.5 { delta = snapped }
+                let radians = CGFloat(delta * .pi / 180)
+                let rotation = CGAffineTransform(translationX: startCenter.x, y: startCenter.y)
+                    .rotated(by: radians)
+                    .translatedBy(x: -startCenter.x, y: -startCenter.y)
+                document.updateDuringGesture { model in
+                    for entry in entries {
+                        var world = entry.world
+                        world.position = world.position.applying(rotation)
+                        world.rotationDegrees += delta
+                        if let local = LayerTransform.rebased(world: world,
+                                                             destinationParent: entry.parent) {
+                            model.modifyLayer(id: entry.id) { $0.transform = local }
+                        }
+                    }
+                }
+            } else {
+                let startAngle = atan2(Double(value.startLocation.y - screenCenter.y),
+                                       Double(value.startLocation.x - screenCenter.x))
+                let entries = multiTransformEntries()
+                guard !entries.isEmpty else { return }
+                document.beginGesture()
+                dragMode = .multiRotate(entries: entries, center: center,
+                                        startAngle: startAngle)
+            }
+        case .ended:
+            document.endGesture(undoManager, actionName: "Rotate Layers")
+            dragMode = nil
+        }
+    }
+
     // MARK: - Selection & snapping
 
     /// Returns the top-level layer under the point. Groups hit when any of
@@ -959,20 +1186,64 @@ struct CanvasViewport: View {
         editorState.selectedLayerID = hitTest(canvasPoint)?.id
     }
 
-    private func snapped(_ point: CGPoint, tolerance: CGFloat) -> CGPoint {
-        var result = point
-        let canvas = document.model.canvasSize
-        let xTargets: [CGFloat] = [canvas.width / 2, canvas.width / 3, canvas.width * 2 / 3]
-        let yTargets: [CGFloat] = [canvas.height / 2, canvas.height / 3, canvas.height * 2 / 3]
-        for target in xTargets where abs(point.x - target) < tolerance {
-            result.x = target
-            break
+    private func snapped(_ point: CGPoint, layerID: UUID, tolerance: CGFloat) -> CGPoint {
+        guard let layer = document.model.layer(id: layerID) else { return point }
+        let parent = document.model.parentAffine(of: layerID)
+        let localDelta = CGVector(dx: point.x - layer.transform.position.x,
+                                  dy: point.y - layer.transform.position.y)
+        let worldDelta = CGVector(dx: localDelta.dx * parent.a + localDelta.dy * parent.c,
+                                  dy: localDelta.dx * parent.b + localDelta.dy * parent.d)
+        let currentBounds = document.worldBounds(of: layer, renderStore: renderStore)
+        let proposed = currentBounds.offsetBy(dx: worldDelta.dx, dy: worldDelta.dy)
+        let movingX = [proposed.minX, proposed.midX, proposed.maxX]
+        let movingY = [proposed.minY, proposed.midY, proposed.maxY]
+        var xTargets: [CGFloat] = []
+        var yTargets: [CGFloat] = []
+        let workspace = document.model.workspace
+
+        if workspace.smartGuidesEnabled {
+            xTargets += [0, document.model.canvasSize.width / 2, document.model.canvasSize.width]
+            yTargets += [0, document.model.canvasSize.height / 2, document.model.canvasSize.height]
+            for guide in workspace.guides {
+                if guide.orientation == .vertical { xTargets.append(guide.position) }
+                else { yTargets.append(guide.position) }
+            }
+            for other in document.model.allLayers where other.id != layerID
+                && other.isVisible && !other.kind.isGroup
+                && !editorState.selectedLayerIDs.contains(other.id) {
+                let bounds = document.worldBounds(of: other, renderStore: renderStore)
+                xTargets += [bounds.minX, bounds.midX, bounds.maxX]
+                yTargets += [bounds.minY, bounds.midY, bounds.maxY]
+            }
         }
-        for target in yTargets where abs(point.y - target) < tolerance {
-            result.y = target
-            break
+        if workspace.grid.snapsToGrid {
+            let spacing = max(workspace.grid.spacing / Double(max(workspace.grid.subdivisions, 1)), 1)
+            xTargets += movingX.map { ($0 / spacing).rounded() * spacing }
+            yTargets += movingY.map { ($0 / spacing).rounded() * spacing }
         }
-        return result
+
+        let xSnap = bestSnap(anchors: movingX, targets: xTargets, tolerance: tolerance)
+        let ySnap = bestSnap(anchors: movingY, targets: yTargets, tolerance: tolerance)
+        editorState.smartGuideX = xSnap.map { Double($0.target) }
+        editorState.smartGuideY = ySnap.map { Double($0.target) }
+        let correction = CGVector(dx: xSnap?.delta ?? 0, dy: ySnap?.delta ?? 0)
+        guard parent.isInvertible else { return point }
+        let inverse = parent.inverted()
+        return CGPoint(x: point.x + correction.dx * inverse.a + correction.dy * inverse.c,
+                       y: point.y + correction.dx * inverse.b + correction.dy * inverse.d)
+    }
+
+    private func bestSnap(anchors: [CGFloat], targets: [CGFloat], tolerance: CGFloat)
+        -> (delta: CGFloat, target: CGFloat)? {
+        var best: (delta: CGFloat, target: CGFloat)?
+        for anchor in anchors {
+            for target in targets {
+                let delta = target - anchor
+                guard abs(delta) <= tolerance else { continue }
+                if best == nil || abs(delta) < abs(best!.delta) { best = (delta, target) }
+            }
+        }
+        return best
     }
 
     private func nudgeSelection(_ press: KeyPress) -> KeyPress.Result {
@@ -1110,5 +1381,461 @@ struct SelectionOverlay: View {
     private func normalize(_ v: CGPoint) -> CGPoint {
         let len = max(hypot(v.x, v.y), 0.001)
         return CGPoint(x: v.x / len, y: v.y / len)
+    }
+}
+
+/// Axis-aligned aggregate transform box for multiple selected layers.
+struct MultiSelectionOverlay: View {
+    let bounds: CGRect
+    let canvasTransform: CGAffineTransform
+    let onScaleDrag: (HandleDragPhase) -> Void
+    let onRotateDrag: (HandleDragPhase) -> Void
+
+    var body: some View {
+        let corners = [
+            CGPoint(x: bounds.minX, y: bounds.minY),
+            CGPoint(x: bounds.maxX, y: bounds.minY),
+            CGPoint(x: bounds.maxX, y: bounds.maxY),
+            CGPoint(x: bounds.minX, y: bounds.maxY),
+        ].map { $0.applying(canvasTransform) }
+        let topMid = CGPoint(x: (corners[0].x + corners[1].x) / 2,
+                             y: (corners[0].y + corners[1].y) / 2)
+        let rotateHandle = CGPoint(x: topMid.x, y: topMid.y - 24)
+
+        ZStack {
+            Path { path in
+                path.move(to: corners[0])
+                for corner in corners.dropFirst() { path.addLine(to: corner) }
+                path.closeSubpath()
+                path.move(to: topMid)
+                path.addLine(to: rotateHandle)
+            }
+            .stroke(Color.accentColor.opacity(0.9), lineWidth: 1)
+            .allowsHitTesting(false)
+
+            ForEach(0..<4, id: \.self) { index in
+                Circle()
+                    .fill(Color.white)
+                    .stroke(Color.accentColor, lineWidth: 1.5)
+                    .frame(width: 10, height: 10)
+                    .position(corners[index])
+                    .gesture(DragGesture(coordinateSpace: .named("multi-overlay"))
+                        .onChanged { onScaleDrag(.changed($0)) }
+                        .onEnded { _ in onScaleDrag(.ended) })
+            }
+
+            Image(systemName: "arrow.trianglehead.2.clockwise.rotate.90")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(Color.white)
+                .frame(width: 16, height: 16)
+                .background(Circle().fill(Color.accentColor))
+                .position(rotateHandle)
+                .gesture(DragGesture(coordinateSpace: .named("multi-overlay"))
+                    .onChanged { onRotateDrag(.changed($0)) }
+                    .onEnded { _ in onRotateDrag(.ended) })
+        }
+        .coordinateSpace(name: "multi-overlay")
+    }
+}
+
+private struct PathNodeOverlay: View {
+    @ObservedObject var document: PixelDocument
+    let layer: Layer
+    let config: PathConfig
+    let canvasTransform: CGAffineTransform
+    let parentAffine: CGAffineTransform
+    @Environment(\.undoManager) private var undoManager
+
+    private var fullTransform: CGAffineTransform {
+        layer.transform.affine(naturalSize: config.size)
+            .concatenating(parentAffine)
+            .concatenating(canvasTransform)
+    }
+
+    var body: some View {
+        ZStack {
+            Canvas { context, _ in
+                var handles = Path()
+                for node in config.nodes {
+                    let anchor = node.anchor.applying(fullTransform)
+                    let incoming = node.inControl.applying(fullTransform)
+                    let outgoing = node.outControl.applying(fullTransform)
+                    handles.move(to: incoming); handles.addLine(to: anchor); handles.addLine(to: outgoing)
+                }
+                context.stroke(handles, with: .color(.accentColor.opacity(0.65)), lineWidth: 1)
+            }
+            .allowsHitTesting(false)
+
+            ForEach(config.nodes) { node in
+                nodeHandle(node.anchor, size: 11, filled: true)
+                    .gesture(nodeGesture(nodeID: node.id, kind: .anchor))
+                nodeHandle(node.inControl, size: 8, filled: false)
+                    .gesture(nodeGesture(nodeID: node.id, kind: .incoming))
+                nodeHandle(node.outControl, size: 8, filled: false)
+                    .gesture(nodeGesture(nodeID: node.id, kind: .outgoing))
+            }
+        }
+        .coordinateSpace(name: "path-nodes")
+    }
+
+    private enum HandleKind { case anchor, incoming, outgoing }
+
+    private func nodeHandle(_ point: CGPoint, size: CGFloat, filled: Bool) -> some View {
+        Circle()
+            .fill(filled ? Color.accentColor : Color.white)
+            .stroke(Color.accentColor, lineWidth: 1.5)
+            .frame(width: size, height: size)
+            .position(point.applying(fullTransform))
+    }
+
+    private func nodeGesture(nodeID: UUID, kind: HandleKind) -> some Gesture {
+        DragGesture(coordinateSpace: .named("path-nodes"))
+            .onChanged { value in
+                guard fullTransform.isInvertible else { return }
+                document.beginGesture()
+                let local = value.location.applying(fullTransform.inverted())
+                document.updateDuringGesture { model in
+                    model.modifyLayer(id: layer.id) { layer in
+                        layer.modifyPath { path in
+                            guard let index = path.nodes.firstIndex(where: { $0.id == nodeID }) else { return }
+                            switch kind {
+                            case .anchor:
+                                let delta = CGVector(dx: local.x - path.nodes[index].anchor.x,
+                                                     dy: local.y - path.nodes[index].anchor.y)
+                                path.nodes[index].anchor = local
+                                path.nodes[index].inControl.x += delta.dx
+                                path.nodes[index].inControl.y += delta.dy
+                                path.nodes[index].outControl.x += delta.dx
+                                path.nodes[index].outControl.y += delta.dy
+                            case .incoming:
+                                path.nodes[index].inControl = local
+                            case .outgoing:
+                                path.nodes[index].outControl = local
+                            }
+                        }
+                    }
+                }
+            }
+            .onEnded { _ in document.endGesture(undoManager, actionName: "Edit Path Node") }
+    }
+}
+
+/// Non-destructive workspace chrome: grid, persisted guides, transient smart
+/// guides, and fixed rulers that can be dragged to create new guides.
+private struct WorkspaceOverlay: View {
+    @ObservedObject var document: PixelDocument
+    @Bindable var editorState: EditorState
+    let canvasTransform: CGAffineTransform
+    let scale: CGFloat
+    @Environment(\.undoManager) private var undoManager
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Canvas { context, _ in
+                let canvas = document.model.canvasSize
+                let rect = CGRect(origin: .zero, size: canvas).applying(canvasTransform)
+                if document.model.workspace.grid.isVisible {
+                    let grid = document.model.workspace.grid
+                    let step = max(grid.spacing / Double(max(grid.subdivisions, 1)), 1)
+                    if step * scale >= 4 {
+                        var minor = Path()
+                        var x = 0.0
+                        var count = 0
+                        while x <= canvas.width && count < 1000 {
+                            let sx = CGPoint(x: x, y: 0).applying(canvasTransform).x
+                            minor.move(to: CGPoint(x: sx, y: rect.minY))
+                            minor.addLine(to: CGPoint(x: sx, y: rect.maxY))
+                            x += step; count += 1
+                        }
+                        var y = 0.0; count = 0
+                        while y <= canvas.height && count < 1000 {
+                            let sy = CGPoint(x: 0, y: y).applying(canvasTransform).y
+                            minor.move(to: CGPoint(x: rect.minX, y: sy))
+                            minor.addLine(to: CGPoint(x: rect.maxX, y: sy))
+                            y += step; count += 1
+                        }
+                        context.stroke(minor, with: .color(.primary.opacity(0.13)), lineWidth: 0.5)
+                    }
+                }
+
+                var guidePath = Path()
+                for guide in document.model.workspace.guides {
+                    if guide.orientation == .vertical {
+                        let x = CGPoint(x: guide.position, y: 0).applying(canvasTransform).x
+                        guidePath.move(to: CGPoint(x: x, y: rect.minY))
+                        guidePath.addLine(to: CGPoint(x: x, y: rect.maxY))
+                    } else {
+                        let y = CGPoint(x: 0, y: guide.position).applying(canvasTransform).y
+                        guidePath.move(to: CGPoint(x: rect.minX, y: y))
+                        guidePath.addLine(to: CGPoint(x: rect.maxX, y: y))
+                    }
+                }
+                context.stroke(guidePath, with: .color(.blue.opacity(0.8)), lineWidth: 1)
+
+                var smart = Path()
+                if let x = editorState.smartGuideX {
+                    let sx = CGPoint(x: x, y: 0).applying(canvasTransform).x
+                    smart.move(to: CGPoint(x: sx, y: rect.minY))
+                    smart.addLine(to: CGPoint(x: sx, y: rect.maxY))
+                }
+                if let y = editorState.smartGuideY {
+                    let sy = CGPoint(x: 0, y: y).applying(canvasTransform).y
+                    smart.move(to: CGPoint(x: rect.minX, y: sy))
+                    smart.addLine(to: CGPoint(x: rect.maxX, y: sy))
+                }
+                context.stroke(smart, with: .color(.orange),
+                               style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+            }
+            .allowsHitTesting(false)
+
+            if document.model.workspace.showsRulers {
+                rulerBars
+            }
+        }
+    }
+
+    private var rulerBars: some View {
+        ZStack(alignment: .topLeading) {
+            Canvas { context, size in
+                context.fill(Path(CGRect(x: 0, y: 0, width: size.width, height: 22)),
+                             with: .color(Color(nsColor: .windowBackgroundColor).opacity(0.94)))
+                context.fill(Path(CGRect(x: 0, y: 0, width: 22, height: size.height)),
+                             with: .color(Color(nsColor: .windowBackgroundColor).opacity(0.94)))
+                let step = niceRulerStep
+                let inverse = canvasTransform.inverted()
+                let minX = CGPoint(x: 22, y: 22).applying(inverse).x
+                let maxX = CGPoint(x: size.width, y: 22).applying(inverse).x
+                var x = floor(minX / step) * step
+                while x <= maxX {
+                    let screen = CGPoint(x: x, y: 0).applying(canvasTransform).x
+                    var tick = Path()
+                    tick.move(to: CGPoint(x: screen, y: 14)); tick.addLine(to: CGPoint(x: screen, y: 22))
+                    context.stroke(tick, with: .color(.secondary), lineWidth: 0.5)
+                    context.draw(Text("\(Int(x))").font(.system(size: 8)).foregroundStyle(.secondary),
+                                 at: CGPoint(x: screen + 3, y: 7), anchor: .leading)
+                    x += step
+                }
+                let minY = CGPoint(x: 22, y: 22).applying(inverse).y
+                let maxY = CGPoint(x: 22, y: size.height).applying(inverse).y
+                var y = floor(minY / step) * step
+                while y <= maxY {
+                    let screen = CGPoint(x: 0, y: y).applying(canvasTransform).y
+                    var tick = Path()
+                    tick.move(to: CGPoint(x: 14, y: screen)); tick.addLine(to: CGPoint(x: 22, y: screen))
+                    context.stroke(tick, with: .color(.secondary), lineWidth: 0.5)
+                    y += step
+                }
+            }
+            .allowsHitTesting(false)
+
+            Color.clear.frame(height: 22)
+                .contentShape(Rectangle())
+                .gesture(DragGesture(minimumDistance: 2).onEnded { value in
+                    let canvasPoint = CGPoint(x: value.location.x, y: 22).applying(canvasTransform.inverted())
+                    addGuide(.vertical, position: canvasPoint.x)
+                })
+            Color.clear.frame(width: 22)
+                .contentShape(Rectangle())
+                .gesture(DragGesture(minimumDistance: 2).onEnded { value in
+                    let canvasPoint = CGPoint(x: 22, y: value.location.y).applying(canvasTransform.inverted())
+                    addGuide(.horizontal, position: canvasPoint.y)
+                })
+        }
+    }
+
+    private var niceRulerStep: CGFloat {
+        let desired = 80 / max(scale, 0.0001)
+        let magnitude = pow(10, floor(log10(desired)))
+        let normalized = desired / magnitude
+        let factor: CGFloat = normalized < 2 ? 2 : (normalized < 5 ? 5 : 10)
+        return factor * magnitude
+    }
+
+    private func addGuide(_ orientation: GuideOrientation, position: CGFloat) {
+        let maximum = orientation == .vertical
+            ? document.model.canvasSize.width : document.model.canvasSize.height
+        guard position >= 0, position <= maximum else { return }
+        document.update(undoManager, actionName: "Add Guide") {
+            $0.workspace.guides.append(CanvasGuide(orientation: orientation, position: position))
+        }
+    }
+}
+
+private struct NavigatorView: View {
+    @ObservedObject var document: PixelDocument
+    let renderStore: RenderStore
+    let canvasTransform: CGAffineTransform
+    let viewportSize: CGSize
+    let zoomScale: CGFloat
+    @Binding var pan: CGSize
+    @State private var preview: CGImage?
+    @State private var isHovering = false
+    @Environment(\.undoManager) private var undoManager
+
+    private var previewSize: CGSize {
+        let canvas = document.model.canvasSize
+        let ratio = canvas.width / max(canvas.height, 1)
+        return ratio >= 1
+            ? CGSize(width: 160, height: max(44, 160 / ratio))
+            : CGSize(width: max(44, 160 * ratio), height: 160)
+    }
+
+    var body: some View {
+        VStack {
+            Spacer()
+            HStack {
+                GeometryReader { geometry in
+                    ZStack {
+                        if let preview {
+                            Image(decorative: preview, scale: 1)
+                                .resizable()
+                                .frame(width: geometry.size.width, height: geometry.size.height)
+                        }
+                        Path { path in path.addRect(viewportRect(in: geometry.size)) }
+                            .stroke(Color.accentColor, lineWidth: 1.5)
+
+                        VStack {
+                            HStack {
+                                Spacer()
+                                Button {
+                                    document.update(undoManager, actionName: "Hide Navigator") {
+                                        $0.workspace.showsNavigator = false
+                                    }
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .symbolRenderingMode(.hierarchical)
+                                }
+                                .buttonStyle(.plain)
+                                .help("Hide navigator")
+                            }
+                            Spacer()
+                        }
+                        .padding(5)
+                        .opacity(isHovering ? 1 : 0)
+                        .allowsHitTesting(isHovering)
+                    }
+                    .contentShape(Rectangle())
+                    .gesture(DragGesture(minimumDistance: 0).onChanged { value in
+                        centerViewport(on: value.location, miniSize: geometry.size)
+                    })
+                }
+                .frame(width: previewSize.width, height: previewSize.height)
+                .background(Color.black.opacity(0.35))
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(.separator))
+                .clipShape(RoundedRectangle(cornerRadius: 5))
+                .onHover { isHovering = $0 }
+                .animation(.easeInOut(duration: 0.15), value: isHovering)
+                .padding(.leading, document.model.workspace.showsRulers ? 30 : 12)
+                .padding(.bottom, 12)
+                Spacer()
+            }
+        }
+        .task(id: document.model.hashValue) { refreshPreview() }
+    }
+
+    private func refreshPreview() {
+        let items = renderStore.renderItems(model: document.model, quality: .preview)
+        preview = PNGExporter.render(items: items, background: document.model.background,
+                                     canvasSize: document.model.canvasSize,
+                                     targetPixelSize: previewSize)
+    }
+
+    private func viewportRect(in mini: CGSize) -> CGRect {
+        guard canvasTransform.isInvertible else { return .zero }
+        let inverse = canvasTransform.inverted()
+        let visible = CGRect(x: 0, y: 0, width: viewportSize.width, height: viewportSize.height)
+            .applying(inverse)
+            .intersection(CGRect(origin: .zero, size: document.model.canvasSize))
+        let sx = mini.width / document.model.canvasSize.width
+        let sy = mini.height / document.model.canvasSize.height
+        return CGRect(x: visible.minX * sx, y: visible.minY * sy,
+                      width: visible.width * sx, height: visible.height * sy)
+    }
+
+    private func centerViewport(on point: CGPoint, miniSize: CGSize) {
+        let canvas = document.model.canvasSize
+        let canvasPoint = CGPoint(x: point.x / miniSize.width * canvas.width,
+                                  y: point.y / miniSize.height * canvas.height)
+        pan = CGSize(width: zoomScale * (canvas.width / 2 - canvasPoint.x),
+                     height: zoomScale * (canvas.height / 2 - canvasPoint.y))
+    }
+}
+
+/// Transparent AppKit event bridge. It does not steal hit testing from the
+/// SwiftUI tool overlays; local monitors are filtered to this view's window
+/// and bounds and provide pressure, tilt, timestamps, and precise scrolling.
+private struct PointerEventBridge: NSViewRepresentable {
+    let onPointer: (PointerSample) -> Void
+    let onScroll: (CGFloat, CGFloat, CGPoint, NSEvent.ModifierFlags) -> Void
+
+    final class EventView: NSView {
+        override var isFlipped: Bool { true }
+    }
+
+    final class Coordinator {
+        var onPointer: (PointerSample) -> Void
+        var onScroll: (CGFloat, CGFloat, CGPoint, NSEvent.ModifierFlags) -> Void
+        weak var view: NSView?
+        var pointerMonitor: Any?
+        var scrollMonitor: Any?
+
+        init(onPointer: @escaping (PointerSample) -> Void,
+             onScroll: @escaping (CGFloat, CGFloat, CGPoint, NSEvent.ModifierFlags) -> Void) {
+            self.onPointer = onPointer
+            self.onScroll = onScroll
+        }
+
+        func attach(to view: NSView) {
+            self.view = view
+            pointerMonitor = NSEvent.addLocalMonitorForEvents(
+                matching: [.mouseMoved, .leftMouseDragged, .tabletPoint, .pressure]) { [weak self] event in
+                guard let self, let view = self.view,
+                      event.window === view.window else { return event }
+                let location = view.convert(event.locationInWindow, from: nil)
+                guard view.bounds.contains(location) else { return event }
+                let pressure = event.pressure > 0 ? Double(event.pressure) : 1
+                let tilt = event.type == .tabletPoint
+                    ? CGSize(width: event.tilt.x, height: event.tilt.y) : .zero
+                self.onPointer(PointerSample(location: location, pressure: pressure,
+                                             tilt: tilt, timestamp: event.timestamp))
+                return event
+            }
+            scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                guard let self, let view = self.view,
+                      event.window === view.window else { return event }
+                let location = view.convert(event.locationInWindow, from: nil)
+                guard view.bounds.contains(location) else { return event }
+                self.onScroll(event.scrollingDeltaX, event.scrollingDeltaY, location,
+                              event.modifierFlags.union(NSEvent.modifierFlags))
+                return nil
+            }
+        }
+
+        func detach() {
+            if let pointerMonitor { NSEvent.removeMonitor(pointerMonitor) }
+            if let scrollMonitor { NSEvent.removeMonitor(scrollMonitor) }
+            pointerMonitor = nil
+            scrollMonitor = nil
+        }
+
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onPointer: onPointer, onScroll: onScroll)
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = EventView()
+        context.coordinator.attach(to: view)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.onPointer = onPointer
+        context.coordinator.onScroll = onScroll
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.detach()
     }
 }

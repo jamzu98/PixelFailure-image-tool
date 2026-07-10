@@ -27,7 +27,7 @@ struct ShapeInspector: View {
             }
             if config.kind == .polygon || config.kind == .star {
                 LabeledContent("Sides: \(config.sides)") {
-                    Slider(value: Binding(
+                    NumericSlider(value: Binding(
                         get: { Double(config.sides) },
                         set: { newValue in
                             document.updateDuringGesture { model in
@@ -36,7 +36,7 @@ struct ShapeInspector: View {
                                 }
                             }
                         }
-                    ), in: 3...16) { editing in
+                    ), range: 3...16, defaultValue: 6, step: 1, fractionDigits: 0) { editing in
                         if editing { document.beginGesture() } else { document.endGesture(undoManager, actionName: "Sides") }
                     }
                 }
@@ -88,7 +88,7 @@ struct ShapeInspector: View {
 
     private func sizeSlider(_ label: String, keyPath: WritableKeyPath<CGSize, CGFloat>) -> some View {
         LabeledContent("\(label): \(Int(config.size[keyPath: keyPath]))") {
-            Slider(value: Binding(
+            NumericSlider(value: Binding(
                 get: { Double(config.size[keyPath: keyPath]) },
                 set: { newValue in
                     document.updateDuringGesture { model in
@@ -97,7 +97,7 @@ struct ShapeInspector: View {
                         }
                     }
                 }
-            ), in: 16...4000) { editing in
+            ), range: 16...4000, defaultValue: 800, fractionDigits: 0) { editing in
                 if editing { document.beginGesture() } else { document.endGesture(undoManager, actionName: label) }
             }
         }
@@ -106,7 +106,7 @@ struct ShapeInspector: View {
     private func gestureSlider(_ label: String, value: Double, range: ClosedRange<Double>,
                                apply: @escaping (inout ShapeConfig, Double) -> Void) -> some View {
         LabeledContent(label) {
-            Slider(value: Binding(
+            NumericSlider(value: Binding(
                 get: { value },
                 set: { newValue in
                     document.updateDuringGesture { model in
@@ -115,9 +115,18 @@ struct ShapeInspector: View {
                         }
                     }
                 }
-            ), in: range) { editing in
+            ), range: range, defaultValue: shapeDefault(for: label)) { editing in
                 if editing { document.beginGesture() } else { document.endGesture(undoManager, actionName: label) }
             }
+        }
+    }
+
+    private func shapeDefault(for label: String) -> Double {
+        switch label {
+        case "Corner Radius": 0.12
+        case "Inner Radius": 0.45
+        case "Stroke Width": 12
+        default: 0
         }
     }
 

@@ -18,6 +18,8 @@ targets:
     platform: macOS
     sources:
       - PixelFailure
+    dependencies:
+      - target: PixelFailureQuickLook
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.pixelfailure.app
@@ -45,3 +47,18 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.pixelfailure.tests
         GENERATE_INFOPLIST_FILE: "YES"
+
+  PixelFailureQuickLook:
+    type: app-extension
+    platform: macOS
+    sources:
+      - QuickLookExtension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pixelfailure.app.quicklook
+        INFOPLIST_FILE: QuickLookExtension/Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
+        SKIP_INSTALL: "YES"
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated

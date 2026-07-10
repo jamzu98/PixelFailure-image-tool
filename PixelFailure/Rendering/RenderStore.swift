@@ -1,6 +1,7 @@
 import CoreGraphics
 import Foundation
 import ImageIO
+import SwiftUI
 
 /// A layer mask ready for each renderer: alpha for Core Graphics/Canvas
 /// clipping, luminance (grayscale) for SVG's luminance-based masks.
@@ -29,6 +30,8 @@ struct RenderItem: Identifiable {
     var naturalSize: CGSize
     var content: Content
     var mask: RenderMask?
+    var styles: [LayerStyle] = []
+    var svgWarning: String? = nil
 }
 
 enum RenderQuality {
@@ -69,18 +72,16 @@ final class RenderStore {
     // MARK: - Public
 
     func renderItems(model: ProjectModel, quality: RenderQuality) -> [RenderItem] {
-        model.layers.compactMap { layer in
-            guard layer.isVisible else { return nil }
-            return renderItem(for: layer, model: model, quality: quality)
-        }
+        resolve(layers: model.layers, model: model, quality: quality)
     }
 
     func naturalSize(for layer: Layer, model: ProjectModel) -> CGSize {
         switch layer.kind {
-        case .pattern, .fill, .group: model.canvasSize
+        case .pattern, .fill, .group, .adjustment: model.canvasSize
         case .image(let config): config.croppedPixelSize
         case .text: primitivesResult(for: layer, model: model).naturalSize
         case .shape(let config): config.size
+        case .path(let config): config.size
         }
     }
 
@@ -171,10 +172,71 @@ final class RenderStore {
 
     // MARK: - Layer resolution
 
+    private func resolve(layers: [Layer], model: ProjectModel,
+                         quality: RenderQuality) -> [RenderItem] {
+        var resolved: [RenderItem] = []
+        for layer in layers where layer.isVisible {
+            if case .adjustment(let config) = layer.kind {
+                guard !resolved.isEmpty,
+                      let base = canvasRaster(items: resolved, model: model, quality: quality) else { continue }
+                let adjusted = EffectPipeline.shared.apply(effects: config.effects, to: base,
+                                                           palette: model.palette)
+                resolved.append(RenderItem(
+                    id: layer.id, opacity: layer.opacity, blendMode: layer.blendMode,
+                    transform: .identity, naturalSize: model.canvasSize,
+                    content: .raster(adjusted), mask: renderMask(for: layer, model: model),
+                    styles: layer.styles,
+                    svgWarning: "Adjustment layer rendered as a raster overlay."))
+                continue
+            }
+            guard var item = renderItem(for: layer, model: model, quality: quality) else { continue }
+            item.styles = layer.styles
+            if layer.clipsToBelow, let base = resolved.last,
+               let clipped = clippedCanvas(item: item, base: base, model: model, quality: quality) {
+                item = RenderItem(id: layer.id, opacity: 1, blendMode: .normal,
+                                  transform: .identity, naturalSize: model.canvasSize,
+                                  content: .raster(clipped), mask: nil,
+                                  svgWarning: "Clipping mask rendered as a raster overlay.")
+            }
+            resolved.append(item)
+        }
+        return resolved
+    }
+
+    private func targetSize(model: ProjectModel, quality: RenderQuality) -> CGSize {
+        guard let cap = quality.maxRasterDimension else { return model.canvasSize }
+        let scale = min(1, Double(cap) / Double(max(model.canvasSize.width, model.canvasSize.height)))
+        return CGSize(width: max(8, (model.canvasSize.width * scale).rounded()),
+                      height: max(8, (model.canvasSize.height * scale).rounded()))
+    }
+
+    private func canvasRaster(items: [RenderItem], model: ProjectModel,
+                              quality: RenderQuality) -> CGImage? {
+        PNGExporter.render(items: items, background: .clear,
+                           canvasSize: model.canvasSize,
+                           targetPixelSize: targetSize(model: model, quality: quality))
+    }
+
+    private func clippedCanvas(item: RenderItem, base: RenderItem,
+                               model: ProjectModel, quality: RenderQuality) -> CGImage? {
+        guard let foreground = canvasRaster(items: [item], model: model, quality: quality),
+              let alphaBase = canvasRaster(items: [base], model: model, quality: quality) else { return nil }
+        let width = foreground.width, height = foreground.height
+        guard let context = CGContext(data: nil, width: width, height: height,
+                                      bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        let rect = CGRect(x: 0, y: 0, width: width, height: height)
+        context.draw(foreground, in: rect)
+        context.setBlendMode(.destinationIn)
+        context.draw(alphaBase, in: rect)
+        return context.makeImage()
+    }
+
     private func renderItem(for layer: Layer, model: ProjectModel, quality: RenderQuality) -> RenderItem? {
-        let mask = renderMask(for: layer)
+        let mask = renderMask(for: layer, model: model)
         switch layer.kind {
-        case .pattern, .text, .shape:
+        case .pattern, .text, .shape, .path:
             let result = primitivesResult(for: layer, model: model)
             return RenderItem(id: layer.id,
                               opacity: layer.opacity,
@@ -202,10 +264,7 @@ final class RenderStore {
                               content: .fill(config),
                               mask: mask)
         case .group(let config):
-            let children = config.children.compactMap { child -> RenderItem? in
-                guard child.isVisible else { return nil }
-                return renderItem(for: child, model: model, quality: quality)
-            }
+            let children = resolve(layers: config.children, model: model, quality: quality)
             return RenderItem(id: layer.id,
                               opacity: layer.opacity,
                               blendMode: layer.blendMode,
@@ -213,11 +272,13 @@ final class RenderStore {
                               naturalSize: model.canvasSize,
                               content: .group(children),
                               mask: mask)
+        case .adjustment:
+            return nil
         }
     }
 
     /// Alpha + luminance mask images for a layer, cached by mask hash.
-    private func renderMask(for layer: Layer) -> RenderMask? {
+    private func renderMask(for layer: Layer, model: ProjectModel) -> RenderMask? {
         guard let mask = layer.mask, mask.isEnabled else { return nil }
         // Live mask painting preview.
         if let session = activePaintSession,
@@ -233,7 +294,28 @@ final class RenderStore {
         if let cached = masks[layer.id], cached.hash == hash {
             return cached.mask
         }
-        guard let grayscale = originalImage(key: mask.imageKey),
+        let grayscale: CGImage?
+        if let pattern = mask.pattern {
+            var sampler: ImageSampler?
+            if pattern.generator.generator.needsSourceImage,
+               let source = sourceImageLayer(for: pattern, model: model) {
+                sampler = self.sampler(for: source, model: model)
+            }
+            let palette = Palette(name: "Mask", hex: ["#000000", "#FFFFFF", "#777777", "#CCCCCC", "#333333"])
+            let context = GeneratorContext(size: mask.pixelSize, palette: palette, sampler: sampler)
+            let primitives = pattern.generator.generator.generate(params: pattern.params,
+                                                                  seed: pattern.seed,
+                                                                  context: context)
+            let item = RenderItem(id: layer.id, opacity: 1, blendMode: .normal,
+                                  transform: .identity, naturalSize: mask.pixelSize,
+                                  content: .primitives(primitives), mask: nil)
+            grayscale = PNGExporter.render(items: [item], background: .black,
+                                           canvasSize: mask.pixelSize,
+                                           targetPixelSize: mask.pixelSize)
+        } else {
+            grayscale = originalImage(key: mask.imageKey)
+        }
+        guard let grayscale,
               let images = EffectPipeline.shared.maskImages(from: grayscale, inverted: mask.inverted) else {
             return nil
         }
@@ -268,11 +350,18 @@ final class RenderStore {
             return (prims, model.canvasSize)
 
         case .text(let config):
+            var textPath: Path?
+            if let pathID = config.pathLayerID,
+               let pathLayer = model.layer(id: pathID),
+               let pathConfig = pathLayer.pathConfig {
+                hasher.combine(pathLayer.kind)
+                textPath = PathGeometry.path(for: pathConfig)
+            }
             let hash = hasher.finalize()
             if let cached = primitives[layer.id], cached.hash == hash {
                 return (cached.primitives, cached.naturalSize)
             }
-            let result = TextOutliner.render(config)
+            let result = TextOutliner.render(config, path: textPath)
             primitives[layer.id] = (hash, result.primitives, result.size)
             return (result.primitives, result.size)
 
@@ -285,7 +374,16 @@ final class RenderStore {
             primitives[layer.id] = (hash, prims, config.size)
             return (prims, config.size)
 
-        case .image, .fill, .group:
+        case .path(let config):
+            let hash = hasher.finalize()
+            if let cached = primitives[layer.id], cached.hash == hash {
+                return (cached.primitives, cached.naturalSize)
+            }
+            let prims = PathGeometry.primitives(for: config)
+            primitives[layer.id] = (hash, prims, config.size)
+            return (prims, config.size)
+
+        case .image, .fill, .group, .adjustment:
             return ([], .zero)
         }
     }
