@@ -100,6 +100,14 @@ enum SVGExporter {
             body += "<g mask=\"url(#\(maskID))\">\n"
         }
 
+        if item.clipsToBounds {
+            let clipID = "bounds\(index)"
+            let width = fmt(Double(item.naturalSize.width))
+            let height = fmt(Double(item.naturalSize.height))
+            defs += "<clipPath id=\"\(clipID)\" clipPathUnits=\"userSpaceOnUse\"><rect width=\"\(width)\" height=\"\(height)\"/></clipPath>\n"
+            body += "<g clip-path=\"url(#\(clipID))\">\n"
+        }
+
         if let deformation = item.deformation {
             for (triangleIndex, triangle) in deformation.triangles(size: item.naturalSize).enumerated() {
                 guard let map = triangle.affine else { continue }
@@ -118,6 +126,7 @@ enum SVGExporter {
                                    defs: &defs, idCounter: &idCounter)
         }
 
+        if item.clipsToBounds { body += "</g>\n" }
         if item.mask != nil {
             body += "</g>\n"
         }

@@ -29,6 +29,7 @@ struct RenderItem: Identifiable {
     var transform: CGAffineTransform
     var naturalSize: CGSize
     var content: Content
+    var clipsToBounds = false
     var deformation: LayerDeformation? = nil
     var mask: RenderMask?
     var styles: [LayerStyle] = []
@@ -68,12 +69,31 @@ nonisolated struct ViewportInvalidation: Equatable, Sendable {
 /// Per-document render cache: decoded images, resolved effect chains,
 /// generated primitives. Owned by the editor window; all main-actor.
 final class RenderStore: ObservableObject {
+    private struct RasterCacheKey: Hashable {
+        let layerID: UUID
+        let quality: RenderQuality
+    }
+
+    private struct SceneCacheKey: Hashable {
+        let modelHash: Int
+        let quality: RenderQuality
+    }
+
     private unowned let document: PixelDocument
 
     @Published private(set) var viewportInvalidation: ViewportInvalidation = .initial
 
     private var decodedImages: [String: CGImage] = [:]
-    private var previewImages: [UUID: (hash: Int, image: CGImage)] = [:]
+    /// Resolved image content is retained independently at every viewport tier.
+    /// A proxy request must never evict the warm preview/full surface that the
+    /// next interaction or handoff needs.
+    private var resolvedImages: [RasterCacheKey: (hash: Int, image: CGImage)] = [:]
+    /// Small LRU of immutable resolved scenes. Transform interaction can borrow
+    /// the exact scene already supplied to the tiled renderer and update only
+    /// affine matrices instead of resolving/rasterizing content on pointer-down.
+    private var sceneCache: [SceneCacheKey: [RenderItem]] = [:]
+    private var sceneCacheOrder: [SceneCacheKey] = []
+    private let sceneCacheLimit = 12
     private var primitives: [UUID: (hash: Int, primitives: [VectorPrimitive], naturalSize: CGSize)] = [:]
     private var samplers: [UUID: (hash: Int, sampler: ImageSampler)] = [:]
     private var masks: [UUID: (hash: Int, mask: RenderMask)] = [:]
@@ -91,7 +111,45 @@ final class RenderStore: ObservableObject {
     // MARK: - Public
 
     func renderItems(model: ProjectModel, quality: RenderQuality) -> [RenderItem] {
-        resolve(layers: model.layers, model: model, quality: quality)
+        // Live paint is intentionally absent from ProjectModel, so it must not
+        // read or populate a model-keyed scene entry.
+        guard activePaintSession == nil else {
+            return resolve(layers: model.layers, model: model, quality: quality)
+        }
+        let key = SceneCacheKey(modelHash: model.hashValue, quality: quality)
+        if let cached = sceneCache[key] {
+            touchScene(key)
+            return cached
+        }
+        let items = resolve(layers: model.layers, model: model, quality: quality)
+        storeScene(items, for: key)
+        return items
+    }
+
+    /// Resolves an immediate paint preview without changing which paint surface
+    /// the retained tiled renderer will use for its document snapshot.
+    func renderItems(model: ProjectModel, quality: RenderQuality,
+                     overridingWith paintSession: PaintSession) -> [RenderItem] {
+        let previous = activePaintSession
+        activePaintSession = paintSession
+        defer { activePaintSession = previous }
+        return resolve(layers: model.layers, model: model, quality: quality)
+    }
+
+    /// Returns only an already-resolved scene; it never decodes, downsamples,
+    /// runs effects, or rasterizes. This is safe to call from pointer handlers.
+    func cachedRenderItems(model: ProjectModel,
+                           preferredQualities: [RenderQuality] = [.preview, .proxy, .full]) -> [RenderItem]? {
+        guard activePaintSession == nil else { return nil }
+        let modelHash = model.hashValue
+        for quality in preferredQualities {
+            let key = SceneCacheKey(modelHash: modelHash, quality: quality)
+            if let cached = sceneCache[key] {
+                touchScene(key)
+                return cached
+            }
+        }
+        return nil
     }
 
     func naturalSize(for layer: Layer, model: ProjectModel) -> CGSize {
@@ -115,9 +173,18 @@ final class RenderStore: ObservableObject {
         return image
     }
 
+    /// Installs an image that is already resident (notably a finished paint
+    /// buffer) under its persisted key. Publishing that key can then render
+    /// immediately without an encode/decode round trip on the main actor.
+    func adoptOriginalImage(_ image: CGImage, for key: String) {
+        decodedImages[key] = image
+    }
+
     /// Drops content caches; decoded originals stay (they never change per key).
     func invalidateResolved() {
-        previewImages.removeAll()
+        resolvedImages.removeAll()
+        sceneCache.removeAll()
+        sceneCacheOrder.removeAll()
         primitives.removeAll()
         samplers.removeAll()
         masks.removeAll()
@@ -130,9 +197,21 @@ final class RenderStore: ObservableObject {
     /// redraw; structural/global and evaluated-animation changes conservatively
     /// invalidate the canvas.
     func modelDidChange(from oldModel: ProjectModel, to newModel: ProjectModel) {
-        let region = RenderInvalidationPlanner.region(from: oldModel, to: newModel) {
-            [weak self] layer, model in
-            self?.renderBounds(for: layer, model: model) ?? .zero
+        // SwiftUI may coalesce many model publications during a gesture. A
+        // single latest dirty rect cannot describe the complete path from the
+        // retained pixels to the final transform, so hand off one atomic full
+        // replacement after interactive presentation instead.
+        let oldTransforms = Dictionary(uniqueKeysWithValues: oldModel.allLayers.map { ($0.id, $0.transform) })
+        let transformChanged = newModel.allLayers.contains {
+            oldTransforms[$0.id] != nil && oldTransforms[$0.id] != $0.transform
+        }
+        let region: RenderInvalidationRegion = if document.isContinuousEditing || transformChanged {
+            .full
+        } else {
+            RenderInvalidationPlanner.region(from: oldModel, to: newModel) {
+                [weak self] layer, model in
+                self?.renderBounds(for: layer, model: model) ?? .zero
+            }
         }
         guard region != .none else { return }
         viewportInvalidation = ViewportInvalidation(
@@ -215,6 +294,16 @@ final class RenderStore: ObservableObject {
         return result
     }
 
+    /// Canvas-effect preview for a resident paint surface without leaking that
+    /// transient override into the final tiled snapshot.
+    func composite(model: ProjectModel, quality: RenderQuality,
+                   extraHash: Int, overridingWith paintSession: PaintSession) -> CGImage? {
+        let previous = activePaintSession
+        activePaintSession = paintSession
+        defer { activePaintSession = previous }
+        return composite(model: model, quality: quality, extraHash: extraHash)
+    }
+
     // MARK: - Layer resolution
 
     private func resolve(layers: [Layer], model: ProjectModel,
@@ -293,6 +382,7 @@ final class RenderStore: ObservableObject {
                               transform: layer.transform.affine(naturalSize: result.naturalSize),
                               naturalSize: result.naturalSize,
                               content: .primitives(result.primitives),
+                              clipsToBounds: layer.kind.isPattern,
                               deformation: layer.transform.deformation,
                               mask: mask)
         case .image(let config):
@@ -477,7 +567,8 @@ final class RenderStore: ObservableObject {
         hasher.combine(quality)
         let hash = hasher.finalize()
 
-        if quality.maxRasterDimension != nil, let cached = previewImages[layer.id], cached.hash == hash {
+        let cacheKey = RasterCacheKey(layerID: layer.id, quality: quality)
+        if let cached = resolvedImages[cacheKey], cached.hash == hash {
             return cached.image
         }
 
@@ -498,10 +589,22 @@ final class RenderStore: ObservableObject {
 
         let result = EffectPipeline.shared.apply(effects: config.effects, to: image, palette: model.palette)
 
-        if quality.maxRasterDimension != nil {
-            previewImages[layer.id] = (hash, result)
-        }
+        resolvedImages[cacheKey] = (hash, result)
         return result
+    }
+
+    private func storeScene(_ items: [RenderItem], for key: SceneCacheKey) {
+        sceneCache[key] = items
+        touchScene(key)
+        while sceneCacheOrder.count > sceneCacheLimit {
+            let evicted = sceneCacheOrder.removeFirst()
+            sceneCache.removeValue(forKey: evicted)
+        }
+    }
+
+    private func touchScene(_ key: SceneCacheKey) {
+        sceneCacheOrder.removeAll { $0 == key }
+        sceneCacheOrder.append(key)
     }
 
     /// Post-effects sampler for image-driven generators, so glitched/duotoned

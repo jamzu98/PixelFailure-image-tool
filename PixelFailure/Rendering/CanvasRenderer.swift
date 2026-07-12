@@ -27,6 +27,7 @@ enum CanvasRenderer {
         layerContext.drawLayer { inner in
             inner.concatenate(item.transform)
             let naturalRect = CGRect(origin: .zero, size: item.naturalSize)
+            if item.clipsToBounds { inner.clip(to: Path(naturalRect)) }
             if let deformation = item.deformation {
                 for triangle in deformation.triangles(size: item.naturalSize) {
                     guard let map = triangle.affine else { continue }

@@ -1611,7 +1611,7 @@ struct TiledViewportTests {
 
     @Test func proxyAndFullRasterCachesKeepTheirOwnResolution() throws {
         let document = PixelDocument()
-        let width = 900, height = 300
+        let width = 2_000, height = 600
         let context = try #require(ColorSettings.default.makeRGBAContext(width: width, height: height))
         context.setFillColor(RGBAColor(hex: "#D07050").cgColor)
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
@@ -1628,12 +1628,41 @@ struct TiledViewportTests {
         let proxy = try #require(store.resolvedImage(for: layer,
                                                      config: config,
                                                      model: model, quality: .proxy))
+        let preview = try #require(store.resolvedImage(for: layer,
+                                                       config: config,
+                                                       model: model, quality: .preview))
+        let proxyAgain = try #require(store.resolvedImage(for: layer,
+                                                          config: config,
+                                                          model: model, quality: .proxy))
         let full = try #require(store.resolvedImage(for: layer,
                                                     config: config,
                                                     model: model, quality: .full))
         #expect(max(proxy.width, proxy.height) == 512)
+        #expect(max(preview.width, preview.height) == 1_600)
+        #expect(proxyAgain === proxy)
         #expect(full.width == width)
         #expect(full.height == height)
+
+        _ = store.renderItems(model: model, quality: .preview)
+        _ = store.renderItems(model: model, quality: .full)
+        let interactionScene = try #require(store.cachedRenderItems(model: model))
+        let interactionItem = try #require(interactionScene.first)
+        if case .raster(let interactionImage) = interactionItem.content {
+            #expect(interactionImage === preview)
+        } else {
+            Issue.record("Expected the warm preview raster for interaction")
+        }
+    }
+
+    @Test func adoptedPaintBufferAvoidsPersistenceDecode() throws {
+        let document = PixelDocument()
+        let context = try #require(ColorSettings.default.makeRGBAContext(width: 24, height: 16))
+        context.setFillColor(RGBAColor(hex: "#C04020").cgColor)
+        context.fill(CGRect(x: 0, y: 0, width: 24, height: 16))
+        let image = try #require(context.makeImage())
+        let store = RenderStore(document: document)
+        store.adoptOriginalImage(image, for: "pending-paint.png")
+        #expect(store.originalImage(key: "pending-paint.png") === image)
     }
 
     @Test func viewportUsesRetainedLayersAndPanDoesNotRender() {
@@ -1658,6 +1687,36 @@ struct TiledViewportTests {
         #expect(sample.r > 0.75)
         #expect(sample.g < 0.35)
         #expect(sample.b < 0.25)
+    }
+
+    @Test func proceduralContentIsClippedToItsLayerBounds() throws {
+        var path = Path()
+        path.addRect(CGRect(x: -16, y: -16, width: 64, height: 64))
+        let primitive = VectorPrimitive(path: path, fill: RGBAColor(hex: "#E04020"))
+        let item = RenderItem(id: UUID(), opacity: 1, blendMode: .normal,
+                              transform: CGAffineTransform(translationX: 16, y: 16),
+                              naturalSize: CGSize(width: 32, height: 32),
+                              content: .primitives([primitive]), clipsToBounds: true,
+                              mask: nil)
+        let image = try #require(PNGExporter.render(items: [item], background: .clear,
+                                                    canvasSize: CGSize(width: 64, height: 64),
+                                                    targetPixelSize: CGSize(width: 64, height: 64)))
+        let sampler = try #require(ImageSampler(cgImage: image))
+        #expect(sampler.color(atUnitX: 0.5, y: 0.5).a > 0.9)
+        #expect(sampler.color(atUnitX: 0.1, y: 0.5).a < 0.01)
+        #expect(sampler.color(atUnitX: 0.9, y: 0.5).a < 0.01)
+    }
+
+    @Test func transformChangesForceAnAtomicFullReplacement() {
+        let document = PixelDocument()
+        let layer = Layer(name: "Moving", transform: LayerTransform(position: CGPoint(x: 80, y: 80)),
+                          kind: .shape(ShapeConfig(size: CGSize(width: 40, height: 40))))
+        let old = ProjectModel(canvasSize: CGSize(width: 300, height: 200), layers: [layer])
+        var new = old
+        new.modifyLayer(id: layer.id) { $0.transform.position.x += 50 }
+        let store = RenderStore(document: document)
+        store.modelDidChange(from: old, to: new)
+        #expect(store.viewportInvalidation.region == .full)
     }
 
     @Test func paddedTilesMatchTheMonolithicRenderAcrossASeam() throws {
@@ -1837,6 +1896,67 @@ struct TiledViewportTests {
         #expect(presented == [1, 3])
         #expect(scheduler.metrics.coalesced == 2)
         #expect(scheduler.metrics.completed == 2)
+    }
+
+    @Test func newerContentPreemptsObsoleteTileWork() async {
+        let renderer: ViewportRenderScheduler.Renderer = { request in
+            try? await Task.sleep(for: request.contentToken == 1
+                                 ? .milliseconds(180) : .milliseconds(10))
+            return TileBatch(generation: request.generation,
+                             contentToken: request.contentToken,
+                             quality: request.quality,
+                             tiles: [], submittedAt: request.submittedAt,
+                             presentationRevision: request.presentationRevision)
+        }
+        let scheduler = ViewportRenderScheduler(renderer: renderer)
+        var completedTokens: [UInt64] = []
+        scheduler.onBatch = { completedTokens.append($0.contentToken) }
+        let size = CGSize(width: 32, height: 32)
+        let snapshot = ViewportRenderSnapshot(items: [], background: .black,
+                                              canvasSize: size, workingSpace: .sRGB)
+        let spec = TileSpec(key: TileKey(level: 0, x: 0, y: 0),
+                            canvasRect: CGRect(origin: .zero, size: size), rasterScale: 1)
+        scheduler.submit(ViewportRenderRequest(generation: 1, contentToken: 1,
+                                               snapshot: snapshot, quality: .preview,
+                                               specs: [spec], submittedAt: ContinuousClock().now,
+                                               presentationRevision: 10))
+        scheduler.submit(ViewportRenderRequest(generation: 2, contentToken: 2,
+                                               snapshot: snapshot, quality: .full,
+                                               specs: [spec], submittedAt: ContinuousClock().now,
+                                               presentationRevision: 11))
+        try? await Task.sleep(for: .milliseconds(80))
+        #expect(completedTokens == [2])
+    }
+
+    @Test func handoffReadinessWaitsForDisplayFrameAndExactRevision() throws {
+        let size = CGSize(width: 32, height: 32)
+        let view = RetainedTileCanvasNSView(frame: CGRect(origin: .zero, size: size))
+        let snapshot = ViewportRenderSnapshot(items: [], background: RGBAColor(hex: "#4060D0"),
+                                              canvasSize: size, workingSpace: .sRGB)
+        let spec = TileSpec(key: TileKey(level: 0, x: 0, y: 0),
+                            canvasRect: CGRect(origin: .zero, size: size), rasterScale: 1)
+        let rendered = try #require(TileRasterizer.render(spec: spec, snapshot: snapshot)?.image)
+        var callbacks: [(RenderQuality, UInt64)] = []
+        view.onPresented = { callbacks.append(($0, $1)) }
+        view.updateContent(snapshot: snapshot, quality: .full,
+                           invalidation: .initial, transientInvalidation: .none,
+                           presentationRevision: 7)
+
+        view.presentForTesting(TileBatch(generation: 1, contentToken: 1, quality: .full,
+                                         tiles: [RenderedTile(spec: spec, image: rendered)],
+                                         submittedAt: ContinuousClock().now,
+                                         presentationRevision: 6))
+        #expect(callbacks.isEmpty)
+
+        view.presentForTesting(TileBatch(generation: 2, contentToken: 1, quality: .full,
+                                         tiles: [RenderedTile(spec: spec, image: rendered)],
+                                         submittedAt: ContinuousClock().now,
+                                         presentationRevision: 7))
+        #expect(callbacks.isEmpty)
+        view.displayFrameForTesting()
+        #expect(callbacks.count == 1)
+        #expect(callbacks.first?.0 == .full)
+        #expect(callbacks.first?.1 == 7)
     }
 
     @Test func eightyLayerLargeCanvasStillPlansALocalInvalidation() {

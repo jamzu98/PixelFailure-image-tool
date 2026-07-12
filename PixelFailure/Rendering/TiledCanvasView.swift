@@ -21,7 +21,47 @@ struct TiledCanvasView: NSViewRepresentable {
     let invalidation: ViewportInvalidation
     let transientInvalidation: TransientViewportInvalidation
     let suspendsContentUpdates: Bool
-    let onPresented: (RenderQuality) -> Void
+    let presentationRevision: UInt64
+    let onPresented: (RenderQuality, UInt64) -> Void
+
+    init(model: ProjectModel,
+         renderStore: RenderStore,
+         quality: RenderQuality,
+         canvasTransform: CGAffineTransform,
+         invalidation: ViewportInvalidation,
+         transientInvalidation: TransientViewportInvalidation,
+         presentationRevision: UInt64 = 0,
+         suspendsContentUpdates: Bool,
+         onPresented: @escaping (RenderQuality, UInt64) -> Void) {
+        self.model = model
+        self.renderStore = renderStore
+        self.quality = quality
+        self.canvasTransform = canvasTransform
+        self.invalidation = invalidation
+        self.transientInvalidation = transientInvalidation
+        self.suspendsContentUpdates = suspendsContentUpdates
+        self.presentationRevision = presentationRevision
+        self.onPresented = onPresented
+    }
+
+    /// Source-compatible bridge for callers that do not need revision-aware
+    /// presentation. New interaction handoffs should use the two-argument
+    /// callback above so an older accepted batch cannot release their overlay.
+    init(model: ProjectModel,
+         renderStore: RenderStore,
+         quality: RenderQuality,
+         canvasTransform: CGAffineTransform,
+         invalidation: ViewportInvalidation,
+         transientInvalidation: TransientViewportInvalidation,
+         suspendsContentUpdates: Bool,
+         onPresented: @escaping (RenderQuality) -> Void) {
+        self.init(model: model, renderStore: renderStore, quality: quality,
+                  canvasTransform: canvasTransform, invalidation: invalidation,
+                  transientInvalidation: transientInvalidation,
+                  presentationRevision: 0,
+                  suspendsContentUpdates: suspendsContentUpdates,
+                  onPresented: { quality, _ in onPresented(quality) })
+    }
 
     func makeNSView(context: Context) -> RetainedTileCanvasNSView {
         RetainedTileCanvasNSView()
@@ -32,7 +72,8 @@ struct TiledCanvasView: NSViewRepresentable {
         if !suspendsContentUpdates,
            view.requiresResolvedContent(invalidationRevision: invalidation.revision,
                                         quality: quality,
-                                        transientRevision: transientInvalidation.revision) {
+                                        transientRevision: transientInvalidation.revision,
+                                        presentationRevision: presentationRevision) {
             let items: [RenderItem]
             let background: RGBAColor
             if let composite = renderStore.composite(
@@ -54,7 +95,8 @@ struct TiledCanvasView: NSViewRepresentable {
             view.updateContent(snapshot: snapshot,
                                quality: quality,
                                invalidation: invalidation,
-                               transientInvalidation: transientInvalidation)
+                               transientInvalidation: transientInvalidation,
+                               presentationRevision: presentationRevision)
         }
         view.updateCanvasTransform(canvasTransform)
     }
@@ -105,16 +147,32 @@ nonisolated struct ViewportRenderRequest: @unchecked Sendable {
     let quality: RenderQuality
     let specs: [TileSpec]
     let submittedAt: ContinuousClock.Instant
+    let presentationRevision: UInt64
+
+    init(generation: UInt64, contentToken: UInt64,
+         snapshot: ViewportRenderSnapshot, quality: RenderQuality,
+         specs: [TileSpec], submittedAt: ContinuousClock.Instant,
+         presentationRevision: UInt64 = 0) {
+        self.generation = generation
+        self.contentToken = contentToken
+        self.snapshot = snapshot
+        self.quality = quality
+        self.specs = specs
+        self.submittedAt = submittedAt
+        self.presentationRevision = presentationRevision
+    }
 
     func mergingPending(_ earlier: ViewportRenderRequest) -> ViewportRenderRequest {
         guard contentToken == earlier.contentToken,
               quality == earlier.quality,
+              presentationRevision == earlier.presentationRevision,
               specs.first?.key.level == earlier.specs.first?.key.level else { return self }
         var merged = Dictionary(uniqueKeysWithValues: earlier.specs.map { ($0.key, $0) })
         for spec in specs { merged[spec.key] = spec }
         return ViewportRenderRequest(generation: generation, contentToken: contentToken,
                                      snapshot: snapshot, quality: quality,
-                                     specs: Array(merged.values), submittedAt: submittedAt)
+                                     specs: Array(merged.values), submittedAt: submittedAt,
+                                     presentationRevision: presentationRevision)
     }
 }
 
@@ -130,16 +188,19 @@ nonisolated struct TileBatch: @unchecked Sendable {
     let tiles: [RenderedTile]
     let submittedAt: ContinuousClock.Instant
     let requestedSpecs: [TileSpec]
+    let presentationRevision: UInt64
 
     init(generation: UInt64, contentToken: UInt64, quality: RenderQuality,
          tiles: [RenderedTile], submittedAt: ContinuousClock.Instant,
-         requestedSpecs: [TileSpec]? = nil) {
+         requestedSpecs: [TileSpec]? = nil,
+         presentationRevision: UInt64 = 0) {
         self.generation = generation
         self.contentToken = contentToken
         self.quality = quality
         self.tiles = tiles
         self.submittedAt = submittedAt
         self.requestedSpecs = requestedSpecs ?? tiles.map(\.spec)
+        self.presentationRevision = presentationRevision
     }
 }
 
@@ -152,9 +213,9 @@ nonisolated struct ViewportRenderMetrics: Equatable {
     var lastPresentationLatency: Duration = .zero
 }
 
-/// One active render and one newest pending render. Finishing work is allowed
-/// to present even when something newer is pending, which prevents starvation
-/// during continuous pointer input.
+/// One active render and one newest pending render. Same-content visible work
+/// is allowed to finish while newer specs coalesce, preventing starvation
+/// during panning. A new content token, quality, revision, or LOD preempts it.
 @MainActor
 final class ViewportRenderScheduler {
     typealias Renderer = @Sendable (ViewportRenderRequest) async -> TileBatch
@@ -162,6 +223,7 @@ final class ViewportRenderScheduler {
     var onBatch: ((TileBatch) -> Void)?
     private let renderer: Renderer
     private var activeTask: Task<Void, Never>?
+    private var activeRequest: ViewportRenderRequest?
     private var pending: ViewportRenderRequest?
     var metrics = ViewportRenderMetrics()
 
@@ -173,28 +235,58 @@ final class ViewportRenderScheduler {
         guard !request.specs.isEmpty else { return }
         metrics.requested += 1
         guard activeTask == nil else {
+            if let activeRequest, supersedesActive(request, active: activeRequest) {
+                activeTask?.cancel()
+                activeTask = nil
+                self.activeRequest = nil
+                pending = nil
+                start(request)
+                return
+            }
             pending = pending.map { request.mergingPending($0) } ?? request
             metrics.coalesced += 1
             return
         }
-        start(request)
+        // `onBatch` is allowed to submit synchronously. If work was already
+        // pending when the just-finished task entered that callback, consume it
+        // here so the callback's newest request wins or merges with it.
+        if let earlier = pending {
+            pending = nil
+            start(request.mergingPending(earlier))
+        } else {
+            start(request)
+        }
     }
 
     func cancel() {
         activeTask?.cancel()
         activeTask = nil
+        activeRequest = nil
         pending = nil
+    }
+
+    private func supersedesActive(_ request: ViewportRenderRequest,
+                                  active: ViewportRenderRequest) -> Bool {
+        request.contentToken != active.contentToken
+            || request.quality != active.quality
+            || request.presentationRevision != active.presentationRevision
+            || request.specs.first?.key.level != active.specs.first?.key.level
     }
 
     private func start(_ request: ViewportRenderRequest) {
         let renderer = renderer
+        activeRequest = request
         activeTask = Task { [weak self] in
             let batch = await renderer(request)
             guard let self, !Task.isCancelled else { return }
             metrics.completed += 1
-            onBatch?(batch)
+            // Mark this request finished before invoking client code. The
+            // callback may synchronously submit a newer token; clearing these
+            // afterward would accidentally erase that new active task.
             activeTask = nil
-            if let next = pending {
+            activeRequest = nil
+            onBatch?(batch)
+            if activeTask == nil, let next = pending {
                 pending = nil
                 start(next)
             }
@@ -226,7 +318,8 @@ nonisolated enum TileRasterizer {
                          quality: request.quality,
                          tiles: tiles,
                          submittedAt: request.submittedAt,
-                         requestedSpecs: request.specs)
+                         requestedSpecs: request.specs,
+                         presentationRevision: request.presentationRevision)
     }
 
     static func render(spec: TileSpec, snapshot: ViewportRenderSnapshot) -> RenderedTile? {
@@ -287,7 +380,14 @@ final class RetainedTileCanvasNSView: NSView {
         let snapshot: ViewportRenderSnapshot
         let quality: RenderQuality
         let contentToken: UInt64
+        let presentationRevision: UInt64
         var region: RenderInvalidationRegion
+    }
+
+    private struct PendingPresentation {
+        let quality: RenderQuality
+        let contentToken: UInt64
+        let presentationRevision: UInt64
     }
 
     private let canvasLayer = CALayer()
@@ -306,19 +406,22 @@ final class RetainedTileCanvasNSView: NSView {
     }()
     private var displayLink: CADisplayLink?
     private var pendingContent: PendingContent?
+    private var pendingPresentation: PendingPresentation?
     private var latestSnapshot: ViewportRenderSnapshot?
     private var latestQuality: RenderQuality = .preview
     private var latestContentToken: UInt64 = 0
+    private var latestPresentationRevision: UInt64 = 0
     private var nextGeneration: UInt64 = 0
     private var receivedInvalidationRevision: UInt64?
     private var receivedTransientRevision: UInt64?
+    private var receivedPresentationRevision: UInt64?
     private var receivedQuality: RenderQuality?
     private var pendingTransform = CGAffineTransform.identity
     private var appliedTransform = CGAffineTransform.identity
     private var desiredLevel = 0
     private var activeLevel: Int?
     private var lastVisibleKeys: Set<TileKey> = []
-    var onPresented: ((RenderQuality) -> Void)?
+    var onPresented: ((RenderQuality, UInt64) -> Void)?
 
     override var isFlipped: Bool { true }
 
@@ -367,21 +470,26 @@ final class RetainedTileCanvasNSView: NSView {
 
     func requiresResolvedContent(invalidationRevision: UInt64,
                                  quality: RenderQuality,
-                                 transientRevision: UInt64) -> Bool {
+                                 transientRevision: UInt64,
+                                 presentationRevision: UInt64 = 0) -> Bool {
         latestSnapshot == nil || receivedInvalidationRevision != invalidationRevision
             || receivedQuality != quality || receivedTransientRevision != transientRevision
+            || receivedPresentationRevision != presentationRevision
     }
 
     func updateContent(snapshot: ViewportRenderSnapshot,
                        quality: RenderQuality,
                        invalidation: ViewportInvalidation,
-                       transientInvalidation: TransientViewportInvalidation) {
+                       transientInvalidation: TransientViewportInvalidation,
+                       presentationRevision: UInt64 = 0) {
         var region = invalidation.region
         if receivedInvalidationRevision == invalidation.revision { region = .none }
         if receivedTransientRevision != transientInvalidation.revision {
             region = union(region, transientInvalidation.region)
         }
         if receivedQuality != nil, receivedQuality != quality { region = .full }
+        if receivedPresentationRevision != nil,
+           receivedPresentationRevision != presentationRevision { region = .full }
         if latestSnapshot == nil { region = .full }
 
         let canvasSizeChanged = latestSnapshot?.canvasSize != nil
@@ -393,20 +501,26 @@ final class RetainedTileCanvasNSView: NSView {
         }
 
         latestContentToken &+= 1
+        pendingPresentation = nil
         latestSnapshot = snapshot
         latestQuality = quality
+        latestPresentationRevision = presentationRevision
         receivedInvalidationRevision = invalidation.revision
         receivedTransientRevision = transientInvalidation.revision
+        receivedPresentationRevision = presentationRevision
         receivedQuality = quality
         canvasLayer.bounds = CGRect(origin: .zero, size: snapshot.canvasSize)
         for grid in gridLayers.values { grid.bounds = canvasLayer.bounds }
 
         let incoming = PendingContent(snapshot: snapshot, quality: quality,
-                                      contentToken: latestContentToken, region: region)
+                                      contentToken: latestContentToken,
+                                      presentationRevision: presentationRevision,
+                                      region: region)
         if var pending = pendingContent {
             pending.region = union(pending.region, region)
             pendingContent = PendingContent(snapshot: snapshot, quality: quality,
                                             contentToken: latestContentToken,
+                                            presentationRevision: presentationRevision,
                                             region: pending.region)
         } else {
             pendingContent = incoming
@@ -429,6 +543,7 @@ final class RetainedTileCanvasNSView: NSView {
         } else {
             submitMissingVisibleTiles()
         }
+        emitPendingPresentationIfReady()
     }
 
     private func applyPendingTransform() {
@@ -450,7 +565,9 @@ final class RetainedTileCanvasNSView: NSView {
             CATransaction.commit()
             if let snapshot = latestSnapshot {
                 pendingContent = PendingContent(snapshot: snapshot, quality: latestQuality,
-                                                contentToken: latestContentToken, region: .full)
+                                                contentToken: latestContentToken,
+                                                presentationRevision: latestPresentationRevision,
+                                                region: .full)
             }
         }
     }
@@ -470,7 +587,8 @@ final class RetainedTileCanvasNSView: NSView {
                                                snapshot: content.snapshot,
                                                quality: content.quality,
                                                specs: specs,
-                                               submittedAt: ContinuousClock().now))
+                                               submittedAt: ContinuousClock().now,
+                                               presentationRevision: content.presentationRevision))
     }
 
     private func submitMissingVisibleTiles() {
@@ -491,12 +609,14 @@ final class RetainedTileCanvasNSView: NSView {
                                                snapshot: snapshot,
                                                quality: latestQuality,
                                                specs: missing,
-                                               submittedAt: ContinuousClock().now))
+                                               submittedAt: ContinuousClock().now,
+                                               presentationRevision: latestPresentationRevision))
     }
 
     private func present(_ batch: TileBatch) {
         guard batch.contentToken == latestContentToken,
               batch.quality == latestQuality,
+              batch.presentationRevision == latestPresentationRevision,
               batch.requestedSpecs.allSatisfy({ $0.key.level == desiredLevel }) else {
             scheduler.metrics.discarded += max(1, batch.tiles.count)
             submitMissingVisibleTiles()
@@ -550,8 +670,31 @@ final class RetainedTileCanvasNSView: NSView {
         }
         scheduler.metrics.presented += 1
         scheduler.metrics.lastPresentationLatency = batch.submittedAt.duration(to: ContinuousClock().now)
-        if activeLevel == desiredLevel { onPresented?(batch.quality) }
+        pendingPresentation = PendingPresentation(
+            quality: batch.quality,
+            contentToken: batch.contentToken,
+            presentationRevision: batch.presentationRevision)
         submitMissingVisibleTiles()
+    }
+
+    /// Layer contents committed by `present` are not necessarily on screen yet.
+    /// The display-link boundary gives Core Animation a chance to display them,
+    /// and revalidating the current visible set prevents a pan or LOD change
+    /// from releasing a live interaction overlay onto gaps or stale tiles.
+    private func emitPendingPresentationIfReady() {
+        guard let pendingPresentation,
+              pendingPresentation.contentToken == latestContentToken,
+              pendingPresentation.quality == latestQuality,
+              pendingPresentation.presentationRevision == latestPresentationRevision,
+              activeLevel == desiredLevel else { return }
+        let visible = visibleSpecs(level: desiredLevel)
+        guard visible.allSatisfy({ spec in
+            tileLayers[spec.key]?.contents != nil
+                && !invalidTileKeys.contains(spec.key)
+        }) else { return }
+        self.pendingPresentation = nil
+        onPresented?(pendingPresentation.quality,
+                     pendingPresentation.presentationRevision)
     }
 
     private func install(image: CGImage, spec: TileSpec, generation: UInt64,
@@ -644,7 +787,8 @@ final class RetainedTileCanvasNSView: NSView {
                                                snapshot: snapshot,
                                                quality: quality,
                                                specs: specs,
-                                               submittedAt: ContinuousClock().now))
+                                               submittedAt: ContinuousClock().now,
+                                               presentationRevision: latestPresentationRevision))
     }
 
     private func invalidateRetainedTiles(in region: RenderInvalidationRegion) {
@@ -672,6 +816,7 @@ final class RetainedTileCanvasNSView: NSView {
         installedSpecs.removeAll()
         invalidTileKeys.removeAll()
         tileCache.removeAll()
+        pendingPresentation = nil
         activeLevel = nil
         lastVisibleKeys.removeAll()
     }

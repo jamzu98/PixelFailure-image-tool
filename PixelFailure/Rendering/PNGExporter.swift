@@ -66,6 +66,7 @@ nonisolated enum PNGExporter {
         ctx.concatenate(item.transform)
 
         let naturalRect = CGRect(origin: .zero, size: item.naturalSize)
+        if item.clipsToBounds { ctx.clip(to: naturalRect) }
         if let deformation = item.deformation {
             drawDeformed(item, deformation: deformation, naturalRect: naturalRect,
                          context: ctx, space: space)

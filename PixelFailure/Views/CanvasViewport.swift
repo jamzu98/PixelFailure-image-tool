@@ -20,10 +20,52 @@ struct CanvasViewport: View {
     @State private var paintInvalidation = TransientViewportInvalidation.none
     @State private var isHoveringViewport = false
     @State private var viewportSize: CGSize = .zero
-    @State private var viewportQuality: RenderQuality = .full
+    // Warm the interaction-sized scene first. Retaining this mip means the
+    // first transform never has to upload a native multi-megapixel texture to
+    // SwiftUI Canvas on pointer-down; idle rendering refines to full shortly.
+    @State private var viewportQuality: RenderQuality = .preview
     @State private var fullResolutionTask: Task<Void, Never>?
-    @State private var awaitingTiledHandoff = false
+    @State private var presentationRevision: UInt64 = 0
+    @State private var awaitingTiledHandoff: UInt64?
+    @State private var transformPreview: TransformPreview?
+    @State private var preparedInteractionPreview: TransformPreview?
+    @State private var interactionPreparationTask: Task<Void, Never>?
+    @State private var paintCommitTask: Task<Void, Never>?
+    @State private var isPaintStrokeActive = false
+    @State private var pendingPaintCommits: [PendingPaintCommit] = []
+    @State private var publishedPaintKeys: [PaintTargetIdentity: String] = [:]
     @FocusState private var isFocused: Bool
+
+    private struct TransformPreview: @unchecked Sendable {
+        let items: [RenderItem]
+        let layerIDs: Set<UUID>
+        let sourceModelHash: Int
+    }
+
+    private struct SendableImage: @unchecked Sendable {
+        let value: CGImage
+    }
+
+    private enum PaintTargetIdentity: Hashable {
+        case content(UUID)
+        case mask(UUID)
+    }
+
+    private struct PendingPaintCommit: Identifiable {
+        let id = UUID()
+        let target: PaintSession.Target
+        let identity: PaintTargetIdentity
+        let image: CGImage
+        let expectedImageKey: String?
+        let actionName: String
+    }
+
+    private struct MultiTransformEntry {
+        let id: UUID
+        let local: LayerTransform
+        let world: LayerTransform
+        let parent: CGAffineTransform
+    }
 
     private enum DragMode {
         /// Moves every entry: start position plus the inverse linear part of
@@ -32,9 +74,9 @@ struct CanvasViewport: View {
         case pan(startPan: CGSize)
         case scale(layerID: UUID, startScale: Double, startDistance: CGFloat)
         case rotate(layerID: UUID, startRotation: Double, startAngle: Double)
-        case multiScale(entries: [(id: UUID, world: LayerTransform, parent: CGAffineTransform)],
+        case multiScale(entries: [MultiTransformEntry],
                         center: CGPoint, startDistance: CGFloat)
-        case multiRotate(entries: [(id: UUID, world: LayerTransform, parent: CGAffineTransform)],
+        case multiRotate(entries: [MultiTransformEntry],
                          center: CGPoint, startAngle: Double)
         case paint
         case marquee(startCanvasPoint: CGPoint)
@@ -79,20 +121,21 @@ struct CanvasViewport: View {
                                 canvasTransform: canvasTransform,
                                 invalidation: renderStore.viewportInvalidation,
                                 transientInvalidation: transientInvalidation,
-                                suspendsContentUpdates: isDirectlyTransforming,
-                                onPresented: { quality in
-                                    guard awaitingTiledHandoff,
+                                presentationRevision: presentationRevision,
+                                suspendsContentUpdates: isDirectlyTransforming || isPainting,
+                                onPresented: { quality, revision in
+                                    guard awaitingTiledHandoff == revision,
                                           !isDirectlyTransforming,
-                                          quality != .proxy else { return }
-                                    awaitingTiledHandoff = false
+                                          !isPainting,
+                                          quality == .full else { return }
+                                    finishTiledHandoff()
                                 })
                 .opacity(usesImmediateTransformPreview ? 0 : 1)
                 .allowsHitTesting(false)
 
                 if usesImmediateTransformPreview {
-                    immediateTransformPreview(model: displayModel,
-                                              canvasTransform: canvasTransform,
-                                              quality: isDirectlyTransforming ? .proxy : .preview)
+                    interactionPreview(model: displayModel,
+                                       canvasTransform: canvasTransform)
                         .allowsHitTesting(false)
                 }
 
@@ -241,6 +284,7 @@ struct CanvasViewport: View {
                 // Tool switched by shortcut while hovering: update immediately
                 // instead of waiting for the next mouse move.
                 setCursor(cursor(at: hoverLocation, canvasTransform: canvasTransform, scale: scale))
+                scheduleInteractionPreparation()
             }
             .onModifierKeysChanged(mask: .option) { _, _ in
                 // Modifier presses don't produce hover events; refresh so the
@@ -282,11 +326,27 @@ struct CanvasViewport: View {
         .onChange(of: isPainting) { _, _ in updateViewportQuality() }
         .onChange(of: editorState.isAnimationPlaying) { _, _ in updateViewportQuality() }
         .onChange(of: editorState.isAnimationScrubbing) { _, _ in updateViewportQuality() }
-        .onDisappear { fullResolutionTask?.cancel() }
+        .onChange(of: editorState.selectedLayerIDs) { _, _ in scheduleInteractionPreparation() }
+        .onChange(of: document.model) { _, _ in scheduleInteractionPreparation() }
+        .onAppear {
+            updateViewportQuality()
+            scheduleInteractionPreparation()
+        }
+        .onDisappear {
+            fullResolutionTask?.cancel()
+            interactionPreparationTask?.cancel()
+        }
     }
 
     private func updateViewportQuality() {
         fullResolutionTask?.cancel()
+        // A direct interaction already has a stable front surface. Render the
+        // one native-resolution replacement behind it and swap once, instead
+        // of exposing proxy -> preview -> full as three visible transitions.
+        if awaitingTiledHandoff != nil {
+            viewportQuality = .full
+            return
+        }
         let active = document.isContinuousEditing || isPainting
             || editorState.isAnimationPlaying || editorState.isAnimationScrubbing
         if active {
@@ -313,31 +373,153 @@ struct CanvasViewport: View {
     }
 
     private var usesImmediateTransformPreview: Bool {
-        isDirectlyTransforming || awaitingTiledHandoff
+        isDirectlyTransforming || isPainting || awaitingTiledHandoff != nil
+            || transformPreview != nil || paintSession != nil
     }
 
     @ViewBuilder
-    private func immediateTransformPreview(model: ProjectModel,
-                                           canvasTransform: CGAffineTransform,
-                                           quality: RenderQuality) -> some View {
-        if let composite = renderStore.composite(model: model, quality: quality) {
+    private func interactionPreview(model: ProjectModel,
+                                    canvasTransform: CGAffineTransform) -> some View {
+        let effectComposite: CGImage? = if let paintSession {
+            renderStore.composite(
+                model: model, quality: .proxy,
+                extraHash: Int(truncatingIfNeeded: paintInvalidation.revision),
+                overridingWith: paintSession)
+        } else {
+            renderStore.composite(model: model, quality: .proxy)
+        }
+        if let effectComposite {
             Canvas { context, _ in
                 context.concatenate(canvasTransform)
                 let canvasRect = CGRect(origin: .zero, size: model.canvasSize)
                 var clipped = context
                 clipped.clip(to: Path(canvasRect))
-                clipped.draw(Image(decorative: composite, scale: 1), in: canvasRect)
+                clipped.draw(Image(decorative: effectComposite, scale: 1), in: canvasRect)
             }
-        } else {
-            let items = renderStore.renderItems(model: model, quality: quality)
+        } else if let preview = transformPreview {
+            let items = applyingCurrentTransforms(to: preview.items,
+                                                  layerIDs: preview.layerIDs,
+                                                  model: model)
             Canvas { context, _ in
                 context.concatenate(canvasTransform)
-                CanvasRenderer.draw(items: items,
-                                    background: model.background,
-                                    canvasSize: model.canvasSize,
-                                    in: context,
+                CanvasRenderer.draw(items: items, background: model.background,
+                                    canvasSize: model.canvasSize, in: context,
                                     space: model.colorSettings.workingSpace)
             }
+        } else {
+            // Keep the already-warm preview mip during interaction. Switching
+            // to proxy on pointer-down used to evict preview content and force
+            // synchronous downsampling/effects before the first visual update.
+            let quality: RenderQuality = isDirectlyTransforming
+                && !canUseRetainedTransformScene(model) ? .proxy : .preview
+            let items = if let paintSession {
+                renderStore.renderItems(model: model, quality: quality,
+                                        overridingWith: paintSession)
+            } else {
+                renderStore.renderItems(model: model, quality: quality)
+            }
+            Canvas { context, _ in
+                context.concatenate(canvasTransform)
+                CanvasRenderer.draw(items: items, background: model.background,
+                                    canvasSize: model.canvasSize, in: context,
+                                    space: model.colorSettings.workingSpace)
+            }
+        }
+    }
+
+    private func beginTransformPreview(ids: Set<UUID>) {
+        let ids = Set(ids.filter { document.model.layer(id: $0) != nil })
+        guard !ids.isEmpty else { return }
+        interactionPreparationTask?.cancel()
+        awaitingTiledHandoff = nil
+        // If a paint commit is still represented by the live buffer, the
+        // direct scene path below must keep that buffer in the composition.
+        guard paintSession == nil else {
+            transformPreview = nil
+            return
+        }
+        let sourceModelHash = document.model.hashValue
+        if let prepared = preparedInteractionPreview,
+           prepared.layerIDs == ids,
+           prepared.sourceModelHash == sourceModelHash {
+            transformPreview = prepared
+            return
+        }
+        // Pointer handlers may borrow a scene that the tile renderer already
+        // resolved, but never create one. A cold miss falls back to the live
+        // Canvas path above without doing bitmap work inside this event.
+        if canUseRetainedTransformScene(document.model),
+           let items = renderStore.cachedRenderItems(model: document.model) {
+            transformPreview = TransformPreview(items: items, layerIDs: ids,
+                                                sourceModelHash: sourceModelHash)
+        } else {
+            transformPreview = nil
+        }
+    }
+
+    /// Records the immutable scene already produced by the retained renderer.
+    /// There is deliberately no decode, effect pass, or rasterization here.
+    private func scheduleInteractionPreparation() {
+        interactionPreparationTask?.cancel()
+        guard !isDirectlyTransforming, !isPainting, awaitingTiledHandoff == nil,
+              animationTime == nil else { return }
+
+        interactionPreparationTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(60))
+            guard !Task.isCancelled, !isDirectlyTransforming, !isPainting,
+                  awaitingTiledHandoff == nil else { return }
+
+            let source = document.model
+            let ids = Set(editorState.selectedLayerIDs.filter { source.layer(id: $0) != nil })
+            guard !ids.isEmpty, canUseRetainedTransformScene(source),
+                  let items = renderStore.cachedRenderItems(model: source) else {
+                preparedInteractionPreview = nil
+                return
+            }
+            let sourceModelHash = source.hashValue
+            guard !Task.isCancelled, document.model.hashValue == sourceModelHash,
+                  editorState.selectedLayerIDs == ids else { return }
+            preparedInteractionPreview = TransformPreview(items: items, layerIDs: ids,
+                                                          sourceModelHash: sourceModelHash)
+        }
+    }
+
+    private func beginTiledHandoff() {
+        fullResolutionTask?.cancel()
+        interactionPreparationTask?.cancel()
+        presentationRevision &+= 1
+        awaitingTiledHandoff = presentationRevision
+        viewportQuality = .full
+    }
+
+    private func finishTiledHandoff() {
+        awaitingTiledHandoff = nil
+        transformPreview = nil
+        if !isPainting {
+            paintSession = nil
+            renderStore.activePaintSession = nil
+        }
+        scheduleInteractionPreparation()
+    }
+
+    private func canUseRetainedTransformScene(_ model: ProjectModel) -> Bool {
+        model.canvasEffects.isEmpty
+            && !model.allLayers.contains { $0.kind.isAdjustment || $0.clipsToBelow }
+    }
+
+    private func applyingCurrentTransforms(to items: [RenderItem], layerIDs: Set<UUID>,
+                                           model: ProjectModel) -> [RenderItem] {
+        items.map { source in
+            var item = source
+            if layerIDs.contains(item.id), let layer = model.layer(id: item.id) {
+                item.transform = layer.transform.affine(naturalSize: item.naturalSize)
+            }
+            if case .group(let children) = item.content {
+                item.content = .group(applyingCurrentTransforms(to: children,
+                                                                layerIDs: layerIDs,
+                                                                model: model))
+            }
+            return item
         }
     }
 
@@ -518,8 +700,10 @@ struct CanvasViewport: View {
                             if !editorState.selectedLayerIDs.contains(hit.id) {
                                 editorState.selectedLayerID = hit.id
                             }
+                            let movingIDs = topmostSelectedIDs
+                            beginTransformPreview(ids: movingIDs)
                             document.beginGesture()
-                            dragMode = .move(entries: moveEntries(for: editorState.selectedLayerIDs))
+                            dragMode = .move(entries: moveEntries(for: movingIDs))
                         } else {
                             dragMode = .pan(startPan: pan)
                         }
@@ -576,7 +760,7 @@ struct CanvasViewport: View {
             .onEnded { value in
                 switch dragMode {
                 case .move:
-                    awaitingTiledHandoff = true
+                    beginTiledHandoff()
                     document.endGesture(undoManager, actionName: "Move Layer")
                     editorState.smartGuideX = nil
                     editorState.smartGuideY = nil
@@ -812,14 +996,36 @@ struct CanvasViewport: View {
     // MARK: - Painting
 
     private func startPaintSession() {
-        guard paintSession == nil else { return }
+        let continuationTarget = paintSession?.target
+        let continuationImage = paintSession?.currentImage
+        if let continuationTarget, !pendingPaintCommits.isEmpty {
+            let requestedIdentity: PaintTargetIdentity? = if let maskID = editorState.editingMaskLayerID {
+                .mask(maskID)
+            } else if let layerID = editorState.selectedLayerID {
+                .content(layerID)
+            } else {
+                nil
+            }
+            guard requestedIdentity == paintTargetIdentity(continuationTarget) else {
+                // Keep the previous target's resident preview until its ordered
+                // commit is published; mixing targets would briefly hide it.
+                dragMode = nil
+                return
+            }
+        }
+        interactionPreparationTask?.cancel()
+        awaitingTiledHandoff = nil
+        transformPreview = nil
+        var nextSession: PaintSession?
 
         // Mask editing takes priority over content painting.
         if let maskID = editorState.editingMaskLayerID,
            let layer = document.model.layer(id: maskID),
            !document.model.isEffectivelyLocked(maskID),
            let mask = layer.mask {
-            let base = renderStore.originalImage(key: mask.imageKey)
+            let target = PaintSession.Target.mask(layerID: maskID)
+            let base = samePaintTarget(continuationTarget, target)
+                ? continuationImage : renderStore.originalImage(key: mask.imageKey)
             var clip: CGPath?
             if let selection = editorState.selection {
                 let naturalSize = renderStore.naturalSize(for: layer, model: document.model)
@@ -830,8 +1036,8 @@ struct CanvasViewport: View {
                     clip = selection.path.cgPath.copy(using: &t)
                 }
             }
-            paintSession = PaintSession(target: .mask(layerID: maskID), base: base,
-                                        pixelSize: mask.pixelSize, clipPath: clip)
+            nextSession = PaintSession(target: target, base: base,
+                                       pixelSize: mask.pixelSize, clipPath: clip)
         } else {
             var targetID = editorState.selectedLayerID
             let targetLayer = document.model.layer(id: targetID ?? UUID())
@@ -846,7 +1052,9 @@ struct CanvasViewport: View {
             guard let id = targetID,
                   let layer = document.model.layer(id: id),
                   let config = layer.imageConfig else { return }
-            let base = renderStore.originalImage(key: config.imageKey)
+            let target = PaintSession.Target.content(layerID: id)
+            let base = samePaintTarget(continuationTarget, target)
+                ? continuationImage : renderStore.originalImage(key: config.imageKey)
             var clip: CGPath?
             if let selection = editorState.selection {
                 let naturalSize = renderStore.naturalSize(for: layer, model: document.model)
@@ -857,16 +1065,17 @@ struct CanvasViewport: View {
                     clip = selection.path.cgPath.copy(using: &t)
                 }
             }
-            paintSession = PaintSession(target: .content(layerID: id), base: base,
-                                        pixelSize: config.pixelSize, clipPath: clip,
-                                        colorSettings: document.model.colorSettings)
+            nextSession = PaintSession(target: target, base: base,
+                                       pixelSize: config.pixelSize, clipPath: clip,
+                                       colorSettings: document.model.colorSettings)
         }
-        renderStore.activePaintSession = paintSession
-        if paintSession != nil {
-            isPainting = true
-            paintInvalidation = TransientViewportInvalidation(
-                revision: paintInvalidation.revision &+ 1, region: .none)
-        }
+        guard let nextSession else { return }
+        paintSession = nextSession
+        renderStore.activePaintSession = nextSession
+        isPaintStrokeActive = true
+        isPainting = true
+        paintInvalidation = TransientViewportInvalidation(
+            revision: paintInvalidation.revision &+ 1, region: .none)
     }
 
     private func extendPaintStroke(to viewPoint: CGPoint, canvasTransform: CGAffineTransform) {
@@ -966,30 +1175,112 @@ struct CanvasViewport: View {
     }
 
     private func commitPaintSession() {
-        guard let session = paintSession else { return }
+        isPaintStrokeActive = false
+        guard let session = paintSession,
+              let image = session.currentImage else { return }
         session.endStroke()
-        defer {
-            paintSession = nil
+        let target = session.target
+        pendingPaintCommits.append(PendingPaintCommit(
+            target: target,
+            identity: paintTargetIdentity(target),
+            image: image,
+            expectedImageKey: storedImageKey(for: target),
+            actionName: editorState.activeTool.displayName))
+        startPaintCommitWorkerIfNeeded()
+    }
+
+    /// Serial persistence keeps ImageIO from multiplying CPU/memory pressure
+    /// during fast strokes and preserves one ordered undo record per stroke.
+    private func startPaintCommitWorkerIfNeeded() {
+        guard paintCommitTask == nil else { return }
+        if pendingPaintCommits.count == 1 { publishedPaintKeys.removeAll() }
+
+        paintCommitTask = Task { @MainActor in
+            // Give a follow-up stroke one frame to enqueue before expensive
+            // work begins, while still processing every snapshot in order.
+            try? await Task.sleep(for: .milliseconds(24))
+            guard !Task.isCancelled else { return }
+
+            while let commit = pendingPaintCommits.first {
+                let sendableImage = SendableImage(value: commit.image)
+                let data = await Task.detached(priority: .userInitiated) {
+                    PNGExporter.pngData(sendableImage.value)
+                }.value
+                guard !Task.isCancelled else { return }
+
+                // Encoding failure must not destroy the resident authored
+                // surface. Leave the commit queued and retry after a backoff.
+                guard let data else {
+                    try? await Task.sleep(for: .milliseconds(500))
+                    continue
+                }
+
+                let expectedKey = publishedPaintKeys[commit.identity]
+                    ?? commit.expectedImageKey
+                guard storedImageKey(for: commit.target) == expectedKey else {
+                    // A newer pixel edit changed this target while persistence
+                    // was in flight. Preserve that edit rather than overwriting
+                    // it with a late snapshot; dependent queued strokes for the
+                    // same target will fail the same validation.
+                    pendingPaintCommits.removeFirst()
+                    continue
+                }
+
+                let key = document.storeImage(data: data, fileExtension: "png")
+                renderStore.adoptOriginalImage(commit.image, for: key)
+                applyPaintCommit(commit, imageKey: key)
+                publishedPaintKeys[commit.identity] = key
+                pendingPaintCommits.removeFirst()
+            }
+
+            paintCommitTask = nil
+            publishedPaintKeys.removeAll()
+            guard !isPaintStrokeActive else {
+                // A newer stroke can still be using the resident surface even
+                // after every older snapshot has finished persistence. Its
+                // mouse-up will enqueue the next commit and restart the worker.
+                return
+            }
+            beginTiledHandoff()
             renderStore.activePaintSession = nil
             isPainting = false
             paintInvalidation = TransientViewportInvalidation(
                 revision: paintInvalidation.revision &+ 1, region: .none)
         }
-        guard let image = session.currentImage,
-              let data = PNGExporter.pngData(image) else { return }
-        let key = document.storeImage(data: data, fileExtension: "png")
-        switch session.target {
+    }
+
+    private func applyPaintCommit(_ commit: PendingPaintCommit, imageKey: String) {
+        switch commit.target {
         case .content(let id):
-            document.update(undoManager, actionName: editorState.activeTool.displayName) { model in
+            document.update(undoManager, actionName: commit.actionName) { model in
                 model.modifyLayer(id: id) { layer in
                     layer.recordSourceIfNeeded()
-                    layer.modifyImage { $0.imageKey = key }
+                    layer.modifyImage { $0.imageKey = imageKey }
                 }
             }
         case .mask(let id):
             document.update(undoManager, actionName: "Paint Mask") { model in
-                model.modifyLayer(id: id) { $0.mask?.imageKey = key }
+                model.modifyLayer(id: id) { $0.mask?.imageKey = imageKey }
             }
+        }
+    }
+
+    private func paintTargetIdentity(_ target: PaintSession.Target) -> PaintTargetIdentity {
+        switch target {
+        case .content(let id): .content(id)
+        case .mask(let id): .mask(id)
+        }
+    }
+
+    private func samePaintTarget(_ lhs: PaintSession.Target?,
+                                 _ rhs: PaintSession.Target) -> Bool {
+        lhs.map(paintTargetIdentity) == paintTargetIdentity(rhs)
+    }
+
+    private func storedImageKey(for target: PaintSession.Target) -> String? {
+        switch target {
+        case .content(let id): document.model.layer(id: id)?.imageConfig?.imageKey
+        case .mask(let id): document.model.layer(id: id)?.mask?.imageKey
         }
     }
 
@@ -1111,21 +1402,33 @@ struct CanvasViewport: View {
         let center = layer.transform.position.applying(parentAffine).applying(canvasTransform)
         switch phase {
         case .changed(let value):
-            let startDistance = hypot(value.startLocation.x - center.x, value.startLocation.y - center.y)
             let currentDistance = hypot(value.location.x - center.x, value.location.y - center.y)
-            if case .scale(let id, let startScale, _) = dragMode, id == layer.id {
-                let factor = startDistance > 1 ? currentDistance / startDistance : 1
-                document.updateDuringGesture { model in
-                    model.modifyLayer(id: id) {
-                        $0.transform.scale = min(max(startScale * Double(factor), 0.02), 60)
-                    }
-                }
+            let id: UUID
+            let startScale: Double
+            let startDistance: CGFloat
+            if case .scale(let existingID, let existingScale, let existingDistance) = dragMode,
+               existingID == layer.id {
+                id = existingID
+                startScale = existingScale
+                startDistance = existingDistance
             } else {
+                id = layer.id
+                startScale = layer.transform.scale
+                startDistance = hypot(value.startLocation.x - center.x,
+                                      value.startLocation.y - center.y)
+                beginTransformPreview(ids: [layer.id])
                 document.beginGesture()
-                dragMode = .scale(layerID: layer.id, startScale: layer.transform.scale, startDistance: startDistance)
+                dragMode = .scale(layerID: id, startScale: startScale,
+                                  startDistance: startDistance)
+            }
+            let factor = startDistance > 1 ? currentDistance / startDistance : 1
+            document.updateDuringGesture { model in
+                model.modifyLayer(id: id) {
+                    $0.transform.scale = min(max(startScale * Double(factor), 0.02), 60)
+                }
             }
         case .ended:
-            awaitingTiledHandoff = true
+            beginTiledHandoff()
             document.endGesture(undoManager, actionName: "Scale Layer")
             dragMode = nil
         }
@@ -1136,22 +1439,34 @@ struct CanvasViewport: View {
         let center = layer.transform.position.applying(parentAffine).applying(canvasTransform)
         switch phase {
         case .changed(let value):
-            let startAngle = atan2(Double(value.startLocation.y - center.y), Double(value.startLocation.x - center.x))
             let currentAngle = atan2(Double(value.location.y - center.y), Double(value.location.x - center.x))
-            if case .rotate(let id, let startRotation, _) = dragMode, id == layer.id {
-                var degrees = startRotation + (currentAngle - startAngle) * 180 / .pi
-                // Snap to 15° increments when close.
-                let nearest = (degrees / 15).rounded() * 15
-                if abs(degrees - nearest) < 2.5 { degrees = nearest }
-                document.updateDuringGesture { model in
-                    model.modifyLayer(id: id) { $0.transform.rotationDegrees = degrees }
-                }
+            let id: UUID
+            let startRotation: Double
+            let startAngle: Double
+            if case .rotate(let existingID, let existingRotation, let existingAngle) = dragMode,
+               existingID == layer.id {
+                id = existingID
+                startRotation = existingRotation
+                startAngle = existingAngle
             } else {
+                id = layer.id
+                startRotation = layer.transform.rotationDegrees
+                startAngle = atan2(Double(value.startLocation.y - center.y),
+                                   Double(value.startLocation.x - center.x))
+                beginTransformPreview(ids: [layer.id])
                 document.beginGesture()
-                dragMode = .rotate(layerID: layer.id, startRotation: layer.transform.rotationDegrees, startAngle: startAngle)
+                dragMode = .rotate(layerID: id, startRotation: startRotation,
+                                   startAngle: startAngle)
+            }
+            var degrees = startRotation + (currentAngle - startAngle) * 180 / .pi
+            // Snap to 15° increments when close.
+            let nearest = (degrees / 15).rounded() * 15
+            if abs(degrees - nearest) < 2.5 { degrees = nearest }
+            document.updateDuringGesture { model in
+                model.modifyLayer(id: id) { $0.transform.rotationDegrees = degrees }
             }
         case .ended:
-            awaitingTiledHandoff = true
+            beginTiledHandoff()
             document.endGesture(undoManager, actionName: "Rotate Layer")
             dragMode = nil
         }
@@ -1173,11 +1488,15 @@ struct CanvasViewport: View {
         return bounds.reduce(.null) { $0.union($1) }
     }
 
-    private func multiTransformEntries() -> [(id: UUID, world: LayerTransform, parent: CGAffineTransform)] {
+    private func multiTransformEntries() -> [MultiTransformEntry] {
         topmostSelectedIDs.compactMap { id in
             guard !document.model.isEffectivelyLocked(id),
+                  let layer = document.model.layer(id: id),
                   let world = document.model.worldTransform(of: id) else { return nil }
-            return (id, world, document.model.parentAffine(of: id))
+            let parent = document.model.parentAffine(of: id)
+            guard parent.isInvertible else { return nil }
+            return MultiTransformEntry(id: id, local: layer.transform,
+                                       world: world, parent: parent)
         }
     }
 
@@ -1189,32 +1508,39 @@ struct CanvasViewport: View {
         case .changed(let value):
             let distance = hypot(value.location.x - screenCenter.x,
                                  value.location.y - screenCenter.y)
-            if case .multiScale(let entries, let startCenter, let startDistance) = dragMode {
-                let factor = startDistance > 1 ? max(distance / startDistance, 0.02) : 1
-                document.updateDuringGesture { model in
-                    for entry in entries {
-                        var world = entry.world
-                        world.position = CGPoint(
-                            x: startCenter.x + (world.position.x - startCenter.x) * factor,
-                            y: startCenter.y + (world.position.y - startCenter.y) * factor)
-                        world.scale = min(max(world.scale * Double(factor), 0.02), 60)
-                        if let local = LayerTransform.rebased(world: world,
-                                                             destinationParent: entry.parent) {
-                            model.modifyLayer(id: entry.id) { $0.transform = local }
-                        }
-                    }
-                }
+            let entries: [MultiTransformEntry]
+            let startCenter: CGPoint
+            let startDistance: CGFloat
+            if case .multiScale(let existingEntries, let existingCenter,
+                                let existingDistance) = dragMode {
+                entries = existingEntries
+                startCenter = existingCenter
+                startDistance = existingDistance
             } else {
-                let startDistance = hypot(value.startLocation.x - screenCenter.x,
-                                          value.startLocation.y - screenCenter.y)
-                let entries = multiTransformEntries()
+                startDistance = hypot(value.startLocation.x - screenCenter.x,
+                                      value.startLocation.y - screenCenter.y)
+                entries = multiTransformEntries()
                 guard !entries.isEmpty else { return }
+                startCenter = center
+                beginTransformPreview(ids: Set(entries.map(\.id)))
                 document.beginGesture()
-                dragMode = .multiScale(entries: entries, center: center,
+                dragMode = .multiScale(entries: entries, center: startCenter,
                                        startDistance: startDistance)
             }
+            let factor = startDistance > 1 ? max(distance / startDistance, 0.02) : 1
+            document.updateDuringGesture { model in
+                for entry in entries {
+                    let worldPosition = CGPoint(
+                        x: startCenter.x + (entry.world.position.x - startCenter.x) * factor,
+                        y: startCenter.y + (entry.world.position.y - startCenter.y) * factor)
+                    var local = entry.local
+                    local.position = worldPosition.applying(entry.parent.inverted())
+                    local.scale = min(max(entry.local.scale * Double(factor), 0.02), 60)
+                    model.modifyLayer(id: entry.id) { $0.transform = local }
+                }
+            }
         case .ended:
-            awaitingTiledHandoff = true
+            beginTiledHandoff()
             document.endGesture(undoManager, actionName: "Scale Layers")
             dragMode = nil
         }
@@ -1228,36 +1554,46 @@ struct CanvasViewport: View {
         case .changed(let value):
             let currentAngle = atan2(Double(value.location.y - screenCenter.y),
                                      Double(value.location.x - screenCenter.x))
-            if case .multiRotate(let entries, let startCenter, let startAngle) = dragMode {
-                var delta = (currentAngle - startAngle) * 180 / .pi
-                let snapped = (delta / 15).rounded() * 15
-                if abs(delta - snapped) < 2.5 { delta = snapped }
-                let radians = CGFloat(delta * .pi / 180)
-                let rotation = CGAffineTransform(translationX: startCenter.x, y: startCenter.y)
-                    .rotated(by: radians)
-                    .translatedBy(x: -startCenter.x, y: -startCenter.y)
-                document.updateDuringGesture { model in
-                    for entry in entries {
-                        var world = entry.world
-                        world.position = world.position.applying(rotation)
-                        world.rotationDegrees += delta
-                        if let local = LayerTransform.rebased(world: world,
-                                                             destinationParent: entry.parent) {
-                            model.modifyLayer(id: entry.id) { $0.transform = local }
-                        }
-                    }
-                }
+            let entries: [MultiTransformEntry]
+            let startCenter: CGPoint
+            let startAngle: Double
+            if case .multiRotate(let existingEntries, let existingCenter,
+                                 let existingAngle) = dragMode {
+                entries = existingEntries
+                startCenter = existingCenter
+                startAngle = existingAngle
             } else {
-                let startAngle = atan2(Double(value.startLocation.y - screenCenter.y),
-                                       Double(value.startLocation.x - screenCenter.x))
-                let entries = multiTransformEntries()
+                startAngle = atan2(Double(value.startLocation.y - screenCenter.y),
+                                   Double(value.startLocation.x - screenCenter.x))
+                entries = multiTransformEntries()
                 guard !entries.isEmpty else { return }
+                startCenter = center
+                beginTransformPreview(ids: Set(entries.map(\.id)))
                 document.beginGesture()
-                dragMode = .multiRotate(entries: entries, center: center,
+                dragMode = .multiRotate(entries: entries, center: startCenter,
                                         startAngle: startAngle)
             }
+            var delta = (currentAngle - startAngle) * 180 / .pi
+            let snapped = (delta / 15).rounded() * 15
+            if abs(delta - snapped) < 2.5 { delta = snapped }
+            let radians = CGFloat(delta * .pi / 180)
+            let rotation = CGAffineTransform(translationX: startCenter.x, y: startCenter.y)
+                .rotated(by: radians)
+                .translatedBy(x: -startCenter.x, y: -startCenter.y)
+            document.updateDuringGesture { model in
+                for entry in entries {
+                    var local = entry.local
+                    local.position = entry.world.position.applying(rotation)
+                        .applying(entry.parent.inverted())
+                    let parentMirrors = entry.parent.a * entry.parent.d
+                        - entry.parent.b * entry.parent.c < 0
+                    local.rotationDegrees = entry.local.rotationDegrees
+                        + (parentMirrors ? -delta : delta)
+                    model.modifyLayer(id: entry.id) { $0.transform = local }
+                }
+            }
         case .ended:
-            awaitingTiledHandoff = true
+            beginTiledHandoff()
             document.endGesture(undoManager, actionName: "Rotate Layers")
             dragMode = nil
         }
@@ -1355,7 +1691,7 @@ struct CanvasViewport: View {
     }
 
     private func nudgeSelection(_ press: KeyPress) -> KeyPress.Result {
-        let entries = moveEntries(for: editorState.selectedLayerIDs)
+        let entries = moveEntries(for: topmostSelectedIDs)
         guard !entries.isEmpty else { return .ignored }
         let step: CGFloat = press.modifiers.contains(.shift)
             ? document.model.canvasSize.width * 0.01
@@ -1452,7 +1788,8 @@ struct SelectionOverlay: View {
             ForEach(0..<4, id: \.self) { i in
                 handle(at: corners[i], systemName: nil)
                     .gesture(
-                        DragGesture(coordinateSpace: .named("viewport-overlay"))
+                        DragGesture(minimumDistance: 0,
+                                    coordinateSpace: .named("viewport-overlay"))
                             .onChanged { onScaleDrag(.changed($0)) }
                             .onEnded { _ in onScaleDrag(.ended) }
                     )
@@ -1460,7 +1797,8 @@ struct SelectionOverlay: View {
 
             handle(at: rotateHandle, systemName: "arrow.trianglehead.2.clockwise.rotate.90")
                 .gesture(
-                    DragGesture(coordinateSpace: .named("viewport-overlay"))
+                    DragGesture(minimumDistance: 0,
+                                coordinateSpace: .named("viewport-overlay"))
                         .onChanged { onRotateDrag(.changed($0)) }
                         .onEnded { _ in onRotateDrag(.ended) }
                 )
@@ -1527,7 +1865,8 @@ struct MultiSelectionOverlay: View {
                     .stroke(Color.accentColor, lineWidth: 1.5)
                     .frame(width: 10, height: 10)
                     .position(corners[index])
-                    .gesture(DragGesture(coordinateSpace: .named("multi-overlay"))
+                    .gesture(DragGesture(minimumDistance: 0,
+                                         coordinateSpace: .named("multi-overlay"))
                         .onChanged { onScaleDrag(.changed($0)) }
                         .onEnded { _ in onScaleDrag(.ended) })
             }
@@ -1538,7 +1877,8 @@ struct MultiSelectionOverlay: View {
                 .frame(width: 16, height: 16)
                 .background(Circle().fill(Color.accentColor))
                 .position(rotateHandle)
-                .gesture(DragGesture(coordinateSpace: .named("multi-overlay"))
+                .gesture(DragGesture(minimumDistance: 0,
+                                     coordinateSpace: .named("multi-overlay"))
                     .onChanged { onRotateDrag(.changed($0)) }
                     .onEnded { _ in onRotateDrag(.ended) })
         }

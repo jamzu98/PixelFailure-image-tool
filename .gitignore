@@ -12,3 +12,6 @@ xcuserdata/
 
 # Local build output
 /PixelFailure.app
+
+.claude/
+*.app
