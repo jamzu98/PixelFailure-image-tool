@@ -59,80 +59,63 @@ struct ExportSheet: View {
     @State private var errorMessage: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Export")
-                .font(.title2.bold())
-
-            Picker("Format", selection: $format) {
-                ForEach(Format.allCases, id: \.self) { format in
-                    Text(format.rawValue).tag(format)
-                        .disabled(!format.isAvailable)
-                }
-            }
-            .pickerStyle(.segmented)
-
-            if format != .svg && format != .psd {
-                Picker("Size", selection: $presetIndex) {
-                    ForEach(SizePreset.exportPresets.indices, id: \.self) { i in
-                        Text(SizePreset.exportPresets[i].name).tag(i)
-                    }
-                }
-
-                if SizePreset.exportPresets[presetIndex].size == .zero {
-                    HStack {
-                        TextField("Width", value: $customWidth, format: .number)
-                        Text("×")
-                        TextField("Height", value: $customHeight, format: .number)
-                        Text("px")
-                    }
-                    .textFieldStyle(.roundedBorder)
-                }
-
-                if format.raster?.isLossy == true {
-                    LabeledContent("Quality") {
-                        HStack {
-                            NumericSlider(value: $quality, range: 0.5...1,
-                                          defaultValue: 0.9)
-                            Text("\(Int((quality * 100).rounded()))%")
-                                .font(.caption.monospacedDigit())
-                                .frame(width: 36, alignment: .trailing)
+        VStack(spacing: 0) {
+            Form {
+                Section {
+                    Picker("Format", selection: $format) {
+                        ForEach(Format.allCases, id: \.self) { format in
+                            Text(format.rawValue).tag(format)
+                                .disabled(!format.isAvailable)
                         }
                     }
-                }
-                if format == .jpeg {
-                    Text("JPEG has no transparency — the artwork is flattened onto the background color.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                if format == .pdf {
-                    Text("PDF preserves the rendered appearance as a single composited page. Layers and raster-only effects are explicitly flattened.")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
+
+                    if format != .svg && format != .psd {
+                        Picker("Size", selection: $presetIndex) {
+                            ForEach(SizePreset.exportPresets.indices, id: \.self) { i in
+                                Text(SizePreset.exportPresets[i].name).tag(i)
+                            }
+                        }
+
+                        if SizePreset.exportPresets[presetIndex].size == .zero {
+                            LabeledContent("Custom") {
+                                HStack(spacing: 6) {
+                                    TextField("Width", value: $customWidth, format: .number)
+                                    Text("×")
+                                    TextField("Height", value: $customHeight, format: .number)
+                                    Text("px").foregroundStyle(.secondary)
+                                }
+                                .textFieldStyle(.roundedBorder)
+                            }
+                        }
+
+                        if format.raster?.isLossy == true {
+                            LabeledContent("Quality") {
+                                HStack {
+                                    NumericSlider(value: $quality, range: 0.5...1,
+                                                  defaultValue: 0.9)
+                                    Text("\(Int((quality * 100).rounded()))%")
+                                        .font(.caption.monospacedDigit())
+                                        .frame(width: 36, alignment: .trailing)
+                                }
+                            }
+                        }
+                    }
+                } footer: {
+                    formatHelpText
                 }
 
-                if targetSize() != document.model.canvasSize {
-                    Text("The artwork scales to fill and center-crops if the aspect ratio differs.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            } else {
-                Text(format == .psd
-                     ? "Exports names, opacity, blend modes, visibility, and one raster channel set per layer."
-                     : "Patterns, shapes, and text export as true vectors; image layers are embedded as PNG.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if !document.model.canvasEffects.isEmpty {
-                    Text("Canvas effects are raster-only and will be skipped in SVG.")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
+                if let errorMessage {
+                    Section {
+                        Text(errorMessage)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
                 }
             }
+            .formStyle(.grouped)
+            .padding(.top, 4)
 
-            if let errorMessage {
-                Text(errorMessage)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
+            Divider()
 
             HStack {
                 if !document.model.exportSlices.isEmpty {
@@ -145,9 +128,34 @@ struct ExportSheet: View {
                     .keyboardShortcut(.defaultAction)
                     .disabled(isExporting)
             }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
         }
-        .padding(20)
-        .frame(width: 380)
+        .frame(width: 440)
+        .navigationTitle("Export")
+    }
+
+    @ViewBuilder
+    private var formatHelpText: some View {
+        switch format {
+        case .jpeg:
+            Text("JPEG has no transparency — the artwork is flattened onto the background color.")
+        case .pdf:
+            Text("PDF preserves the rendered appearance as a single composited page. Layers and raster-only effects are explicitly flattened.")
+                .foregroundStyle(.orange)
+        case .psd:
+            Text("Exports names, opacity, blend modes, visibility, and one raster channel set per layer.")
+        case .svg:
+            Text("Patterns, shapes, and text export as true vectors; image layers are embedded as PNG.")
+            if !document.model.canvasEffects.isEmpty {
+                Text("Canvas effects are raster-only and will be skipped in SVG.")
+                    .foregroundStyle(.orange)
+            }
+        default:
+            if targetSize() != document.model.canvasSize {
+                Text("The artwork scales to fill and center-crops if the aspect ratio differs.")
+            }
+        }
     }
 
     private func targetSize() -> CGSize {

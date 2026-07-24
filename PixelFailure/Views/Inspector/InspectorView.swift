@@ -9,7 +9,7 @@ struct InspectorView: View {
     @Environment(\.undoManager) private var undoManager
     @State private var draftWidth: Int = 0
     @State private var draftHeight: Int = 0
-    @State private var snapshotName = "Snapshot"
+    @State private var snapshotName = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -64,7 +64,7 @@ struct InspectorView: View {
     private var historySection: some View {
         Section("History & Snapshots") {
             DisclosureGroup("Recent History (\(document.history.count))") {
-                ForEach(Array(document.history.suffix(30).reversed())) { state in
+                ForEach(Array(document.history.reversed())) { state in
                     Button {
                         document.jumpToHistory(state.id, undoManager: undoManager)
                     } label: {
@@ -78,9 +78,11 @@ struct InspectorView: View {
                 }
             }
             HStack {
-                TextField("Snapshot name", text: $snapshotName)
+                TextField("Snapshot name", text: $snapshotName, prompt: Text("Snapshot"))
                 Button("Save") {
-                    document.createCheckpoint(name: snapshotName.isEmpty ? "Snapshot" : snapshotName)
+                    let name = snapshotName.trimmingCharacters(in: .whitespacesAndNewlines)
+                    document.createCheckpoint(name: name.isEmpty ? "Snapshot" : name)
+                    snapshotName = ""
                 }
             }
             ForEach(document.checkpoints) { state in

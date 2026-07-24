@@ -25,11 +25,8 @@ struct TextInspector: View {
                     }
                 }
 
-            Picker("Font", selection: modify(\.fontFamily, action: "Font")) {
-                ForEach(availableFamilies, id: \.self) { family in
-                    Text(family).tag(family)
-                }
-            }
+            FontFamilyPicker(selection: modify(\.fontFamily, action: "Font"),
+                             families: availableFamilies)
 
             Picker("Weight", selection: modify(\.weight, action: "Weight")) {
                 ForEach(FontWeightChoice.allCases, id: \.self) { weight in
@@ -264,5 +261,98 @@ struct TextInspector: View {
                 if editing { document.beginGesture() } else { document.endGesture(undoManager, actionName: action) }
             }
         }
+    }
+}
+
+/// Form-style font family control. Opens a popover where each family name is
+/// drawn in that face so users can preview before selecting — SwiftUI's
+/// native `Picker` menu strips custom fonts on macOS.
+private struct FontFamilyPicker: View {
+    @Binding var selection: String
+    let families: [String]
+    @State private var isOpen = false
+
+    var body: some View {
+        LabeledContent("Font") {
+            Button {
+                isOpen = true
+            } label: {
+                HStack(spacing: 4) {
+                    Text(selection)
+                        .font(FontFamilyPreview.font(for: selection, size: 12))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .buttonStyle(.borderless)
+            .popover(isPresented: $isOpen, arrowEdge: .bottom) {
+                FontFamilyPickerList(selection: $selection, families: families, isOpen: $isOpen)
+            }
+        }
+    }
+}
+
+private struct FontFamilyPickerList: View {
+    @Binding var selection: String
+    let families: [String]
+    @Binding var isOpen: Bool
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(families, id: \.self) { family in
+                        fontRow(family)
+                            .id(family)
+                    }
+                }
+                .padding(6)
+            }
+            .frame(width: 280)
+            .frame(maxHeight: 480)
+            .onAppear {
+                proxy.scrollTo(selection, anchor: .center)
+            }
+        }
+    }
+
+    private func fontRow(_ family: String) -> some View {
+        let isSelected = selection == family
+        return Button {
+            selection = family
+            isOpen = false
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "checkmark")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .opacity(isSelected ? 1 : 0)
+                    .frame(width: 12)
+                Text(family)
+                    .font(FontFamilyPreview.font(for: family, size: 14))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .contentShape(Rectangle())
+            .background(isSelected ? Color.accentColor.opacity(0.18) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private enum FontFamilyPreview {
+    static func font(for family: String, size: CGFloat) -> Font {
+        let nsFont = NSFontManager.shared.font(withFamily: family, traits: [], weight: 5, size: size)
+            ?? NSFont(name: family, size: size)
+            ?? NSFont.systemFont(ofSize: size)
+        return Font(nsFont as CTFont)
     }
 }

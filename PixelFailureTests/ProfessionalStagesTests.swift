@@ -91,6 +91,18 @@ struct ProfessionalStagesTests {
         #expect(archive.checkpoints.count == 1)
     }
 
+    @Test func recentHistoryCapsAtMaxHistoryCount() {
+        let document = PixelDocument()
+        #expect(document.history.count == 1)
+        for i in 0..<(PixelDocument.maxHistoryCount + 25) {
+            document.update(nil, actionName: "Edit \(i)") {
+                $0.background = RGBAColor(r: Double(i % 255) / 255, g: 0, b: 0, a: 1)
+            }
+        }
+        #expect(document.history.count == PixelDocument.maxHistoryCount)
+        #expect(document.history.last?.name == "Edit \(PixelDocument.maxHistoryCount + 24)")
+    }
+
     @Test func photoCompletionEffectsRetainSize() throws {
         let input = try image(size: 48)
         let effects = [EffectType.sharpen, .noiseReduction, .lensCorrection, .rawDevelop].map {

@@ -55,7 +55,9 @@ struct EditorView: View {
         .toolbar { toolbarContent }
         .sheet(isPresented: Binding(get: { editorState.showExportSheet },
                                     set: { editorState.showExportSheet = $0 })) {
-            ExportSheet(document: document, renderStore: renderStore)
+            NavigationStack {
+                ExportSheet(document: document, renderStore: renderStore)
+            }
         }
         .sheet(isPresented: Binding(get: { !didCompleteOnboarding },
                                     set: { if !$0 { didCompleteOnboarding = true } })) {

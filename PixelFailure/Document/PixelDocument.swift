@@ -25,6 +25,12 @@ final class PixelDocument: ReferenceFileDocument, @unchecked Sendable {
         var checkpoints: [Checkpoint]
     }
 
+    /// Cap for the in-memory recent-history ring. Each entry stores a full
+    /// `ProjectModel` copy (image pixels stay shared via keys). Kept modest
+    /// because UndoManager already retains prior models separately, and large
+    /// layer/path trees multiply RAM with every edit.
+    static let maxHistoryCount = 50
+
     @Published var model: ProjectModel
     @Published private(set) var history: [Checkpoint] = []
     @Published private(set) var checkpoints: [Checkpoint] = []
@@ -149,7 +155,8 @@ final class PixelDocument: ReferenceFileDocument, @unchecked Sendable {
     @MainActor
     private func recordHistory(_ name: String) {
         history.append(Checkpoint(name: name, model: model))
-        if history.count > 200 { history.removeFirst(history.count - 200) }
+        let overflow = history.count - Self.maxHistoryCount
+        if overflow > 0 { history.removeFirst(overflow) }
     }
 
     @MainActor
