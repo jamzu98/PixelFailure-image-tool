@@ -561,7 +561,17 @@ final class RetainedTileCanvasNSView: NSView {
         pendingTransform = transform
     }
 
+    private var lastDisplayLinkTime: CFTimeInterval = 0
+
     @objc private func displayLinkFired(_ link: CADisplayLink) {
+        if PerfLog.isEnabled {
+            let now = CACurrentMediaTime()
+            let gap = (now - lastDisplayLinkTime) * 1000
+            if PerfLog.isInteracting, lastDisplayLinkTime > 0, gap > 25 {
+                PerfLog.log("frame gap \(String(format: "%.1f", gap)) ms (bitmaps: \(interaction != nil))")
+            }
+            lastDisplayLinkTime = now
+        }
         displayFrame()
     }
 

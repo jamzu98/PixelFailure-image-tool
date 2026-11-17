@@ -1,3 +1,4 @@
+import QuartzCore
 import SwiftUI
 
 /// The central canvas: renders the composition, and handles selection,
@@ -43,6 +44,14 @@ struct CanvasViewport: View {
     /// The bitmap-based drag presentation, when the scene allows it.
     @State private var interaction: CanvasInteraction?
     @State private var interactionSerial: UInt64 = 0
+    /// Serial of a drag whose bitmaps are still rasterizing. The tiles stay
+    /// up meanwhile (a frame or two) instead of the full live redraw, which
+    /// costs far more than waiting for the bitmaps.
+    @State private var awaitingSurfaces: UInt64?
+    /// A layer grabbed without being selected first. Publishing the selection
+    /// rebuilds the inspector (~100–200 ms of SwiftUI/AppKit layout), so it
+    /// is applied on pointer-up instead of stalling the drag's first frame.
+    @State private var deferredSelection: UUID?
     @State private var preparedSurfaces: InteractionSurfaces?
     @State private var surfacePreparationTask: Task<Void, Never>?
     @State private var surfaceTask: Task<Void, Never>?
@@ -156,6 +165,8 @@ struct CanvasViewport: View {
                                 suspendsContentUpdates: isDirectlyTransforming || isPainting,
                                 interaction: interaction,
                                 onInteractionFinished: { id in
+                                    PerfLog.log("handoff to tiles complete")
+                                    PerfLog.isInteracting = false
                                     guard interaction?.id == id else { return }
                                     interaction = nil
                                     scheduleInteractionPreparation()
@@ -182,7 +193,7 @@ struct CanvasViewport: View {
                                  scale: scale)
 
                 if editorState.activeTool == .move,
-                   let layer = liveModel.layer(id: editorState.selectedLayerID) {
+                   let layer = liveModel.layer(id: deferredSelection ?? editorState.selectedLayerID) {
                     let parentAffine = liveModel.parentAffine(of: layer.id)
                     SelectionOverlay(layer: layer,
                                      naturalSize: renderStore.naturalSize(for: layer, model: liveModel),
@@ -202,7 +213,7 @@ struct CanvasViewport: View {
                                     parentAffine: document.model.parentAffine(of: layer.id))
                 }
 
-                if editorState.activeTool == .move,
+                if editorState.activeTool == .move, deferredSelection == nil,
                    editorState.selectedLayerIDs.count > 1,
                    let bounds = multiSelectionBounds(in: document.model) {
                     // Handles measure from the committed (gesture-start)
@@ -421,7 +432,7 @@ struct CanvasViewport: View {
 
     private var usesImmediateTransformPreview: Bool {
         // The retained view presents bitmap-based drags itself.
-        if interaction != nil { return false }
+        if interaction != nil || awaitingSurfaces != nil { return false }
         return isDirectlyTransforming || isPainting || awaitingTiledHandoff != nil
             || transformPreview != nil || paintSession != nil
     }
@@ -635,8 +646,10 @@ struct CanvasViewport: View {
                                                             preferredQualities: [.full, .preview]) else {
                 return
             }
+            let t0 = CACurrentMediaTime()
             let surfaces = await renderSurfaces(items: items, model: model, ids: ids, key: key)
             guard !Task.isCancelled else { return }
+            PerfLog.log("idle bitmaps prepared in \(String(format: "%.1f", (CACurrentMediaTime() - t0) * 1000)) ms")
             preparedSurfaces = surfaces
         }
     }
@@ -649,11 +662,14 @@ struct CanvasViewport: View {
         surfaceTask?.cancel()
         liveTransforms = [:]
         interaction = nil
+        awaitingSurfaces = nil
         interactionSerial &+= 1
         let serial = interactionSerial
         let model = document.model
 
+        PerfLog.isInteracting = true
         guard canUseSurfaceInteraction(ids, model: model) else {
+            PerfLog.log("direct transform: ineligible for bitmaps, live redraw")
             interactionStarts = [:]
             beginTransformPreview(ids: ids)
             return
@@ -673,22 +689,36 @@ struct CanvasViewport: View {
            prepared.covers(visible: view.rect, scale: view.screenScale) {
             transformPreview = nil
             interaction = CanvasInteraction(id: serial, surfaces: prepared, deltas: [:])
+            PerfLog.log("direct transform: prepared bitmaps")
             return
         }
-        // Cold start: the immediate preview covers the first frames while the
-        // bitmaps rasterize; never resolve or rasterize inside this event.
-        beginTransformPreview(ids: ids)
+        // Cold start (e.g. dragging a layer that wasn't selected): rasterize
+        // the bitmaps off-main and keep the tiles up for the few ms that
+        // takes. Never resolve or rasterize inside this event, and don't fall
+        // back to the full live redraw unless bitmaps are impossible.
         guard let items = renderStore.cachedRenderItems(model: model,
                                                         preferredQualities: [.full, .preview, .proxy]) else {
+            PerfLog.log("direct transform: cold, no cached scene, live redraw")
+            beginTransformPreview(ids: ids)
             return
         }
+        PerfLog.log("direct transform: cold, rendering bitmaps")
+        transformPreview = nil
+        awaitingSurfaces = serial
         surfaceTask = Task { @MainActor in
+            let t0 = CACurrentMediaTime()
             let surfaces = await renderSurfaces(items: items, model: model, ids: ids, key: key)
-            guard !Task.isCancelled, let surfaces, interactionSerial == serial,
+            PerfLog.log("cold bitmaps ready after \(String(format: "%.1f", (CACurrentMediaTime() - t0) * 1000)) ms, nil=\(surfaces == nil) stillDragging=\(isDirectlyTransforming)")
+            guard !Task.isCancelled, interactionSerial == serial, awaitingSurfaces == serial,
                   isDirectlyTransforming else { return }
+            awaitingSurfaces = nil
+            guard let surfaces else {
+                // The scene can't be reproduced with bitmaps after all.
+                beginTransformPreview(ids: ids)
+                return
+            }
             interaction = CanvasInteraction(id: serial, surfaces: surfaces,
                                             deltas: interactionDeltas(for: liveTransforms))
-            transformPreview = nil
         }
     }
 
@@ -713,6 +743,7 @@ struct CanvasViewport: View {
     /// Pointer-up: commit the live transforms as one undo step, then hand
     /// presentation back to the tiles (only the dirty area re-renders).
     private func endDirectTransform(actionName: String) {
+        PerfLog.log("pointer-up (\(actionName))")
         surfaceTask?.cancel()
         let overrides = liveTransforms
         let before = document.model
@@ -736,9 +767,16 @@ struct CanvasViewport: View {
             current.committedRevision = renderStore.viewportInvalidation.revision
             interaction = current
             transformPreview = nil
+        } else if awaitingSurfaces != nil {
+            // Released before the bitmaps arrived: the tiles never left the
+            // screen, so let them repaint the dirty area directly.
+            awaitingSurfaces = nil
+            PerfLog.isInteracting = false
         } else if changed {
+            PerfLog.isInteracting = false
             beginTiledHandoff()
         } else {
+            PerfLog.isInteracting = false
             transformPreview = nil
         }
         interactionStarts = [:]
@@ -934,6 +972,13 @@ struct CanvasViewport: View {
     private func mainDragGesture(canvasTransform: CGAffineTransform, scale: CGFloat) -> some Gesture {
         DragGesture(minimumDistance: 2)
             .onChanged { value in
+                let handlerStart = PerfLog.isEnabled ? CACurrentMediaTime() : 0
+                defer {
+                    if PerfLog.isEnabled, PerfLog.isInteracting {
+                        let ms = (CACurrentMediaTime() - handlerStart) * 1000
+                        if ms > 4 { PerfLog.log("drag handler \(String(format: "%.2f", ms)) ms") }
+                    }
+                }
                 if dragMode == nil {
                     isFocused = true
                     switch editorState.activeTool {
@@ -955,12 +1000,18 @@ struct CanvasViewport: View {
                     case .move:
                         let canvasPoint = value.startLocation.applying(canvasTransform.inverted())
                         if let hit = hitTest(canvasPoint) {
+                            PerfLog.log("pointer-down on \(editorState.selectedLayerIDs.contains(hit.id) ? "selected" : "unselected") layer")
                             // Dragging a layer that's part of the current
-                            // multi-selection moves the whole selection.
-                            if !editorState.selectedLayerIDs.contains(hit.id) {
-                                editorState.selectedLayerID = hit.id
+                            // multi-selection moves the whole selection;
+                            // grabbing any other layer moves just that one
+                            // and selects it when the drag ends.
+                            let movingIDs: Set<UUID>
+                            if editorState.selectedLayerIDs.contains(hit.id) {
+                                movingIDs = topmostSelectedIDs
+                            } else {
+                                movingIDs = [hit.id]
+                                deferredSelection = hit.id
                             }
-                            let movingIDs = topmostSelectedIDs
                             let entries = moveEntries(for: movingIDs)
                             beginDirectTransform(ids: Set(entries.map(\.id)))
                             snapContext = entries.count == 1
@@ -1031,6 +1082,11 @@ struct CanvasViewport: View {
                     endDirectTransform(actionName: "Move Layer")
                     editorState.smartGuideX = nil
                     editorState.smartGuideY = nil
+                    // Published together with the commit: one UI update.
+                    if let id = deferredSelection {
+                        deferredSelection = nil
+                        editorState.selectedLayerID = id
+                    }
                 case .paint:
                     commitPaintSession()
                 case .marquee(let start):
@@ -1917,8 +1973,7 @@ struct CanvasViewport: View {
                 else { yTargets.append(guide.position) }
             }
             for other in model.allLayers where other.id != layerID
-                && other.isVisible && !other.kind.isGroup
-                && !editorState.selectedLayerIDs.contains(other.id) {
+                && other.isVisible && !other.kind.isGroup {
                 let bounds = worldBounds(of: other, in: model)
                 guard !bounds.isNull else { continue }
                 xTargets += [bounds.minX, bounds.midX, bounds.maxX]

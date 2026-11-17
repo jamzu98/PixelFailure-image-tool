@@ -415,7 +415,7 @@ nonisolated struct WorkspaceSettings: Codable, Hashable, Sendable {
 
     init(guides: [CanvasGuide] = [], grid: GridSettings = GridSettings(),
          showsRulers: Bool = true, smartGuidesEnabled: Bool = true,
-         showsNavigator: Bool = true) {
+         showsNavigator: Bool = false) {
         self.guides = guides
         self.grid = grid
         self.showsRulers = showsRulers

@@ -869,7 +869,7 @@ struct WorkspaceAndCompositingTests {
                                   CanvasGuide(orientation: .horizontal, position: 456)]
         model.workspace.grid = GridSettings(isVisible: true, spacing: 64,
                                             subdivisions: 4, snapsToGrid: true)
-        model.workspace.showsNavigator = false
+        model.workspace.showsNavigator = true
         let decoded = try JSONDecoder().decode(ProjectModel.self,
                                                 from: JSONEncoder().encode(model))
         #expect(decoded.workspace == model.workspace)
