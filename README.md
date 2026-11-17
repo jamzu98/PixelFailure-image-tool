@@ -1,53 +1,44 @@
 # PixelFailure
 
-**A native macOS image editor where generative art, pixel editing, vector tools, and professional compositing meet.**
-
-PixelFailure is a SwiftUI document-based editor for creating deterministic generative artwork and refining it with a full layer workflow. Combine seeded patterns with photographs, editable vectors, typography, masks, adjustments, retouching, and animation—then export the result for the web, print, or further production work.
+PixelFailure is a macOS image editor built with SwiftUI. It combines seeded generative patterns with a regular layer-based editor, so you can generate something, drop a photo on top, add text and vectors, mask and adjust it, and export the result.
 
 ![PixelFailure editor showing a generated flow field artwork](docs/images/pixelfailure-app.png)
 
-## Highlights
+## What it does
 
-- **Deterministic generators** — Build repeatable artwork with flow fields, waves, rings, phyllotaxis, Truchet patterns, grids, and image-sampled mosaics.
-- **Layer-based editing** — Organize images, patterns, shapes, text, fills, paint, paths, adjustments, and groups with masks, opacity, blend modes, and clipping.
-- **Professional color pipeline** — Work in sRGB or Display P3, preserve embedded profiles, choose 8- or 16-bit document depth, and export profile-aware raster files.
-- **Non-destructive workflow** — Transform layers, build effect stacks, retain original raster sources, and move through named history states and snapshots.
-- **Selection and retouching tools** — Use geometric and freeform selections, magic wand and subject selection, feathering, content-aware fill, patch healing, and painting tools.
-- **Vector and type tools** — Create editable shapes and paths, style text ranges, flow text through areas or along paths, and preserve vectors in SVG output.
-- **Animation** — Keyframe layer properties on a timeline and export animated work.
-- **Studio-friendly interoperability** — Import and export layered PSD files, create export slices, print with DPI-aware sizing, and preview project thumbnails with Quick Look.
-- **Automation** — Run batch operations, record and replay actions, use keyboard shortcuts, or integrate with AppleScript.
+- **Generators.** Flow fields, waves, rings, phyllotaxis, Truchet tiles, grids and image-sampled mosaics. Every generator is seeded, so the same settings always give the same output.
+- **Layers.** Image, pattern, shape, text, fill, paint, path, adjustment and group layers, with masks, opacity, blend modes and clipping.
+- **Color.** sRGB or Display P3 documents at 8 or 16 bits per channel. Embedded profiles are kept on import and written on export.
+- **Non-destructive editing.** Transforms and effect stacks don't touch the original pixels. History states can be named, and you can take snapshots.
+- **Selections and retouching.** Geometric and freehand selections, magic wand and subject selection, plus feathering, content-aware fill, patch healing and brushes.
+- **Vectors and type.** Editable shapes and paths. Text can be styled per range, set inside an area or along a path, and stays vector in SVG exports.
+- **Animation.** Keyframe layer properties on a timeline and export the animation.
+- **Working with other apps.** Layered PSD import and export, export slices, printing with DPI-aware sizing, and Quick Look thumbnails for project files.
+- **Automation.** Batch operations, recordable actions, keyboard shortcuts and AppleScript support.
 
 ## Export formats
 
-PixelFailure can export PNG, JPEG, TIFF, HEIC, WebP, PDF, SVG, and layered PSD files. Raster exports support embedded color profiles, while SVG keeps supported patterns, shapes, and outlined text as true vectors.
+PNG, JPEG, TIFF, HEIC, WebP, PDF, SVG and layered PSD. Raster formats can embed a color profile. SVG export keeps supported patterns, shapes and outlined text as real vectors instead of rasterizing them.
 
-Projects are saved as self-contained `.pixelfailure` document packages.
+Projects are saved as `.pixelfailure` document packages that contain everything the project needs.
 
 ## Requirements
 
 - macOS 15.0 or later
-- Xcode 16 or later with the macOS SDK
-- [XcodeGen](https://github.com/yonaskolb/XcodeGen) when regenerating the Xcode project
+- Xcode 16 or later
+- [XcodeGen](https://github.com/yonaskolb/XcodeGen), if you need to regenerate the Xcode project
 
-## Build and run
+## Building
 
-1. Clone the repository:
+Clone the repo and generate the Xcode project:
 
-    ```bash
-    git clone <repository-url>
-    cd PixelFailure-image-tool
-    ```
+```bash
+git clone <repository-url>
+cd PixelFailure-image-tool
+xcodegen generate
+```
 
-2. Generate the Xcode project:
-
-    ```bash
-    xcodegen generate
-    ```
-
-3. Open `PixelFailure.xcodeproj` in Xcode, select the **PixelFailure** scheme, and run the app.
-
-You can also build from the command line:
+Then open `PixelFailure.xcodeproj`, pick the **PixelFailure** scheme and run it. To build from the command line instead:
 
 ```bash
 xcodebuild \
@@ -59,7 +50,7 @@ xcodebuild \
 
 ## Tests
 
-Run the test suite from Xcode with **Product → Test**, or from the command line:
+Run them in Xcode with **Product → Test**, or:
 
 ```bash
 xcodebuild \
@@ -69,24 +60,24 @@ xcodebuild \
   test
 ```
 
-## Project structure
+## Project layout
 
 ```text
 PixelFailure/
-├── App/          Application entry point and automation
-├── Core/         Color, parameters, primitives, noise, and seeded RNG
-├── Document/     Project files, import/export, and workflow operations
-├── Effects/      Core Image effect pipeline
-├── Generators/   Deterministic pattern generators
-├── Model/        Layers, transforms, effects, palettes, and project state
-├── Painting/     Brush and paint-session implementation
-├── Rendering/    Canvas, raster, vector, and animation rendering
-├── Selection/    Selection tools, rasterization, and smart imaging
-└── Views/        SwiftUI editor interface and inspectors
+├── App/          App entry point and automation
+├── Core/         Color, parameters, primitives, noise, seeded RNG
+├── Document/     Project files, import/export, document operations
+├── Effects/      Core Image effects
+├── Generators/   Pattern generators
+├── Model/        Layers, transforms, effects, palettes, project state
+├── Painting/     Brushes and paint sessions
+├── Rendering/    Canvas, raster, vector and animation rendering
+├── Selection/    Selection tools, rasterization, smart imaging
+└── Views/        SwiftUI editor and inspectors
 ```
 
-The Quick Look extension lives in `QuickLookExtension/`, and the Xcode project is generated from `project.yml`.
+The Quick Look extension is in `QuickLookExtension/`. The Xcode project is generated from `project.yml`, so edit that rather than the `.xcodeproj`.
 
-## Development status
+## Status
 
-PixelFailure is still early in the development and worked on as a sideproject.
+This is a side project and still early. Expect rough edges.
