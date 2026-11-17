@@ -34,6 +34,16 @@ struct RenderItem: Identifiable {
     var mask: RenderMask?
     var styles: [LayerStyle] = []
     var svgWarning: String? = nil
+
+    /// Whether the item must be drawn into its own transparency layer.
+    /// Opacity, blend modes, and masks apply to the item as a whole; groups
+    /// isolate their children's blending. Anything else draws directly,
+    /// which avoids a full offscreen buffer per item per tile.
+    nonisolated var needsIsolatedCompositing: Bool {
+        if opacity < 1 || blendMode != .normal || mask != nil { return true }
+        if case .group = content { return true }
+        return false
+    }
 }
 
 nonisolated enum RenderQuality: Hashable, Sendable {
@@ -57,6 +67,14 @@ nonisolated enum RenderInvalidationRegion: Equatable, Sendable {
     case none
     case rect(CGRect)
     case full
+
+    func union(_ other: RenderInvalidationRegion) -> RenderInvalidationRegion {
+        switch (self, other) {
+        case (.full, _), (_, .full): .full
+        case (.none, let other), (let other, .none): other
+        case (.rect(let a), .rect(let b)): .rect(a.union(b))
+        }
+    }
 }
 
 nonisolated struct ViewportInvalidation: Equatable, Sendable {
@@ -82,6 +100,15 @@ final class RenderStore: ObservableObject {
     private unowned let document: PixelDocument
 
     @Published private(set) var viewportInvalidation: ViewportInvalidation = .initial
+    /// Recent invalidations, oldest first. SwiftUI can coalesce several model
+    /// publications into one view update; a consumer that only read the
+    /// newest region would leave stale tiles behind, so it asks for the union
+    /// of everything since the revision it last saw.
+    private var invalidationLog: [ViewportInvalidation] = []
+    private let invalidationLogLimit = 64
+    /// The last planned change, so a caller that plans eagerly (the canvas,
+    /// committing a drag) and the editor's model observer don't double-plan.
+    private var lastPlannedChange: (old: ProjectModel, new: ProjectModel)?
 
     private var decodedImages: [String: CGImage] = [:]
     /// Resolved image content is retained independently at every viewport tier.
@@ -197,15 +224,15 @@ final class RenderStore: ObservableObject {
     /// redraw; structural/global and evaluated-animation changes conservatively
     /// invalidate the canvas.
     func modelDidChange(from oldModel: ProjectModel, to newModel: ProjectModel) {
-        // SwiftUI may coalesce many model publications during a gesture. A
-        // single latest dirty rect cannot describe the complete path from the
-        // retained pixels to the final transform, so hand off one atomic full
-        // replacement after interactive presentation instead.
-        let oldTransforms = Dictionary(uniqueKeysWithValues: oldModel.allLayers.map { ($0.id, $0.transform) })
-        let transformChanged = newModel.allLayers.contains {
-            oldTransforms[$0.id] != nil && oldTransforms[$0.id] != $0.transform
-        }
-        let region: RenderInvalidationRegion = if document.isContinuousEditing || transformChanged {
+        // Array equality short-circuits on shared storage, so comparing
+        // against the copies kept here is cheap.
+        if let last = lastPlannedChange, last.old == oldModel, last.new == newModel { return }
+        lastPlannedChange = (oldModel, newModel)
+        // Slider drags publish many intermediate models; their path is not
+        // worth tracking rect by rect. Discrete edits (including a committed
+        // canvas move) invalidate exactly the old ∪ new bounds; consumers
+        // union regions across coalesced updates via `invalidation(since:)`.
+        let region: RenderInvalidationRegion = if document.isContinuousEditing {
             .full
         } else {
             RenderInvalidationPlanner.region(from: oldModel, to: newModel) {
@@ -214,9 +241,30 @@ final class RenderStore: ObservableObject {
             }
         }
         guard region != .none else { return }
-        viewportInvalidation = ViewportInvalidation(
-            revision: viewportInvalidation.revision &+ 1,
-            region: region)
+        let next = ViewportInvalidation(revision: viewportInvalidation.revision &+ 1,
+                                        region: region)
+        invalidationLog.append(next)
+        if invalidationLog.count > invalidationLogLimit {
+            invalidationLog.removeFirst(invalidationLog.count - invalidationLogLimit)
+        }
+        viewportInvalidation = next
+    }
+
+    /// The newest revision with the union of every region published after
+    /// `revision`. Unknown or evicted history conservatively yields `.full`.
+    func invalidation(since revision: UInt64?) -> ViewportInvalidation {
+        let current = viewportInvalidation
+        guard let revision, revision != current.revision else { return current }
+        guard revision < current.revision,
+              let oldest = invalidationLog.first,
+              oldest.revision <= revision &+ 1 else {
+            return ViewportInvalidation(revision: current.revision, region: .full)
+        }
+        var region = RenderInvalidationRegion.none
+        for entry in invalidationLog where entry.revision > revision {
+            region = region.union(entry.region)
+        }
+        return ViewportInvalidation(revision: current.revision, region: region)
     }
 
     /// Small sidebar thumbnail of one layer's content (mask applied,
@@ -637,7 +685,9 @@ final class RenderStore: ObservableObject {
         return ctx.makeImage()
     }
 
-    private func renderBounds(for layer: Layer, model: ProjectModel) -> CGRect {
+    /// Canvas-space bounds of everything a layer draws (styles and
+    /// antialiasing included).
+    func renderBounds(for layer: Layer, model: ProjectModel) -> CGRect {
         let size = naturalSize(for: layer, model: model)
         guard size.width > 0, size.height > 0 else { return .zero }
         let local = layer.transform.affine(naturalSize: size)

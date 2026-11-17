@@ -21,29 +21,39 @@ enum CanvasRenderer {
     /// transform, and mask.
     static func drawItem(_ item: RenderItem, in context: GraphicsContext,
                          space: WorkingColorSpace = .sRGB) {
+        guard item.needsIsolatedCompositing else {
+            var inner = context
+            drawTransformed(item, in: &inner, space: space)
+            return
+        }
         var layerContext = context
         layerContext.opacity = item.opacity
         layerContext.blendMode = item.blendMode.graphicsContextMode
         layerContext.drawLayer { inner in
-            inner.concatenate(item.transform)
-            let naturalRect = CGRect(origin: .zero, size: item.naturalSize)
-            if item.clipsToBounds { inner.clip(to: Path(naturalRect)) }
-            if let deformation = item.deformation {
-                for triangle in deformation.triangles(size: item.naturalSize) {
-                    guard let map = triangle.affine else { continue }
-                    var patch = inner
-                    var clip = Path()
-                    clip.move(to: triangle.destination.0)
-                    clip.addLine(to: triangle.destination.1)
-                    clip.addLine(to: triangle.destination.2)
-                    clip.closeSubpath()
-                    patch.clip(to: clip)
-                    patch.concatenate(map)
-                    drawLocal(item, naturalRect: naturalRect, in: patch, space: space)
-                }
-            } else {
-                drawLocal(item, naturalRect: naturalRect, in: inner, space: space)
+            drawTransformed(item, in: &inner, space: space)
+        }
+    }
+
+    private static func drawTransformed(_ item: RenderItem, in inner: inout GraphicsContext,
+                                        space: WorkingColorSpace) {
+        inner.concatenate(item.transform)
+        let naturalRect = CGRect(origin: .zero, size: item.naturalSize)
+        if item.clipsToBounds { inner.clip(to: Path(naturalRect)) }
+        if let deformation = item.deformation {
+            for triangle in deformation.triangles(size: item.naturalSize) {
+                guard let map = triangle.affine else { continue }
+                var patch = inner
+                var clip = Path()
+                clip.move(to: triangle.destination.0)
+                clip.addLine(to: triangle.destination.1)
+                clip.addLine(to: triangle.destination.2)
+                clip.closeSubpath()
+                patch.clip(to: clip)
+                patch.concatenate(map)
+                drawLocal(item, naturalRect: naturalRect, in: patch, space: space)
             }
+        } else {
+            drawLocal(item, naturalRect: naturalRect, in: inner, space: space)
         }
     }
 

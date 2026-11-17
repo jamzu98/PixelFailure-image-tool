@@ -22,7 +22,9 @@ struct TiledCanvasView: NSViewRepresentable {
     let transientInvalidation: TransientViewportInvalidation
     let suspendsContentUpdates: Bool
     let presentationRevision: UInt64
+    let interaction: CanvasInteraction?
     let onPresented: (RenderQuality, UInt64) -> Void
+    let onInteractionFinished: (UInt64) -> Void
 
     init(model: ProjectModel,
          renderStore: RenderStore,
@@ -32,7 +34,11 @@ struct TiledCanvasView: NSViewRepresentable {
          transientInvalidation: TransientViewportInvalidation,
          presentationRevision: UInt64 = 0,
          suspendsContentUpdates: Bool,
+         interaction: CanvasInteraction? = nil,
+         onInteractionFinished: @escaping (UInt64) -> Void = { _ in },
          onPresented: @escaping (RenderQuality, UInt64) -> Void) {
+        self.interaction = interaction
+        self.onInteractionFinished = onInteractionFinished
         self.model = model
         self.renderStore = renderStore
         self.quality = quality
@@ -69,6 +75,10 @@ struct TiledCanvasView: NSViewRepresentable {
 
     func updateNSView(_ view: RetainedTileCanvasNSView, context: Context) {
         view.onPresented = onPresented
+        view.onInteractionFinished = onInteractionFinished
+        // Several model publications can land in one SwiftUI update; take the
+        // union of every region since the revision this view last consumed.
+        let invalidation = renderStore.invalidation(since: view.lastReceivedInvalidationRevision)
         if !suspendsContentUpdates,
            view.requiresResolvedContent(invalidationRevision: invalidation.revision,
                                         quality: quality,
@@ -99,6 +109,7 @@ struct TiledCanvasView: NSViewRepresentable {
                                presentationRevision: presentationRevision)
         }
         view.updateCanvasTransform(canvasTransform)
+        view.updateInteraction(interaction)
     }
 }
 
@@ -423,6 +434,14 @@ final class RetainedTileCanvasNSView: NSView {
     private var lastVisibleKeys: Set<TileKey> = []
     var onPresented: ((RenderQuality, UInt64) -> Void)?
 
+    // Direct-transform presentation: pre-rasterized static runs and moving
+    // layers shown above (and instead of) the tile grids.
+    private let interactionLayer = CALayer()
+    private var interaction: CanvasInteraction?
+    private var interactionSurfaceLayers: [(layer: CALayer, surface: InteractionSurfaces.Surface)] = []
+    var onInteractionFinished: ((UInt64) -> Void)?
+    var lastReceivedInvalidationRevision: UInt64? { receivedInvalidationRevision }
+
     override var isFlipped: Bool { true }
 
     override init(frame frameRect: NSRect) {
@@ -445,6 +464,16 @@ final class RetainedTileCanvasNSView: NSView {
         canvasLayer.isGeometryFlipped = true
         canvasLayer.actions = ["transform": NSNull(), "position": NSNull(), "bounds": NSNull()]
         layer?.addSublayer(canvasLayer)
+
+        interactionLayer.anchorPoint = .zero
+        interactionLayer.position = .zero
+        interactionLayer.isGeometryFlipped = true
+        interactionLayer.masksToBounds = true
+        interactionLayer.zPosition = 1
+        interactionLayer.isHidden = true
+        interactionLayer.actions = ["position": NSNull(), "bounds": NSNull(),
+                                    "hidden": NSNull(), "sublayers": NSNull()]
+        canvasLayer.addSublayer(interactionLayer)
     }
 
     override func viewDidMoveToWindow() {
@@ -511,6 +540,7 @@ final class RetainedTileCanvasNSView: NSView {
         receivedQuality = quality
         canvasLayer.bounds = CGRect(origin: .zero, size: snapshot.canvasSize)
         for grid in gridLayers.values { grid.bounds = canvasLayer.bounds }
+        interactionLayer.bounds = canvasLayer.bounds
 
         let incoming = PendingContent(snapshot: snapshot, quality: quality,
                                       contentToken: latestContentToken,
@@ -544,6 +574,7 @@ final class RetainedTileCanvasNSView: NSView {
             submitMissingVisibleTiles()
         }
         emitPendingPresentationIfReady()
+        finishInteractionIfTilesReady()
     }
 
     private func applyPendingTransform() {
@@ -561,7 +592,7 @@ final class RetainedTileCanvasNSView: NSView {
             CATransaction.setDisableActions(true)
             // Keep only the current complete grid visible as the fallback.
             // The desired grid remains hidden until all visible tiles exist.
-            for (level, grid) in gridLayers { grid.isHidden = level != activeLevel }
+            applyGridVisibility()
             CATransaction.commit()
             if let snapshot = latestSnapshot {
                 pendingContent = PendingContent(snapshot: snapshot, quality: latestQuality,
@@ -650,7 +681,7 @@ final class RetainedTileCanvasNSView: NSView {
                         contentToken: batch.contentToken)
             }
             activeLevel = desiredLevel
-            for (level, grid) in gridLayers { grid.isHidden = level != activeLevel }
+            applyGridVisibility()
             CATransaction.commit()
         } else {
             guard batch.requestedSpecs.allSatisfy({
@@ -726,7 +757,7 @@ final class RetainedTileCanvasNSView: NSView {
         grid.position = .zero
         grid.bounds = canvasLayer.bounds
         grid.isGeometryFlipped = true
-        grid.isHidden = level != activeLevel
+        grid.isHidden = interaction != nil || level != activeLevel
         grid.actions = ["position": NSNull(), "bounds": NSNull(), "hidden": NSNull()]
         // Coarser grids are kept below finer ones while a replacement LOD is
         // assembling, so they fill gaps without obscuring ready detail.
@@ -734,6 +765,84 @@ final class RetainedTileCanvasNSView: NSView {
         canvasLayer.insertSublayer(grid, at: insertionIndex)
         gridLayers[level] = grid
         return grid
+    }
+
+    private func applyGridVisibility() {
+        for (level, grid) in gridLayers {
+            grid.isHidden = interaction != nil || level != activeLevel
+        }
+    }
+
+    // MARK: - Direct-transform surfaces
+
+    func updateInteraction(_ next: CanvasInteraction?) {
+        guard let next else {
+            if interaction != nil { tearDownInteraction(notify: false) }
+            return
+        }
+        guard next != interaction else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if interaction?.id != next.id || interaction?.surfaces !== next.surfaces {
+            installSurfaces(next.surfaces)
+        }
+        for (layer, surface) in interactionSurfaceLayers {
+            let delta = surface.movingID.flatMap { next.deltas[$0] } ?? .identity
+            layer.position = surface.canvasRect.origin.applying(delta)
+            layer.setAffineTransform(CGAffineTransform(a: delta.a, b: delta.b,
+                                                       c: delta.c, d: delta.d,
+                                                       tx: 0, ty: 0))
+        }
+        let wasShowing = interaction != nil
+        interaction = next
+        interactionLayer.isHidden = false
+        if !wasShowing { applyGridVisibility() }
+        CATransaction.commit()
+    }
+
+    private func installSurfaces(_ surfaces: InteractionSurfaces) {
+        for entry in interactionSurfaceLayers { entry.layer.removeFromSuperlayer() }
+        interactionSurfaceLayers = surfaces.surfaces.map { surface in
+            let layer = CALayer()
+            layer.anchorPoint = .zero
+            layer.bounds = CGRect(origin: .zero, size: surface.canvasRect.size)
+            layer.position = surface.canvasRect.origin
+            layer.contentsGravity = .resize
+            layer.minificationFilter = .trilinear
+            layer.magnificationFilter = .linear
+            layer.actions = ["contents": NSNull(), "position": NSNull(),
+                             "bounds": NSNull(), "transform": NSNull()]
+            layer.contents = surface.image
+            interactionLayer.addSublayer(layer)
+            return (layer, surface)
+        }
+    }
+
+    /// After pointer-up the bitmaps stay up until the committed model has
+    /// reached this view and every visible tile has been re-rendered, so the
+    /// swap back to tiles is a single invisible frame.
+    private func finishInteractionIfTilesReady() {
+        guard let interaction, let committed = interaction.committedRevision,
+              let received = receivedInvalidationRevision, received >= committed,
+              pendingContent == nil, let activeLevel, activeLevel == desiredLevel else { return }
+        let ready = visibleSpecs(level: desiredLevel).allSatisfy { spec in
+            tileLayers[spec.key]?.contents != nil && !invalidTileKeys.contains(spec.key)
+        }
+        guard ready else { return }
+        tearDownInteraction(notify: true)
+    }
+
+    private func tearDownInteraction(notify: Bool) {
+        let finishedID = interaction?.id
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for entry in interactionSurfaceLayers { entry.layer.removeFromSuperlayer() }
+        interactionSurfaceLayers = []
+        interaction = nil
+        interactionLayer.isHidden = true
+        applyGridVisibility()
+        CATransaction.commit()
+        if notify, let finishedID { onInteractionFinished?(finishedID) }
     }
 
     private func visibleSpecs(level: Int) -> [TileSpec] {
@@ -771,11 +880,7 @@ final class RetainedTileCanvasNSView: NSView {
 
     private func union(_ lhs: RenderInvalidationRegion,
                        _ rhs: RenderInvalidationRegion) -> RenderInvalidationRegion {
-        switch (lhs, rhs) {
-        case (.full, _), (_, .full): .full
-        case (.none, let other), (let other, .none): other
-        case (.rect(let a), .rect(let b)): .rect(a.union(b))
-        }
+        lhs.union(rhs)
     }
 
     private func submit(specs: [TileSpec], snapshot: ViewportRenderSnapshot?,
@@ -826,6 +931,10 @@ final class RetainedTileCanvasNSView: NSView {
     var currentMetrics: ViewportRenderMetrics { scheduler.metrics }
     var currentAppliedTransform: CGAffineTransform { appliedTransform }
     var currentDesiredLevel: Int { desiredLevel }
+    var isShowingInteraction: Bool { interaction != nil }
+    var interactionSurfaceFrames: [CGRect] {
+        interactionSurfaceLayers.map(\.layer.frame)
+    }
     var visibleGridLevels: Set<Int> {
         Set(gridLayers.compactMap { $0.value.isHidden ? nil : $0.key })
     }

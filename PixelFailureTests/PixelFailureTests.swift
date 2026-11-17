@@ -1707,7 +1707,7 @@ struct TiledViewportTests {
         #expect(sampler.color(atUnitX: 0.9, y: 0.5).a < 0.01)
     }
 
-    @Test func transformChangesForceAnAtomicFullReplacement() {
+    @Test func committedTransformInvalidatesOnlyOldAndNewBounds() throws {
         let document = PixelDocument()
         let layer = Layer(name: "Moving", transform: LayerTransform(position: CGPoint(x: 80, y: 80)),
                           kind: .shape(ShapeConfig(size: CGSize(width: 40, height: 40))))
@@ -1716,7 +1716,253 @@ struct TiledViewportTests {
         new.modifyLayer(id: layer.id) { $0.transform.position.x += 50 }
         let store = RenderStore(document: document)
         store.modelDidChange(from: old, to: new)
-        #expect(store.viewportInvalidation.region == .full)
+        guard case .rect(let dirty) = store.viewportInvalidation.region else {
+            Issue.record("expected a local invalidation, got \(store.viewportInvalidation.region)")
+            return
+        }
+        #expect(dirty.minX <= 60 && dirty.maxX >= 150)
+        #expect(dirty.width < 300)
+    }
+
+    @Test func coalescedInvalidationsAreUnionedForLateConsumers() {
+        let document = PixelDocument()
+        let a = Layer(name: "A", transform: LayerTransform(position: CGPoint(x: 30, y: 30)),
+                      kind: .shape(ShapeConfig(size: CGSize(width: 20, height: 20))))
+        let b = Layer(name: "B", transform: LayerTransform(position: CGPoint(x: 250, y: 150)),
+                      kind: .shape(ShapeConfig(size: CGSize(width: 20, height: 20))))
+        let m0 = ProjectModel(canvasSize: CGSize(width: 300, height: 200), layers: [a, b])
+        var m1 = m0
+        m1.modifyLayer(id: a.id) { $0.opacity = 0.5 }
+        var m2 = m1
+        m2.modifyLayer(id: b.id) { $0.opacity = 0.5 }
+        let store = RenderStore(document: document)
+        let start = store.viewportInvalidation.revision
+        store.modelDidChange(from: m0, to: m1)
+        store.modelDidChange(from: m0, to: m1) // duplicate planning is ignored
+        store.modelDidChange(from: m1, to: m2)
+        #expect(store.viewportInvalidation.revision == start + 2)
+
+        // A consumer that missed the first publication still repaints A.
+        guard case .rect(let both) = store.invalidation(since: start).region else {
+            Issue.record("expected a rect")
+            return
+        }
+        #expect(both.contains(CGPoint(x: 30, y: 30)))
+        #expect(both.contains(CGPoint(x: 250, y: 150)))
+        guard case .rect(let latest) = store.invalidation(since: start + 1).region else {
+            Issue.record("expected a rect")
+            return
+        }
+        #expect(!latest.contains(CGPoint(x: 30, y: 30)))
+        // Unknown history is conservatively a full repaint.
+        #expect(store.invalidation(since: start &+ 99).region == .full)
+    }
+
+    private func fillItem(_ hex: String, x: CGFloat, y: CGFloat, size: CGFloat = 20,
+                          opacity: Double = 1, blend: LayerBlendMode = .normal) -> RenderItem {
+        RenderItem(id: UUID(), opacity: opacity, blendMode: blend,
+                   transform: CGAffineTransform(translationX: x, y: y),
+                   naturalSize: CGSize(width: size, height: size),
+                   content: .fill(FillConfig(style: .solid, colors: [RGBAColor(hex: hex)])),
+                   mask: nil)
+    }
+
+    @Test func interactionPlanRefusesBlendingItCannotReproduce() {
+        let below = fillItem("#FF0000", x: 0, y: 0, blend: .multiply)
+        let moving = fillItem("#0000FF", x: 10, y: 10)
+        let above = fillItem("#00FF00", x: 20, y: 20)
+        let bounds: (UUID) -> CGRect? = { _ in CGRect(x: 0, y: 0, width: 40, height: 40) }
+        let plan = InteractionCompositor.plan(items: [below, moving, above], background: .white,
+                                              movingIDs: [moving.id], bounds: bounds)
+        #expect(plan?.count == 3)
+
+        var multiplyAbove = above
+        multiplyAbove.blendMode = .multiply
+        #expect(InteractionCompositor.plan(items: [below, moving, multiplyAbove], background: .white,
+                                           movingIDs: [moving.id], bounds: bounds) == nil)
+        var multiplyMoving = moving
+        multiplyMoving.blendMode = .screen
+        #expect(InteractionCompositor.plan(items: [below, multiplyMoving, above], background: .white,
+                                           movingIDs: [moving.id], bounds: bounds) == nil)
+    }
+
+    /// The drag presentation must look like the real composite: bitmaps of
+    /// the static runs and moved layer, composited source-over, match a
+    /// monolithic render of the moved scene.
+    @Test func interactionSurfacesCompositeLikeTheMonolithicRender() async throws {
+        let size = CGSize(width: 64, height: 64)
+        let below = fillItem("#E02020", x: 4, y: 4, size: 40)
+        let moving = fillItem("#2040E0", x: 10, y: 10)
+        let above = fillItem("#20C040", x: 24, y: 24, opacity: 0.5)
+        let items = [below, moving, above]
+        let movingBounds = CGRect(x: 10, y: 10, width: 20, height: 20).insetBy(dx: -2, dy: -2)
+        let runs = try #require(InteractionCompositor.plan(items: items, background: .white,
+                                                           movingIDs: [moving.id],
+                                                           bounds: { _ in movingBounds }))
+        let key = InteractionSurfaceKey(modelHash: 1, movingIDs: [moving.id])
+        let surfaces = try #require(await InteractionCompositor.render(
+            runs: runs, key: key, canvasSize: size,
+            staticRect: CGRect(origin: .zero, size: size), staticScale: 1, space: .sRGB))
+        #expect(surfaces.surfaces.count == 3)
+
+        let delta = CGAffineTransform(translationX: 14, y: 6)
+        let context = try #require(ColorSettings.default.makeRGBAContext(width: 64, height: 64))
+        context.translateBy(x: 0, y: 64)
+        context.scaleBy(x: 1, y: -1)
+        for surface in surfaces.surfaces {
+            let origin = surface.movingID == nil ? surface.canvasRect.origin
+                : surface.canvasRect.origin.applying(delta)
+            context.saveGState()
+            context.translateBy(x: origin.x, y: origin.y + surface.canvasRect.height)
+            context.scaleBy(x: 1, y: -1)
+            context.draw(surface.image, in: CGRect(origin: .zero, size: surface.canvasRect.size))
+            context.restoreGState()
+        }
+        let composited = try #require(context.makeImage())
+
+        var moved = moving
+        moved.transform = moved.transform.concatenating(delta)
+        let reference = try #require(PNGExporter.render(items: [below, moved, above], background: .white,
+                                                        canvasSize: size, targetPixelSize: size))
+        let a = try #require(ImageSampler(cgImage: composited))
+        let b = try #require(ImageSampler(cgImage: reference))
+        for (x, y) in [(0.1, 0.1), (0.3, 0.3), (0.45, 0.35), (0.6, 0.6), (0.55, 0.45), (0.9, 0.9)] {
+            let ca = a.color(atUnitX: x, y: y), cb = b.color(atUnitX: x, y: y)
+            #expect(abs(ca.r - cb.r) < 0.03 && abs(ca.g - cb.g) < 0.03 && abs(ca.b - cb.b) < 0.03,
+                    "mismatch at \(x),\(y): \(ca) vs \(cb)")
+        }
+    }
+
+    @Test func interactionHandsBackToTilesOnlyWhenCommittedTilesAreReady() async throws {
+        let size = CGSize(width: 32, height: 32)
+        let view = RetainedTileCanvasNSView(frame: CGRect(origin: .zero, size: size))
+        let spec = TileSpec(key: TileKey(level: 0, x: 0, y: 0),
+                            canvasRect: CGRect(origin: .zero, size: size), rasterScale: 1)
+        let red = ViewportRenderSnapshot(items: [], background: RGBAColor(hex: "#D04020"),
+                                         canvasSize: size, workingSpace: .sRGB)
+        view.updateContent(snapshot: red, quality: .full, invalidation: .initial,
+                           transientInvalidation: .none)
+        view.presentForTesting(TileBatch(generation: 1, contentToken: 1, quality: .full,
+                                         tiles: [RenderedTile(spec: spec, image: try #require(
+                                            TileRasterizer.render(spec: spec, snapshot: red)?.image))],
+                                         submittedAt: ContinuousClock().now))
+        #expect(view.visibleGridLevels == [0])
+
+        let moving = fillItem("#2040E0", x: 4, y: 4, size: 8)
+        let runs = try #require(InteractionCompositor.plan(
+            items: [moving], background: .white, movingIDs: [moving.id],
+            bounds: { _ in CGRect(x: 4, y: 4, width: 8, height: 8) }))
+        let surfaces = try #require(await InteractionCompositor.render(
+            runs: runs, key: InteractionSurfaceKey(modelHash: 0, movingIDs: [moving.id]),
+            canvasSize: size, staticRect: CGRect(origin: .zero, size: size),
+            staticScale: 1, space: .sRGB))
+        var finished: [UInt64] = []
+        view.onInteractionFinished = { finished.append($0) }
+
+        var interaction = CanvasInteraction(id: 7, surfaces: surfaces,
+                                            deltas: [moving.id: CGAffineTransform(translationX: 10, y: 0)])
+        view.updateInteraction(interaction)
+        #expect(view.isShowingInteraction)
+        #expect(view.visibleGridLevels.isEmpty)
+        #expect(view.interactionSurfaceFrames.contains { abs($0.minX - 14) < 0.01 })
+
+        // Pointer-up: the commit's revision hasn't reached the view yet.
+        interaction.committedRevision = 1
+        view.updateInteraction(interaction)
+        view.displayFrameForTesting()
+        #expect(view.isShowingInteraction)
+
+        let blue = ViewportRenderSnapshot(items: [], background: RGBAColor(hex: "#2040D0"),
+                                          canvasSize: size, workingSpace: .sRGB)
+        view.updateContent(snapshot: blue, quality: .full,
+                           invalidation: ViewportInvalidation(revision: 1, region: .full),
+                           transientInvalidation: .none)
+        view.displayFrameForTesting()
+        #expect(view.isShowingInteraction) // tile still stale
+        view.presentForTesting(TileBatch(generation: 3, contentToken: 2, quality: .full,
+                                         tiles: [RenderedTile(spec: spec, image: try #require(
+                                            TileRasterizer.render(spec: spec, snapshot: blue)?.image))],
+                                         submittedAt: ContinuousClock().now))
+        view.displayFrameForTesting()
+        #expect(!view.isShowingInteraction)
+        #expect(finished == [7])
+        #expect(view.visibleGridLevels == [0])
+    }
+
+    /// Renders the real Core Animation tree: the bitmap drag presentation
+    /// (moved + rotated) must land exactly where the tiles draw the same
+    /// committed scene, catching any flip / transform-order mistake.
+    @Test func interactionLayersMatchTilePresentationGeometry() async throws {
+        let size = CGSize(width: 64, height: 64)
+        let view = RetainedTileCanvasNSView(frame: CGRect(origin: .zero, size: size))
+        view.layoutSubtreeIfNeeded()
+        let below = fillItem("#E02020", x: 0, y: 40, size: 24)
+        // Asymmetric bar so a flip or wrong rotation direction shows.
+        var moving = fillItem("#2040E0", x: 6, y: 6)
+        moving.naturalSize = CGSize(width: 30, height: 8)
+        let start = moving.transform
+        let delta = CGAffineTransform(translationX: -20, y: -10)
+            .concatenating(CGAffineTransform(rotationAngle: .pi / 6))
+            .concatenating(CGAffineTransform(translationX: 20 + 14, y: 10 + 18))
+
+        func renderLayerTree() throws -> ImageSampler {
+            let context = try #require(ColorSettings.default.makeRGBAContext(width: 64, height: 64))
+            view.layer?.render(in: context)
+            let image = try #require(context.makeImage())
+            return try #require(ImageSampler(cgImage: image))
+        }
+
+        // Reference: tiles of the committed (moved) scene.
+        var moved = moving
+        moved.transform = start.concatenating(delta)
+        let committed = ViewportRenderSnapshot(items: [below, moved], background: .white,
+                                               canvasSize: size, workingSpace: .sRGB)
+        let spec = TileSpec(key: TileKey(level: 0, x: 0, y: 0),
+                            canvasRect: CGRect(origin: .zero, size: size), rasterScale: 1)
+        view.updateContent(snapshot: committed, quality: .full, invalidation: .initial,
+                           transientInvalidation: .none)
+        let committedImage = try #require(TileRasterizer.render(spec: spec, snapshot: committed)?.image)
+        view.presentForTesting(TileBatch(generation: 1, contentToken: 1, quality: .full,
+                                         tiles: [RenderedTile(spec: spec, image: committedImage)],
+                                         submittedAt: ContinuousClock().now))
+        let tiles = try renderLayerTree()
+
+        // Candidate: capture-time bitmaps plus the live delta.
+        let runs = try #require(InteractionCompositor.plan(
+            items: [below, moving], background: .white, movingIDs: [moving.id],
+            bounds: { _ in CGRect(x: 4, y: 4, width: 34, height: 12) }))
+        let surfaces = try #require(await InteractionCompositor.render(
+            runs: runs, key: InteractionSurfaceKey(modelHash: 0, movingIDs: [moving.id]),
+            canvasSize: size, staticRect: CGRect(origin: .zero, size: size),
+            staticScale: 1, space: .sRGB))
+        view.updateInteraction(CanvasInteraction(id: 1, surfaces: surfaces,
+                                                 deltas: [moving.id: delta]))
+        #expect(view.isShowingInteraction)
+        let bitmaps = try renderLayerTree()
+
+        var mismatches = 0, blueSamples = 0
+        for yi in 0..<16 {
+            for xi in 0..<16 {
+                let x = (Double(xi) + 0.5) / 16, y = (Double(yi) + 0.5) / 16
+                let a = tiles.color(atUnitX: x, y: y), b = bitmaps.color(atUnitX: x, y: y)
+                if a.b > 0.6 && a.r < 0.4 { blueSamples += 1 }
+                if abs(a.r - b.r) > 0.2 || abs(a.g - b.g) > 0.2 || abs(a.b - b.b) > 0.2 {
+                    mismatches += 1
+                }
+            }
+        }
+        #expect(blueSamples > 4)      // the moved bar is actually in frame
+        #expect(mismatches <= 6)      // only antialiased edge samples may differ
+    }
+
+    @Test func trivialItemsSkipIsolationButComplexOnesKeepIt() {
+        let plain = fillItem("#FF0000", x: 0, y: 0)
+        #expect(!plain.needsIsolatedCompositing)
+        #expect(fillItem("#FF0000", x: 0, y: 0, opacity: 0.5).needsIsolatedCompositing)
+        #expect(fillItem("#FF0000", x: 0, y: 0, blend: .multiply).needsIsolatedCompositing)
+        var group = plain
+        group.content = .group([plain])
+        #expect(group.needsIsolatedCompositing)
     }
 
     @Test func paddedTilesMatchTheMonolithicRenderAcrossASeam() throws {

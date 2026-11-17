@@ -55,14 +55,29 @@ nonisolated enum PNGExporter {
         ctx.restoreGState()
     }
 
+    /// Draws items in order without clipping or a background. Used by the
+    /// interaction compositor, whose moving-layer bitmaps may extend past the
+    /// canvas edge.
+    static func drawItems(_ items: [RenderItem], context ctx: CGContext,
+                          space: WorkingColorSpace) {
+        for item in items {
+            drawItem(item, context: ctx, space: space)
+        }
+    }
+
     /// Draws one item (recursively for groups) with opacity, blend mode,
     /// transform, and mask.
     private static func drawItem(_ item: RenderItem, context ctx: CGContext,
                                  space: WorkingColorSpace) {
         ctx.saveGState()
-        ctx.setAlpha(CGFloat(item.opacity))
-        ctx.setBlendMode(item.blendMode.cgBlendMode)
-        ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+        // A transparency layer is a full offscreen buffer per item per tile.
+        // It only changes the result when the item must composite as a unit.
+        let isolated = item.needsIsolatedCompositing
+        if isolated {
+            ctx.setAlpha(CGFloat(item.opacity))
+            ctx.setBlendMode(item.blendMode.cgBlendMode)
+            ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+        }
         ctx.concatenate(item.transform)
 
         let naturalRect = CGRect(origin: .zero, size: item.naturalSize)
@@ -86,7 +101,7 @@ nonisolated enum PNGExporter {
             }
         }
 
-        ctx.endTransparencyLayer()
+        if isolated { ctx.endTransparencyLayer() }
         ctx.restoreGState()
     }
 
