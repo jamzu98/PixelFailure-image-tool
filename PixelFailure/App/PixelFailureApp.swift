@@ -7,6 +7,8 @@ struct PixelFailureApp: App {
         DocumentGroup(newDocument: { PixelDocument() }) { configuration in
             EditorView(document: configuration.document)
         }
+        // One slim bar: title and toolbar items share a single compact row.
+        .windowToolbarStyle(.unifiedCompact(showsTitle: true))
         .commands {
             EditorCommands()
             ViewCommands()

@@ -53,6 +53,10 @@ struct EditorView: View {
                                                       renderStore: renderStore,
                                                       undoManager: undoManager))
         .toolbar { toolbarContent }
+        // Paint the title bar as one solid strip; otherwise each split pane's
+        // background (layers, canvas, inspector) bleeds up into it as sections.
+        .toolbarBackground(Color(nsColor: .windowBackgroundColor), for: .windowToolbar)
+        .toolbarBackgroundVisibility(.visible, for: .windowToolbar)
         .sheet(isPresented: Binding(get: { editorState.showExportSheet },
                                     set: { editorState.showExportSheet = $0 })) {
             NavigationStack {
@@ -176,7 +180,13 @@ struct EditorView: View {
                 Divider()
                 Button("Show Welcome") { didCompleteOnboarding = false }
             } label: {
-                Label("Share", systemImage: "square.and.arrow.up.on.square")
+                // Tall stacked glyphs overflow the compact toolbar capsule at
+                // the default scale; shrink them so they sit inside it.
+                Label {
+                    Text("Share")
+                } icon: {
+                    Image(systemName: "square.and.arrow.up.on.square").imageScale(.small)
+                }
             }
 
             Menu {
@@ -200,8 +210,12 @@ struct EditorView: View {
                     }
                 }
             } label: {
-                Label(editorState.isRecordingAction ? "Recording" : "Actions",
-                      systemImage: editorState.isRecordingAction ? "record.circle.fill" : "play.square.stack")
+                Label {
+                    Text(editorState.isRecordingAction ? "Recording" : "Actions")
+                } icon: {
+                    Image(systemName: editorState.isRecordingAction ? "record.circle.fill" : "play.square.stack")
+                        .imageScale(.small)
+                }
             }
         }
     }
