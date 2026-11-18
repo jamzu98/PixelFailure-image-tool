@@ -22,7 +22,7 @@ struct EditorView: View {
         VStack(spacing: 0) {
             // Always present at a fixed height so switching tools never
             // shifts the canvas.
-            ToolOptionsBar(document: document, editorState: editorState)
+            ToolOptionsBar(document: document, editorState: editorState, renderStore: renderStore)
 
             HSplitView {
                 HStack(spacing: 0) {

@@ -119,6 +119,16 @@ struct CanvasViewport: View {
         case paint
         case marquee(startCanvasPoint: CGPoint)
         case lassoFreehand(points: [CGPoint])
+        case objectBox(startCanvasPoint: CGPoint)
+    }
+
+    private var visionFocus: EditorFocus {
+        EditorFocus(document: document, editorState: editorState,
+                    renderStore: renderStore, undoManager: undoManager)
+    }
+
+    private static func boxPath(from a: CGPoint, to b: CGPoint) -> Path {
+        Path(CGRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(a.x - b.x), height: abs(a.y - b.y)))
     }
 
     private func moveEntries(for ids: Set<UUID>) -> [(id: UUID, start: LayerTransform, parentInverse: CGAffineTransform)] {
@@ -233,6 +243,13 @@ struct CanvasViewport: View {
                                                                                 canvasTransform: canvasTransform) })
                 }
 
+                if editorState.activeTool == .objectSelect {
+                    VisionOverlayView(vision: editorState.vision,
+                                      canvasTransform: canvasTransform,
+                                      canvasSize: document.model.canvasSize,
+                                      scale: scale)
+                }
+
                 SelectionAntsView(editorState: editorState,
                                   canvasTransform: canvasTransform,
                                   scale: scale,
@@ -283,6 +300,10 @@ struct CanvasViewport: View {
                 return .handled
             }
             .onKeyPress(.escape) {
+                if editorState.vision.candidate != nil || editorState.vision.isBusy {
+                    editorState.vision.cancel()
+                    return .handled
+                }
                 if editorState.lassoVertices != nil {
                     editorState.lassoVertices = nil
                     return .handled
@@ -305,6 +326,10 @@ struct CanvasViewport: View {
                 return .handled
             }
             .onKeyPress(.return) {
+                if editorState.vision.candidate != nil {
+                    editorState.vision.commit(editorState)
+                    return .handled
+                }
                 if editorState.lassoVertices != nil {
                     closePolygonalLasso()
                     return .handled
@@ -335,12 +360,22 @@ struct CanvasViewport: View {
                     hoverLocation = location
                     isHoveringViewport = true
                     setCursor(cursor(at: location, canvasTransform: canvasTransform, scale: scale))
+                    if editorState.activeTool == .objectSelect, dragMode == nil {
+                        editorState.vision.hover(at: location.applying(canvasTransform.inverted()),
+                                                 focus: visionFocus)
+                    }
                 case .ended:
                     isHoveringViewport = false
                     setCursor(.arrow)
+                    editorState.vision.clearHover()
                 }
             }
-            .onChange(of: editorState.activeTool) { _, _ in
+            .onChange(of: editorState.activeTool) { old, new in
+                if old == .objectSelect {
+                    editorState.vision.commit(editorState)
+                    editorState.vision.clearHover()
+                }
+                if new == .objectSelect { editorState.vision.prefetch(focus: visionFocus) }
                 // Tool switched by shortcut while hovering: update immediately
                 // instead of waiting for the next mouse move.
                 setCursor(cursor(at: hoverLocation, canvasTransform: canvasTransform, scale: scale))
@@ -387,7 +422,18 @@ struct CanvasViewport: View {
         .onChange(of: editorState.isAnimationPlaying) { _, _ in updateViewportQuality() }
         .onChange(of: editorState.isAnimationScrubbing) { _, _ in updateViewportQuality() }
         .onChange(of: editorState.selectedLayerIDs) { _, _ in scheduleInteractionPreparation() }
-        .onChange(of: document.model) { _, _ in scheduleInteractionPreparation() }
+        .onChange(of: document.model.canvasSize) { _, newSize in
+            // A soft matte is a grid over the old canvas; it can't follow a crop/resize.
+            if let matte = editorState.selection?.matte, matte.canvasSize != newSize {
+                editorState.selection = nil
+            }
+            editorState.vision.cancel()
+        }
+        .onChange(of: document.model) { _, _ in
+            scheduleInteractionPreparation()
+            editorState.vision.documentChanged()
+            if editorState.activeTool == .objectSelect { editorState.vision.prefetch(focus: visionFocus) }
+        }
         .onChange(of: pan) { _, _ in scheduleInteractionPreparation() }
         .onChange(of: zoomLevel) { _, _ in scheduleInteractionPreparation() }
         .onAppear {
@@ -997,6 +1043,9 @@ struct CanvasViewport: View {
                         dragMode = .pan(startPan: pan)
                     case .marquee:
                         dragMode = .marquee(startCanvasPoint: value.startLocation.applying(canvasTransform.inverted()))
+                    case .objectSelect:
+                        editorState.vision.clearHover()
+                        dragMode = .objectBox(startCanvasPoint: value.startLocation.applying(canvasTransform.inverted()))
                     case .lasso:
                         if editorState.lassoPolygonal {
                             dragMode = .pan(startPan: pan)
@@ -1065,6 +1114,9 @@ struct CanvasViewport: View {
                 case .marquee(let start):
                     let current = value.location.applying(canvasTransform.inverted())
                     editorState.selectionDraft = marqueePath(from: start, to: current)
+                case .objectBox(let start):
+                    let current = value.location.applying(canvasTransform.inverted())
+                    editorState.selectionDraft = Self.boxPath(from: start, to: current)
                 case .lassoFreehand(var points):
                     let current = value.location.applying(canvasTransform.inverted())
                     if let last = points.last, hypot(current.x - last.x, current.y - last.y) > 2 / scale {
@@ -1099,6 +1151,11 @@ struct CanvasViewport: View {
                     let end = value.location.applying(canvasTransform.inverted())
                     editorState.selectionDraft = nil
                     commitSelectionPath(marqueePath(from: start, to: end))
+                case .objectBox(let start):
+                    let end = value.location.applying(canvasTransform.inverted())
+                    editorState.selectionDraft = nil
+                    editorState.vision.box(Self.boxPath(from: start, to: end).boundingRect,
+                                           modifiers: NSEvent.modifierFlags, focus: visionFocus)
                 case .lassoFreehand(let points):
                     editorState.selectionDraft = nil
                     if points.count >= 3 {
@@ -1206,7 +1263,7 @@ struct CanvasViewport: View {
             return NSEvent.modifierFlags.contains(.option) ? .zoomOut : .zoomIn
         case .eyedropper:
             return Cursors.eyedropper
-        case .marquee, .lasso, .wand:
+        case .marquee, .lasso, .wand, .objectSelect:
             return .crosshair
         case .pen:
             return .crosshair
@@ -1298,6 +1355,8 @@ struct CanvasViewport: View {
             polygonalLassoClick(at: canvasPoint, scale: scale)
         case .wand:
             wandClick(at: canvasPoint)
+        case .objectSelect:
+            editorState.vision.click(at: canvasPoint, modifiers: NSEvent.modifierFlags, focus: visionFocus)
         case .pen:
             if let layer = document.model.layer(id: editorState.selectedLayerID), layer.kind.isPath {
                 document.addPathNode(to: layer.id, canvasPoint: canvasPoint, undoManager: undoManager)
@@ -1361,17 +1420,23 @@ struct CanvasViewport: View {
             let base = samePaintTarget(continuationTarget, target)
                 ? continuationImage : renderStore.originalImage(key: mask.imageKey)
             var clip: CGPath?
+            var clipMask: CGImage?
             if let selection = editorState.selection {
                 let naturalSize = renderStore.naturalSize(for: layer, model: document.model)
                 if var t = SelectionRasterizer.canvasToLocalBuffer(layer: layer,
                                                                    naturalSize: naturalSize,
                                                                    bufferPixelSize: mask.pixelSize,
                                                                    parentAffine: document.model.parentAffine(of: maskID)) {
-                    clip = selection.path.cgPath.copy(using: &t)
+                    if selection.matte != nil {
+                        clipMask = SelectionRasterizer.grayMask(selection: selection, transform: t,
+                                                                pixelSize: mask.pixelSize)
+                    } else {
+                        clip = selection.path.cgPath.copy(using: &t)
+                    }
                 }
             }
             nextSession = PaintSession(target: target, base: base,
-                                       pixelSize: mask.pixelSize, clipPath: clip)
+                                       pixelSize: mask.pixelSize, clipPath: clip, clipMask: clipMask)
         } else {
             var targetID = editorState.selectedLayerID
             let targetLayer = document.model.layer(id: targetID ?? UUID())
@@ -1395,17 +1460,23 @@ struct CanvasViewport: View {
                 : samePaintTarget(continuationTarget, target)
                 ? continuationImage : renderStore.originalImage(key: config.imageKey)
             var clip: CGPath?
+            var clipMask: CGImage?
             if let selection = editorState.selection {
                 let naturalSize = renderStore.naturalSize(for: layer, model: document.model)
                 if var t = SelectionRasterizer.canvasToContentBuffer(layer: layer,
                                                                      naturalSize: naturalSize,
                                                                      config: config,
                                                                      parentAffine: document.model.parentAffine(of: id)) {
-                    clip = selection.path.cgPath.copy(using: &t)
+                    if selection.matte != nil {
+                        clipMask = SelectionRasterizer.grayMask(selection: selection, transform: t,
+                                                                pixelSize: config.pixelSize)
+                    } else {
+                        clip = selection.path.cgPath.copy(using: &t)
+                    }
                 }
             }
             nextSession = PaintSession(target: target, base: base,
-                                       pixelSize: config.pixelSize, clipPath: clip,
+                                       pixelSize: config.pixelSize, clipPath: clip, clipMask: clipMask,
                                        colorSettings: document.model.colorSettings)
         }
         guard let nextSession else { return }
@@ -2112,6 +2183,7 @@ struct CanvasViewport: View {
             Text("\(model.colorSettings.workingSpace.displayName) · \(model.colorSettings.bitDepth.displayName)")
             BarDivider()
             Text("\(model.allLayers.count) layer\(model.allLayers.count == 1 ? "" : "s")")
+            VisionStatusView(vision: editorState.vision)
             Spacer(minLength: 0)
             Text(editorState.activeTool.displayName)
         }

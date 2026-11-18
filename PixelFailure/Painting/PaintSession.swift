@@ -35,8 +35,10 @@ final class PaintSession {
 
     /// `base` seeds the buffer (existing pixels / existing mask).
     /// `clipPath` (buffer space, even-odd) confines strokes to a selection.
+    /// `clipMask` (buffer-space grayscale, white = paintable) softly confines
+    /// strokes to a matte-backed selection; it wins over `clipPath`.
     init?(target: Target, base: CGImage?, pixelSize: CGSize, clipPath: CGPath? = nil,
-          colorSettings: ColorSettings = .default) {
+          clipMask: CGImage? = nil, colorSettings: ColorSettings = .default) {
         self.target = target
         self.pixelSize = pixelSize
         self.colorSettings = colorSettings
@@ -63,7 +65,9 @@ final class PaintSession {
             // the base image draws directly.
             ctx.draw(base, in: CGRect(x: 0, y: 0, width: width, height: height))
         }
-        if let clipPath {
+        if let clipMask {
+            ctx.clip(to: CGRect(x: 0, y: 0, width: width, height: height), mask: clipMask)
+        } else if let clipPath {
             ctx.addPath(clipPath)
             ctx.clip(using: .evenOdd)
         }

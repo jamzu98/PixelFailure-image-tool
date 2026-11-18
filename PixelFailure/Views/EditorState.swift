@@ -2,7 +2,7 @@ import SwiftUI
 
 /// The viewport tools, Photoshop-style.
 enum EditorTool: String, CaseIterable, Identifiable {
-    case move, marquee, lasso, wand, hand, zoom, eyedropper, brush, eraser, crop
+    case move, marquee, lasso, wand, objectSelect, hand, zoom, eyedropper, brush, eraser, crop
     case clone, heal, smudge, dodge, burn
     case pen, node
 
@@ -14,6 +14,7 @@ enum EditorTool: String, CaseIterable, Identifiable {
         case .marquee: "Marquee Select"
         case .lasso: "Lasso Select"
         case .wand: "Magic Wand"
+        case .objectSelect: "Object Select"
         case .hand: "Hand"
         case .zoom: "Zoom"
         case .eyedropper: "Eyedropper"
@@ -36,6 +37,7 @@ enum EditorTool: String, CaseIterable, Identifiable {
         case .marquee: "rectangle.dashed"
         case .lasso: "lasso"
         case .wand: "wand.and.rays"
+        case .objectSelect: "sparkles.rectangle.stack"
         case .hand: "hand.raised"
         case .zoom: "magnifyingglass"
         case .eyedropper: "eyedropper"
@@ -58,6 +60,7 @@ enum EditorTool: String, CaseIterable, Identifiable {
         case .marquee: "m"
         case .lasso: "l"
         case .wand: "w"
+        case .objectSelect: "q"
         case .hand: "h"
         case .zoom: "z"
         case .eyedropper: "i"
@@ -75,7 +78,7 @@ enum EditorTool: String, CaseIterable, Identifiable {
     }
 
     var isSelectionTool: Bool {
-        self == .marquee || self == .lasso || self == .wand
+        self == .marquee || self == .lasso || self == .wand || self == .objectSelect
     }
 }
 
@@ -225,6 +228,8 @@ final class EditorState {
     var wandTolerance = 0.25
     /// Feather (canvas px) applied to newly created selections.
     var featherDefault = 0.0
+    /// Vision-backed smart selection (Select Subject, Object Select tool).
+    let vision = VisionSelectionController()
 
     /// Transient smart-guide feedback while moving a layer.
     var smartGuideX: Double?

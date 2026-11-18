@@ -54,7 +54,7 @@ struct ToolStrip: View {
 
     private static let groups: [[EditorTool]] = [
         [.move],
-        [.marquee, .lasso, .wand],
+        [.marquee, .lasso, .wand, .objectSelect],
         [.crop, .eyedropper],
         [.brush, .eraser, .clone, .heal, .smudge, .dodge, .burn],
         [.pen, .node],
@@ -122,6 +122,7 @@ struct ToolStrip: View {
 struct ToolOptionsBar: View {
     @ObservedObject var document: PixelDocument
     @Bindable var editorState: EditorState
+    let renderStore: RenderStore
     @Environment(\.undoManager) private var undoManager
     @State private var showsDynamics = false
 
@@ -172,6 +173,11 @@ struct ToolOptionsBar: View {
                     ), range: 0.02...0.9, defaultValue: 0.25, percent: true)
                     .frame(width: 150)
                 }
+                featherControl
+            case .objectSelect:
+                ObjectSelectOptions(vision: editorState.vision,
+                                    focus: EditorFocus(document: document, editorState: editorState,
+                                                       renderStore: renderStore, undoManager: undoManager))
                 featherControl
             case .hand:
                 option("Rotate View") {

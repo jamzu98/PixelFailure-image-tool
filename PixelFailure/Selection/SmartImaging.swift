@@ -1,37 +1,5 @@
 import CoreImage
 import SwiftUI
-import Vision
-
-enum SmartSelectionError: LocalizedError {
-    case noForeground
-
-    var errorDescription: String? { "Vision could not identify a foreground subject in this image." }
-}
-
-/// Vision-backed subject/background selection. The resulting mask is traced
-/// into the same canvas-space path model used by marquee, lasso, and wand.
-nonisolated enum SmartSelection {
-    static func foreground(in image: CGImage, canvasSize: CGSize) throws -> CanvasSelection {
-        let request = VNGenerateForegroundInstanceMaskRequest()
-        let handler = VNImageRequestHandler(cgImage: image, options: [:])
-        try handler.perform([request])
-        guard let observation = request.results?.first else {
-            throw SmartSelectionError.noForeground
-        }
-        let buffer = try observation.generateScaledMaskForImage(
-            forInstances: observation.allInstances, from: handler)
-        let ciImage = CIImage(cvPixelBuffer: buffer)
-        guard let mask = CIContext(options: [.cacheIntermediates: false])
-            .createCGImage(ciImage, from: ciImage.extent),
-              let (grid, width, height) = ContourTracer.grid(from: mask),
-              let path = ContourTracer.trace(grid: grid, width: width, height: height,
-                                             scale: CGPoint(x: canvasSize.width / CGFloat(width),
-                                                            y: canvasSize.height / CGFloat(height))) else {
-            throw SmartSelectionError.noForeground
-        }
-        return CanvasSelection(path: path)
-    }
-}
 
 /// Deterministic nearest-boundary inpainting used by Content-Aware Fill.
 /// It runs entirely on the layer buffer, so it is undoable and works offline.

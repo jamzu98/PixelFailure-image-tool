@@ -96,7 +96,7 @@ struct EditorCommands: Commands {
 
     var body: some Commands {
         CommandGroup(after: .pasteboard) {
-            Button("Deselect") {
+            Button("Deselect Layers") {
                 focus?.editorState.selectedLayerID = nil
             }
             .keyboardShortcut("a", modifiers: [.command, .shift])
@@ -129,6 +129,7 @@ struct SelectCommands: Commands {
             Button("Deselect") {
                 focus?.editorState.selection = nil
             }
+            .keyboardShortcut("d", modifiers: .command)
             .disabled(!hasSelection)
 
             Button("Invert Selection") {
@@ -140,10 +141,32 @@ struct SelectCommands: Commands {
 
             Divider()
 
-            Button("Select Subject") { selectForeground(inverted: false) }
-                .disabled(focus == nil)
-            Button("Select Background") { selectForeground(inverted: true) }
-                .disabled(focus == nil)
+            Button("Subject") {
+                guard let focus else { return }
+                focus.editorState.vision.selectSubject(inverted: false, focus: focus)
+            }
+            .disabled(focus == nil)
+            Button("Background") {
+                guard let focus else { return }
+                focus.editorState.vision.selectSubject(inverted: true, focus: focus)
+            }
+            .disabled(focus == nil)
+            Button("People") {
+                guard let focus else { return }
+                focus.editorState.vision.selectPeople(focus: focus)
+            }
+            .disabled(focus == nil)
+            Menu("Faces") {
+                ForEach([("Face", FaceFeatures.face), ("Face Skin", .skin), ("Eyes", .eyes),
+                         ("Eyebrows", .brows), ("Lips", .lips), ("Nose", .nose), ("Pupils", .pupils)],
+                        id: \.0) { item in
+                    Button(item.0) {
+                        guard let focus else { return }
+                        focus.editorState.vision.selectFaces(item.1, focus: focus)
+                    }
+                }
+            }
+            .disabled(focus == nil)
 
             Divider()
 
@@ -231,23 +254,6 @@ struct SelectCommands: Commands {
         }
     }
 
-    private func selectForeground(inverted: Bool) {
-        guard let focus,
-              let image = PNGExporter.render(
-                items: focus.renderStore.renderItems(model: focus.document.model, quality: .preview),
-                background: focus.document.model.background,
-                canvasSize: focus.document.model.canvasSize,
-                targetPixelSize: focus.document.model.canvasSize) else { return }
-        do {
-            let foreground = try SmartSelection.foreground(in: image,
-                                                            canvasSize: focus.document.model.canvasSize)
-            focus.editorState.selection = inverted
-                ? foreground.inverted(canvasSize: focus.document.model.canvasSize)
-                : foreground
-        } catch {
-            NSSound.beep()
-        }
-    }
 }
 
 struct LayerCommands: Commands {

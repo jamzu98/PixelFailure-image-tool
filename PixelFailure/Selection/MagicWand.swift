@@ -76,55 +76,61 @@ nonisolated enum ContourTracer {
         func corner(_ x: Int, _ y: Int) -> Int { y * cw + x }
 
         // Every cell side facing an unselected neighbor becomes a directed
-        // edge (clockwise around selected area in a y-down grid).
-        var nextByStart: [Int: Int] = [:]
-        nextByStart.reserveCapacity(width * height / 4)
+        // edge (clockwise around selected area in a y-down grid). A corner
+        // where two cells touch diagonally has two outgoing edges, so keep a
+        // list per corner — a single slot would drop one, cut the loop short,
+        // and closeSubpath would then draw a stray diagonal across the image.
+        var outgoing: [Int: [Int]] = [:]
+        outgoing.reserveCapacity(width * height / 4)
         func cell(_ x: Int, _ y: Int) -> Bool {
             guard (0..<width).contains(x), (0..<height).contains(y) else { return false }
             return grid[y * width + x]
         }
         for y in 0..<height {
             for x in 0..<width where cell(x, y) {
-                if !cell(x, y - 1) { nextByStart[corner(x, y)] = corner(x + 1, y) }          // top → right
-                if !cell(x + 1, y) { nextByStart[corner(x + 1, y)] = corner(x + 1, y + 1) }  // right → down
-                if !cell(x, y + 1) { nextByStart[corner(x + 1, y + 1)] = corner(x, y + 1) }  // bottom → left
-                if !cell(x - 1, y) { nextByStart[corner(x, y + 1)] = corner(x, y) }          // left → up
+                if !cell(x, y - 1) { outgoing[corner(x, y), default: []].append(corner(x + 1, y)) }          // top → right
+                if !cell(x + 1, y) { outgoing[corner(x + 1, y), default: []].append(corner(x + 1, y + 1)) }  // right → down
+                if !cell(x, y + 1) { outgoing[corner(x + 1, y + 1), default: []].append(corner(x, y + 1)) }  // bottom → left
+                if !cell(x - 1, y) { outgoing[corner(x, y + 1), default: []].append(corner(x, y)) }          // left → up
             }
         }
 
+        // In- and out-degree match at every corner, so each walk returns to
+        // its start; loops sharing a pinch corner may merge into one closed
+        // polyline, which even-odd fills identically.
         var path = Path()
-        var visited = Set<Int>()
-        for start in nextByStart.keys {
-            guard !visited.contains(start) else { continue }
-            var loop: [Int] = []
-            var current = start
-            while !visited.contains(current), let next = nextByStart[current] {
-                visited.insert(current)
-                loop.append(current)
-                current = next
-            }
-            guard loop.count >= 4 else { continue }
-
-            // Merge collinear runs (all edges are axis-aligned unit steps).
-            var points: [CGPoint] = []
-            for cornerIndex in loop {
-                let point = CGPoint(x: CGFloat(cornerIndex % cw) * scale.x,
-                                    y: CGFloat(cornerIndex / cw) * scale.y)
-                if points.count >= 2 {
-                    let a = points[points.count - 2]
-                    let b = points[points.count - 1]
-                    if (a.x == b.x && b.x == point.x) || (a.y == b.y && b.y == point.y) {
-                        points[points.count - 1] = point
-                        continue
-                    }
+        for start in Array(outgoing.keys) {
+            while let first = outgoing[start]?.popLast() {
+                var loop = [start]
+                var current = first
+                while current != start {
+                    loop.append(current)
+                    guard let next = outgoing[current]?.popLast() else { break }
+                    current = next
                 }
-                points.append(point)
+                guard loop.count >= 4 else { continue }
+
+                // Merge collinear runs (all edges are axis-aligned unit steps).
+                var points: [CGPoint] = []
+                for cornerIndex in loop {
+                    let point = CGPoint(x: CGFloat(cornerIndex % cw) * scale.x,
+                                        y: CGFloat(cornerIndex / cw) * scale.y)
+                    if points.count >= 2 {
+                        let a = points[points.count - 2]
+                        let b = points[points.count - 1]
+                        if (a.x == b.x && b.x == point.x) || (a.y == b.y && b.y == point.y) {
+                            points[points.count - 1] = point
+                            continue
+                        }
+                    }
+                    points.append(point)
+                }
+                path.move(to: points[0])
+                for point in points.dropFirst() {
+                    path.addLine(to: point)
+                }
+                path.closeSubpath()
             }
-            path.move(to: points[0])
-            for point in points.dropFirst() {
-                path.addLine(to: point)
-            }
-            path.closeSubpath()
         }
         return path.isEmpty ? nil : path
     }

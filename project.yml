@@ -2,7 +2,7 @@ name: PixelFailure
 options:
   bundleIdPrefix: com.pixelfailure
   deploymentTarget:
-    macOS: "15.0"
+    macOS: "27.0"
   createIntermediateGroups: true
 
 settings:

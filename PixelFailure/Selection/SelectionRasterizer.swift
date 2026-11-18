@@ -21,14 +21,21 @@ enum SelectionRasterizer {
         let height = max(1, Int(pixelSize.height))
         guard let ctx = colorSettings.makeRGBAContext(width: width, height: height) else { return nil }
 
-        // Apply the canvas→buffer transform to the path, not the context, so
-        // the feather blur below operates in buffer pixels.
-        ctx.beginPath()
-        if let transformed = withTransform(selection.path.cgPath, transform) {
-            ctx.addPath(transformed)
-        }
         ctx.setFillColor(color.cgColor(in: colorSettings.workingSpace))
-        ctx.fillPath(using: .evenOdd)
+        if let matte = selection.matte {
+            ctx.saveGState()
+            matte.clip(ctx, transform: transform)
+            ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+            ctx.restoreGState()
+        } else {
+            // Apply the canvas→buffer transform to the path, not the context, so
+            // the feather blur below operates in buffer pixels.
+            ctx.beginPath()
+            if let transformed = withTransform(selection.path.cgPath, transform) {
+                ctx.addPath(transformed)
+            }
+            ctx.fillPath(using: .evenOdd)
+        }
         guard var image = ctx.makeImage() else { return nil }
 
         // Feather: gaussian blur scaled to buffer pixels.
@@ -59,12 +66,16 @@ enum SelectionRasterizer {
                                   bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return nil }
         ctx.setFillColor(CGColor(gray: 0, alpha: 1))
         ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
-        ctx.beginPath()
-        if let transformed = withTransform(selection.path.cgPath, transform) {
-            ctx.addPath(transformed)
+        if let matte = selection.matte {
+            matte.draw(into: ctx, transform: transform)
+        } else {
+            ctx.beginPath()
+            if let transformed = withTransform(selection.path.cgPath, transform) {
+                ctx.addPath(transformed)
+            }
+            ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+            ctx.fillPath(using: .evenOdd)
         }
-        ctx.setFillColor(CGColor(gray: 1, alpha: 1))
-        ctx.fillPath(using: .evenOdd)
         guard var image = ctx.makeImage() else { return nil }
 
         let scale = (hypot(transform.a, transform.b) + hypot(transform.c, transform.d)) / 2

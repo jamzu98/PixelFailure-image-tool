@@ -9,6 +9,10 @@ enum SelectionTransforms {
     /// Grows (positive) or shrinks (negative) the selection by `pixels`
     /// canvas px: rasterize → Core Image morphology → re-trace the contour.
     static func offset(_ selection: CanvasSelection, by pixels: Double, canvasSize: CGSize) -> CanvasSelection? {
+        if let matte = selection.matte {
+            guard let grown = matte.morphed(by: pixels) else { return nil }
+            return CanvasSelection(matte: grown, feather: selection.feather)
+        }
         let maxDim = 1200.0
         let scale = min(1, maxDim / Double(max(canvasSize.width, canvasSize.height)))
         let pixelSize = CGSize(width: max(8, canvasSize.width * scale),
@@ -273,7 +277,9 @@ extension PixelDocument {
         guard affine.isInvertible else { return nil }
         let localBounds = selection.bounds.applying(affine.inverted())
         let scale = bufferSize.width / naturalSize.width
-        let pad = selection.feather * 2 + 2
+        // Soft mattes extend a little past their 50% contour.
+        let mattePad = selection.matte.map { 2 * $0.canvasSize.width / CGFloat($0.width) + 2 } ?? 0
+        let pad = selection.feather * 2 + 2 + mattePad
         let bufferRect = CGRect(x: (localBounds.minX - pad) * scale,
                                 y: (localBounds.minY - pad) * scale,
                                 width: (localBounds.width + pad * 2) * scale,

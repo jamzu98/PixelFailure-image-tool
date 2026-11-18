@@ -37,6 +37,9 @@ enum Theme {
     static let icon = hex(0xC4C4C4)
 
     static let accent = hex(0x378EF0)
+    /// The accent as a CGColor, for bitmap overlays (smart-selection tints).
+    nonisolated static let accentCG = CGColor(srgbRed: 0x37 / 255.0, green: 0x8E / 255.0,
+                                              blue: 0xF0 / 255.0, alpha: 1)
     static let warning = hex(0xE8B046)
     /// Magenta, as in Photoshop/Affinity, so guides read on any artwork.
     static let smartGuide = hex(0xFF3EBF)
