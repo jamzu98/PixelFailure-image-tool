@@ -2234,3 +2234,29 @@ struct TiledViewportTests {
         #expect(dirty.width * dirty.height < canvas.width * canvas.height / 1000)
     }
 }
+
+@MainActor
+struct PaintLayerCreationTests {
+    /// First-stroke layer creation must not PNG-encode on the main actor; the
+    /// blank image stays resident and its data is produced lazily.
+    @Test func addPaintLayerDefersEncodeButKeepsDataResolvable() throws {
+        let document = PixelDocument(model: ProjectModel(canvasSize: CGSize(width: 4096, height: 4096)))
+        let store = RenderStore(document: document)
+
+        let start = CFAbsoluteTimeGetCurrent()
+        let id = try #require(document.addPaintLayer(undoManager: nil))
+        let config = try #require(document.model.layer(id: id)?.imageConfig)
+        let image = try #require(store.originalImage(key: config.imageKey))
+        let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
+        print("addPaintLayer + resolve: \(String(format: "%.1f", elapsed)) ms")
+
+        #expect(image.width == Int(config.pixelSize.width))
+        #expect(elapsed < 40)
+        // A save taken before the background encode lands still includes it.
+        let snapshot = try document.snapshot(contentType: .pixelFailureProject)
+        let data = try #require(snapshot.images[config.imageKey])
+        let decoded = CGImageSourceCreateWithData(data as CFData, nil)
+            .flatMap { CGImageSourceCreateImageAtIndex($0, 0, nil) }
+        #expect(decoded?.width == 4096)
+    }
+}

@@ -1325,6 +1325,11 @@ struct CanvasViewport: View {
     // MARK: - Painting
 
     private func startPaintSession() {
+        PerfLog.isInteracting = true
+        PerfLog.measure("start paint session") { startPaintSessionBody() }
+    }
+
+    private func startPaintSessionBody() {
         let continuationTarget = paintSession?.target
         let continuationImage = paintSession?.currentImage
         if let continuationTarget, !pendingPaintCommits.isEmpty {
@@ -1372,17 +1377,22 @@ struct CanvasViewport: View {
             let targetLayer = document.model.layer(id: targetID ?? UUID())
             let paintable = (targetLayer?.kind.isImage ?? false)
                 && targetLayer.map { !document.model.isEffectivelyLocked($0.id) } == true
+            var createdBlankLayer = false
             if !paintable {
                 let retouch = [.clone, .heal, .smudge, .dodge, .burn].contains(editorState.activeTool)
                 if retouch { return }
                 targetID = document.addPaintLayer(undoManager: undoManager)
                 editorState.selectedLayerID = targetID
+                createdBlankLayer = true
             }
             guard let id = targetID,
                   let layer = document.model.layer(id: id),
                   let config = layer.imageConfig else { return }
             let target = PaintSession.Target.content(layerID: id)
-            let base = samePaintTarget(continuationTarget, target)
+            // A freshly created layer is fully transparent; seeding the
+            // buffer with it would only redraw empty pixels.
+            let base = createdBlankLayer ? nil
+                : samePaintTarget(continuationTarget, target)
                 ? continuationImage : renderStore.originalImage(key: config.imageKey)
             var clip: CGPath?
             if let selection = editorState.selection {
@@ -1504,6 +1514,7 @@ struct CanvasViewport: View {
     }
 
     private func commitPaintSession() {
+        PerfLog.isInteracting = false
         isPaintStrokeActive = false
         guard let session = paintSession,
               let image = session.currentImage else { return }

@@ -3,6 +3,8 @@ import SwiftUI
 
 @main
 struct PixelFailureApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     init() {
         // A pro editor runs dark regardless of the system appearance, so
         // artwork colors are judged against neutral gray chrome.
@@ -11,17 +13,61 @@ struct PixelFailureApp: App {
     }
 
     var body: some Scene {
-        DocumentGroup(newDocument: { PixelDocument() }) { configuration in
+        DocumentGroup(newDocument: {
+            PixelDocument(model: NewDocumentStore.loadLastUsed().makeModel())
+        }) { configuration in
             EditorView(document: configuration.document)
         }
         .defaultSize(width: 1440, height: 900)
         // One slim bar: title and toolbar items share a single compact row.
         .windowToolbarStyle(.unifiedCompact(showsTitle: true))
         .commands {
+            FileCommands()
             EditorCommands()
             ViewCommands()
             LayerCommands()
             SelectCommands()
+        }
+
+        Window("Home", id: HomeModel.windowID) {
+            HomeView()
+        }
+        .windowStyle(.hiddenTitleBar)
+        .windowResizability(.contentSize)
+        .windowBackgroundDragBehavior(.enabled)
+        .defaultLaunchBehavior(LaunchAction.current == .home ? .presented : .suppressed)
+        .restorationBehavior(.disabled)
+        .commandsRemoved()
+    }
+}
+
+struct FileCommands: Commands {
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.newDocument) private var newDocument
+    @Environment(\.openDocument) private var openDocument
+
+    private var launcher: DocumentLauncher {
+        DocumentLauncher(newDocument: newDocument, openDocument: openDocument)
+    }
+
+    var body: some Commands {
+        CommandGroup(replacing: .newItem) {
+            Button("New…") { HomeModel.shared.show(.new, using: openWindow) }
+                .keyboardShortcut("n", modifiers: .command)
+            Button("New Blank Canvas") {
+                var settings = NewDocumentStore.shared.lastUsed
+                settings.name = "Untitled"
+                settings.starterGenerator = nil
+                launcher.create(settings)
+            }
+            .keyboardShortcut("n", modifiers: [.command, .option])
+            Button("Home") { HomeModel.shared.show(.home, using: openWindow) }
+        }
+        // SwiftUI keeps its own Open… / Open Recent for projects; images
+        // open as a new canvas of their own size, as in Photoshop.
+        CommandGroup(after: .newItem) {
+            Button("Open Image as Canvas…") { launcher.presentOpenPanel() }
+                .keyboardShortcut("o", modifiers: [.command, .option])
         }
     }
 }

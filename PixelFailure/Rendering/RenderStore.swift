@@ -191,6 +191,10 @@ final class RenderStore: ObservableObject {
 
     func originalImage(key: String) -> CGImage? {
         if let cached = decodedImages[key] { return cached }
+        if let resident = document.residentImage(for: key) {
+            decodedImages[key] = resident
+            return resident
+        }
         guard let data = document.imageData(for: key),
               let source = CGImageSourceCreateWithData(data as CFData, nil),
               let image = CGImageSourceCreateImageAtIndex(source, 0, [

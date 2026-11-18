@@ -316,10 +316,12 @@ extension PixelDocument {
         let width = max(8, Int(model.canvasSize.width * scale))
         let height = max(8, Int(model.canvasSize.height * scale))
         guard let ctx = model.colorSettings.makeRGBAContext(width: width, height: height),
-              let image = ctx.makeImage(),
-              let data = PNGExporter.pngData(image) else { return nil }
+              let image = ctx.makeImage() else { return nil }
 
-        let key = storeImage(data: data, fileExtension: "png")
+        // Encoding a canvas-sized blank PNG costs ~80 ms at 4096²; the
+        // first brush stroke creates this layer, so keep that off the
+        // main actor. The resident image renders until the data lands.
+        let key = storeImageDeferringEncode(image)
         let pixelSize = CGSize(width: width, height: height)
         let fitScale = model.canvasSize.width / pixelSize.width
         let layer = Layer(name: "Paint",

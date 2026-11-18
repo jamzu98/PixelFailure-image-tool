@@ -42,6 +42,10 @@ final class PixelDocument: ReferenceFileDocument, @unchecked Sendable {
     /// Raw data of imported images, keyed by file name inside images/.
     /// Append-only within a session so undo can always resolve references.
     private(set) var images: [String: Data]
+    /// Resident images whose PNG data is still being encoded off the main
+    /// actor (fresh blank paint layers). Readers fall back to a synchronous
+    /// encode, so a save, copy or export never sees a missing key.
+    private var pendingImages: [String: CGImage] = [:]
 
     /// Pre-gesture model, captured while a slider drag is in flight so the
     /// whole drag collapses into one undo step.
@@ -55,8 +59,25 @@ final class PixelDocument: ReferenceFileDocument, @unchecked Sendable {
         history = [Checkpoint(name: "Opened", model: model)]
     }
 
-    init(configuration: ReadConfiguration) throws {
-        let root = configuration.file
+    /// A fresh document from the New Document dialog (or a prepared model,
+    /// e.g. an image opened as a new canvas).
+    init(model: ProjectModel) {
+        self.model = model
+        images = [:]
+        history = [Checkpoint(name: "New", model: model)]
+    }
+
+    convenience init(configuration: ReadConfiguration) throws {
+        try self.init(package: configuration.file)
+    }
+
+    /// Reads a project package outside the document system — used for
+    /// recent-file thumbnails on the Home screen.
+    convenience init(contentsOf url: URL) throws {
+        try self.init(package: FileWrapper(url: url, options: .immediate))
+    }
+
+    private init(package root: FileWrapper) throws {
         guard let manifest = root.fileWrappers?["manifest.json"]?.regularFileContents else {
             throw CocoaError(.fileReadCorruptFile)
         }
@@ -75,7 +96,8 @@ final class PixelDocument: ReferenceFileDocument, @unchecked Sendable {
     }
 
     func snapshot(contentType: UTType) throws -> Snapshot {
-        Snapshot(model: model, images: images, checkpoints: checkpoints)
+        for key in Array(pendingImages.keys) { _ = flushPendingImage(key) }
+        return Snapshot(model: model, images: images, checkpoints: checkpoints)
     }
 
     func fileWrapper(snapshot: Snapshot, configuration: WriteConfiguration) throws -> FileWrapper {
@@ -212,5 +234,37 @@ final class PixelDocument: ReferenceFileDocument, @unchecked Sendable {
         return key
     }
 
-    func imageData(for key: String) -> Data? { images[key] }
+    /// Stores an already-resident image under a new key and encodes its PNG
+    /// data in the background. Keeps first-stroke layer creation off the
+    /// main actor's encode path.
+    @MainActor
+    func storeImageDeferringEncode(_ image: CGImage) -> String {
+        let key = UUID().uuidString + ".png"
+        pendingImages[key] = image
+        let sendable = PendingImage(value: image)
+        Task { @MainActor [weak self] in
+            let data = await Task.detached(priority: .utility) {
+                PNGExporter.pngData(sendable.value)
+            }.value
+            guard let self, let data, self.pendingImages.removeValue(forKey: key) != nil else { return }
+            self.images[key] = data
+        }
+        return key
+    }
+
+    /// The in-memory image for a key whose data is still being encoded.
+    func residentImage(for key: String) -> CGImage? { pendingImages[key] }
+
+    func imageData(for key: String) -> Data? { images[key] ?? flushPendingImage(key) }
+
+    private func flushPendingImage(_ key: String) -> Data? {
+        guard let image = pendingImages[key], let data = PNGExporter.pngData(image) else { return nil }
+        pendingImages[key] = nil
+        images[key] = data
+        return data
+    }
+
+    private struct PendingImage: @unchecked Sendable {
+        let value: CGImage
+    }
 }

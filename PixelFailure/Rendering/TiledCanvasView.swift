@@ -748,6 +748,13 @@ final class RetainedTileCanvasNSView: NSView {
         tileLayer.contentsGravity = .resize
         tileLayer.minificationFilter = .linear
         tileLayer.magnificationFilter = .linear
+        // Core Animation antialiases every layer edge by default on macOS.
+        // Interior tile edges land on fractional device pixels at most zooms,
+        // so both neighbours would get partial coverage and the viewport
+        // background would bleed through as a faint grid. Only edges on the
+        // canvas boundary keep antialiasing; interior edges rasterize hard
+        // and abut exactly.
+        tileLayer.edgeAntialiasingMask = outerEdges(of: spec.canvasRect)
         tileLayer.actions = ["contents": NSNull(), "contentsRect": NSNull(),
                              "position": NSNull(), "bounds": NSNull()]
         tileLayer.contents = image
@@ -758,6 +765,16 @@ final class RetainedTileCanvasNSView: NSView {
         tileContentTokens[spec.key] = contentToken
         installedSpecs[spec.key] = spec
         invalidTileKeys.remove(spec.key)
+    }
+
+    private func outerEdges(of rect: CGRect) -> CAEdgeAntialiasingMask {
+        let canvas = canvasLayer.bounds
+        var mask: CAEdgeAntialiasingMask = []
+        if rect.minX <= canvas.minX { mask.insert(.layerLeftEdge) }
+        if rect.maxX >= canvas.maxX { mask.insert(.layerRightEdge) }
+        if rect.minY <= canvas.minY { mask.insert(.layerBottomEdge) }
+        if rect.maxY >= canvas.maxY { mask.insert(.layerTopEdge) }
+        return mask
     }
 
     private func gridLayer(for level: Int) -> CALayer {
