@@ -60,60 +60,54 @@ struct ExportSheet: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Form {
-                Section {
-                    Picker("Format", selection: $format) {
-                        ForEach(Format.allCases, id: \.self) { format in
-                            Text(format.rawValue).tag(format)
-                                .disabled(!format.isAvailable)
-                        }
+            VStack(alignment: .leading, spacing: 10) {
+                PanelPicker("Format", selection: $format) {
+                    ForEach(Format.allCases, id: \.self) { format in
+                        Text(format.rawValue).tag(format)
+                            .disabled(!format.isAvailable)
                     }
-
-                    if format != .svg && format != .psd {
-                        Picker("Size", selection: $presetIndex) {
-                            ForEach(SizePreset.exportPresets.indices, id: \.self) { i in
-                                Text(SizePreset.exportPresets[i].name).tag(i)
-                            }
-                        }
-
-                        if SizePreset.exportPresets[presetIndex].size == .zero {
-                            LabeledContent("Custom") {
-                                HStack(spacing: 6) {
-                                    TextField("Width", value: $customWidth, format: .number)
-                                    Text("×")
-                                    TextField("Height", value: $customHeight, format: .number)
-                                    Text("px").foregroundStyle(.secondary)
-                                }
-                                .textFieldStyle(.roundedBorder)
-                            }
-                        }
-
-                        if format.raster?.isLossy == true {
-                            LabeledContent("Quality") {
-                                HStack {
-                                    NumericSlider(value: $quality, range: 0.5...1,
-                                                  defaultValue: 0.9)
-                                    Text("\(Int((quality * 100).rounded()))%")
-                                        .font(.caption.monospacedDigit())
-                                        .frame(width: 36, alignment: .trailing)
-                                }
-                            }
-                        }
-                    }
-                } footer: {
-                    formatHelpText
                 }
+
+                if format != .svg && format != .psd {
+                    PanelPicker("Size", selection: $presetIndex) {
+                        ForEach(SizePreset.exportPresets.indices, id: \.self) { i in
+                            Text(SizePreset.exportPresets[i].name).tag(i)
+                        }
+                    }
+
+                    if SizePreset.exportPresets[presetIndex].size == .zero {
+                        LabeledContent("Custom") {
+                            HStack(spacing: 6) {
+                                TextField("Width", value: $customWidth, format: .number)
+                                Text("×")
+                                TextField("Height", value: $customHeight, format: .number)
+                                Text("px").foregroundStyle(.secondary)
+                            }
+                            .textFieldStyle(.roundedBorder)
+                        }
+                    }
+
+                    if format.raster?.isLossy == true {
+                        LabeledContent("Quality") {
+                            HStack {
+                                NumericSlider(value: $quality, range: 0.5...1,
+                                              defaultValue: 0.9, percent: true)
+                            }
+                        }
+                    }
+                }
+                formatHelpText
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.textDim)
+                    .fixedSize(horizontal: false, vertical: true)
 
                 if let errorMessage {
-                    Section {
-                        Text(errorMessage)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                    }
+                    Text(errorMessage)
+                        .foregroundStyle(.red)
                 }
             }
-            .formStyle(.grouped)
-            .padding(.top, 4)
+            .padding(20)
+            .panelStyle()
 
             Divider()
 
@@ -139,21 +133,18 @@ struct ExportSheet: View {
     private var formatHelpText: some View {
         switch format {
         case .jpeg:
-            Text("JPEG has no transparency — the artwork is flattened onto the background color.")
+            Text("No transparency — flattened onto the background.")
         case .pdf:
-            Text("PDF preserves the rendered appearance as a single composited page. Layers and raster-only effects are explicitly flattened.")
-                .foregroundStyle(.orange)
+            Text("Flattened to a single page.")
         case .psd:
-            Text("Exports names, opacity, blend modes, visibility, and one raster channel set per layer.")
+            Text("Layered, one raster per layer.")
         case .svg:
-            Text("Patterns, shapes, and text export as true vectors; image layers are embedded as PNG.")
-            if !document.model.canvasEffects.isEmpty {
-                Text("Canvas effects are raster-only and will be skipped in SVG.")
-                    .foregroundStyle(.orange)
-            }
+            Text(document.model.canvasEffects.isEmpty
+                 ? "Vectors stay vector; images embed as PNG."
+                 : "Vectors stay vector. Canvas effects are skipped.")
         default:
             if targetSize() != document.model.canvasSize {
-                Text("The artwork scales to fill and center-crops if the aspect ratio differs.")
+                Text("Scaled to fill, center-cropped.")
             }
         }
     }

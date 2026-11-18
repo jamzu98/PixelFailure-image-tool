@@ -31,22 +31,21 @@ struct PatternInspector: View {
     }
 
     var body: some View {
-        Section(config.generator.displayName) {
+        InspectorSection("Pattern") {
             if editorState.animationLayerID == layerID {
                 if let selectedKeyframe {
-                    Label("Editing keyframe at \(selectedKeyframe.time, specifier: "%.2f") s",
+                    Label("Keyframe \(selectedKeyframe.time, specifier: "%.2f") s",
                           systemImage: "diamond.fill")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(Color.accentColor)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Theme.accent)
                 } else {
-                    Text("Scrubbing preview — add or select a keyframe to edit its values.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Text("Preview — select a keyframe to edit")
+                        .foregroundStyle(Theme.textDim)
                 }
             }
 
             // Swap the algorithm in place — shared parameters carry over.
-            Picker("Generator", selection: Binding(
+            PanelPicker("Generator", selection: Binding(
                 get: { config.generator },
                 set: { switchGenerator(to: $0) }
             )) {
@@ -57,41 +56,44 @@ struct PatternInspector: View {
 
             // Seed row: reroll or dial in a specific seed.
             LabeledContent("Seed") {
-                HStack(spacing: 6) {
+                HStack(spacing: 2) {
                     Text(String(displayedConfig.seed % 100000))
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 11).monospacedDigit())
+                        .foregroundStyle(Theme.text)
+                        .frame(minWidth: 44, alignment: .leading)
                     Button {
                         reroll(randomizeParams: false)
                     } label: {
                         Image(systemName: "dice")
                     }
-                    .buttonStyle(.borderless)
-                    .help("Reroll seed (⌘R)")
+                    .buttonStyle(IconButtonStyle(size: 22))
+                    .help("Reroll Seed (⌘R)")
 
                     Button {
                         reroll(randomizeParams: true)
                     } label: {
                         Image(systemName: "sparkles")
                     }
-                    .buttonStyle(.borderless)
-                    .help("Randomize parameters too (⌥⌘R)")
+                    .buttonStyle(IconButtonStyle(size: 22))
+                    .help("Randomize (⌥⌘R)")
                 }
                 .disabled(animationIsReadOnly)
             }
 
-            Button("Variations Grid…") { showVariations = true }
-                .disabled(animationIsReadOnly)
-            Button(editorState.animationLayerID == layerID ? "Close Generator Timeline" : "Animate Generator…") {
-                if editorState.animationLayerID == layerID {
-                    editorState.animationLayerID = nil
-                    editorState.selectedAnimationKeyframeID = nil
-                    editorState.isAnimationPlaying = false
-                } else {
-                    editorState.animationLayerID = layerID
-                    editorState.animationPlayhead = min(editorState.animationPlayhead,
-                                                         document.model.animation.duration)
-                    editorState.selectedAnimationKeyframeID = nil
+            HStack(spacing: 6) {
+                Button("Variations…") { showVariations = true }
+                    .disabled(animationIsReadOnly)
+                Button(editorState.animationLayerID == layerID ? "Close Timeline" : "Animate…") {
+                    if editorState.animationLayerID == layerID {
+                        editorState.animationLayerID = nil
+                        editorState.selectedAnimationKeyframeID = nil
+                        editorState.isAnimationPlaying = false
+                    } else {
+                        editorState.animationLayerID = layerID
+                        editorState.animationPlayhead = min(editorState.animationPlayhead,
+                                                             document.model.animation.duration)
+                        editorState.selectedAnimationKeyframeID = nil
+                    }
                 }
             }
 
@@ -177,11 +179,10 @@ struct PatternInspector: View {
     private var sourceImagePicker: some View {
         let imageLayers = document.model.layers.filter(\.kind.isImage)
         if imageLayers.isEmpty {
-            Text("Add an image layer to sample from.")
-                .font(.caption)
-                .foregroundStyle(.orange)
+            Label("Needs an image layer", systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(Theme.warning)
         } else {
-            Picker("Source Image", selection: Binding(
+            PanelPicker("Source Image", selection: Binding(
                 get: { config.sourceImageLayerID ?? imageLayers.last?.id },
                 set: { newValue in
                     document.update(undoManager, actionName: "Source Image") { model in
@@ -222,7 +223,7 @@ private struct VariationsSheet: View {
             HStack {
                 VStack(alignment: .leading) {
                     Text("Variations").font(.title2.weight(.semibold))
-                    Text("Choose a preview to apply its seed and parameters.")
+                    Text("Click one to apply it.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()

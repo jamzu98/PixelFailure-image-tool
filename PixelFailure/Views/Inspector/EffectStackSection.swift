@@ -30,16 +30,19 @@ struct EffectStackSection: View {
     let title: String
     let target: EffectsTarget
     let effects: [Effect]
-    var footnote: String?
     @Environment(\.undoManager) private var undoManager
 
     var body: some View {
-        Section {
+        InspectorSection(title) {
+            if effects.isEmpty {
+                Text("None")
+                    .foregroundStyle(Theme.textFaint)
+            }
             ForEach(Array(effects.enumerated()), id: \.element.id) { index, effect in
                 effectRow(effect, index: index)
             }
-
-            Menu("Add Effect") {
+        } accessory: {
+            Menu {
                 ForEach(EffectType.allCases, id: \.self) { type in
                     Button(type.displayName) {
                         document.update(undoManager, actionName: "Add \(type.displayName)") { model in
@@ -49,19 +52,15 @@ struct EffectStackSection: View {
                         }
                     }
                 }
+            } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Theme.icon)
             }
-        } header: {
-            Text(title)
-        } footer: {
-            if let footnote, !effects.isEmpty || footnote.contains("PNG") {
-                Text(footnote)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else if effects.isEmpty {
-                Text("Effects stack non-destructively, in order.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Add Effect")
         }
     }
 
@@ -100,19 +99,20 @@ struct EffectStackSection: View {
                 .labelsHidden()
 
                 Text(effect.type.displayName)
+                    .foregroundStyle(effect.isEnabled ? Theme.text : Theme.textFaint)
 
                 Spacer()
 
                 Button {
                     moveEffect(effect.id, by: -1)
                 } label: { Image(systemName: "chevron.up") }
-                    .buttonStyle(.borderless)
+                    .buttonStyle(IconButtonStyle(size: 18))
                     .disabled(index == 0)
 
                 Button {
                     moveEffect(effect.id, by: 1)
                 } label: { Image(systemName: "chevron.down") }
-                    .buttonStyle(.borderless)
+                    .buttonStyle(IconButtonStyle(size: 18))
                     .disabled(index == effects.count - 1)
 
                 Button {
@@ -122,7 +122,7 @@ struct EffectStackSection: View {
                         }
                     }
                 } label: { Image(systemName: "trash") }
-                    .buttonStyle(.borderless)
+                    .buttonStyle(IconButtonStyle(size: 18))
             }
         }
     }
@@ -195,11 +195,9 @@ private struct CurveEditor: View {
                 })
         }
         .frame(height: 130)
+        .background(Theme.field, in: RoundedRectangle(cornerRadius: 3))
 
         HStack {
-            Text(activePoint.map { "Point \($0 + 1)" } ?? "Drag a curve point")
-                .font(.caption)
-                .foregroundStyle(.secondary)
             Spacer()
             Button("Reset") {
                 write([0, 0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1, 1], gesture: false)
@@ -270,7 +268,7 @@ private struct HistogramView: View {
             context.fill(area, with: .color(.secondary.opacity(0.45)))
         }
         .frame(height: 58)
-        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 4))
+        .background(Theme.field, in: RoundedRectangle(cornerRadius: 3))
         .onChange(of: imageData) { _, data in bins = Self.compute(data) }
     }
 

@@ -7,8 +7,8 @@ struct ShapeInspector: View {
     @Environment(\.undoManager) private var undoManager
 
     var body: some View {
-        Section("Shape") {
-            Picker("Shape", selection: Binding(
+        InspectorSection("Shape") {
+            PanelPicker("Shape", selection: Binding(
                 get: { config.kind },
                 set: { newValue in modify("Shape Kind") { $0.kind = newValue } }
             )) {
@@ -26,7 +26,7 @@ struct ShapeInspector: View {
                 }
             }
             if config.kind == .polygon || config.kind == .star {
-                LabeledContent("Sides: \(config.sides)") {
+                LabeledContent("Sides") {
                     NumericSlider(value: Binding(
                         get: { Double(config.sides) },
                         set: { newValue in
@@ -58,7 +58,7 @@ struct ShapeInspector: View {
                 }
             ))
             if let fill = config.fill {
-                ColorPicker("Fill Color", selection: Binding(
+                PanelColorPicker("Fill Color", selection: Binding(
                     get: { fill.color(in: document.model.colorSettings.workingSpace) },
                     set: { newValue in modify("Fill Color") { $0.fill = RGBAColor(colorValue: newValue, in: document.model.colorSettings.workingSpace) } }
                 ))
@@ -75,7 +75,7 @@ struct ShapeInspector: View {
                 }
             ))
             if let stroke = config.stroke {
-                ColorPicker("Stroke Color", selection: Binding(
+                PanelColorPicker("Stroke Color", selection: Binding(
                     get: { stroke.color(in: document.model.colorSettings.workingSpace) },
                     set: { newValue in modify("Stroke Color") { $0.stroke = RGBAColor(colorValue: newValue, in: document.model.colorSettings.workingSpace) } }
                 ))
@@ -87,7 +87,7 @@ struct ShapeInspector: View {
     }
 
     private func sizeSlider(_ label: String, keyPath: WritableKeyPath<CGSize, CGFloat>) -> some View {
-        LabeledContent("\(label): \(Int(config.size[keyPath: keyPath]))") {
+        LabeledContent(label) {
             NumericSlider(value: Binding(
                 get: { Double(config.size[keyPath: keyPath]) },
                 set: { newValue in

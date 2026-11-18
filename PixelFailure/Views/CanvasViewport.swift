@@ -132,6 +132,13 @@ struct CanvasViewport: View {
     }
 
     var body: some View {
+        VStack(spacing: 0) {
+            viewport
+            statusBar
+        }
+    }
+
+    private var viewport: some View {
         GeometryReader { geo in
             let viewSize = geo.size
             let scale = effectiveZoom(viewSize: viewSize)
@@ -144,7 +151,7 @@ struct CanvasViewport: View {
             } ?? paintInvalidation
 
             ZStack {
-                Color(nsColor: .underPageBackgroundColor)
+                Theme.canvas
 
                 PointerEventBridge(onPointer: { sample in
                     editorState.pointerSample = sample
@@ -250,7 +257,6 @@ struct CanvasViewport: View {
                                   zoomScale: scale, pan: $pan)
                 }
 
-                zoomControls(scale: scale)
             }
             .contentShape(Rectangle())
             .gesture(mainDragGesture(canvasTransform: canvasTransform, scale: scale))
@@ -2057,36 +2063,54 @@ struct CanvasViewport: View {
         return .handled
     }
 
-    // MARK: - Zoom controls
+    // MARK: - Status bar
 
-    private func zoomControls(scale: CGFloat) -> some View {
-        VStack {
-            Spacer()
-            HStack {
-                Spacer()
-                HStack(spacing: 2) {
-                    Button {
-                        zoomLevel = max(scale / 1.4, 0.02)
-                    } label: { Image(systemName: "minus.magnifyingglass") }
-                    Text("\(Int((scale * 100).rounded()))%")
-                        .font(.caption.monospacedDigit())
-                        .frame(width: 48)
-                    Button {
-                        zoomLevel = min(scale * 1.4, 12)
-                    } label: { Image(systemName: "plus.magnifyingglass") }
-                    Button("Fit") {
-                        zoomLevel = nil
-                        pan = .zero
-                    }
-                    .font(.caption)
-                }
-                .buttonStyle(.borderless)
-                .padding(6)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
-                .padding(12)
+    private var statusBar: some View {
+        let scale = effectiveZoom(viewSize: viewportSize)
+        let model = document.model
+        return HStack(spacing: 10) {
+            HStack(spacing: 0) {
+                Button {
+                    zoomLevel = max(scale / 1.4, 0.02)
+                } label: { Image(systemName: "minus") }
+                    .help("Zoom Out")
+                Text("\(Int((scale * 100).rounded()))%")
+                    .font(.system(size: 10.5).monospacedDigit())
+                    .foregroundStyle(Theme.text)
+                    .frame(width: 42)
+                Button {
+                    zoomLevel = min(scale * 1.4, 12)
+                } label: { Image(systemName: "plus") }
+                    .help("Zoom In")
+                Button {
+                    zoomLevel = nil
+                    pan = .zero
+                } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
+                    .help("Fit on Screen")
+                Button {
+                    zoomLevel = 1
+                    pan = .zero
+                } label: { Text("1:1").font(.system(size: 9.5, weight: .medium)) }
+                    .help("Actual Pixels")
             }
+            .buttonStyle(IconButtonStyle(size: 20))
+
+            BarDivider()
+            Text("\(Int(model.canvasSize.width)) × \(Int(model.canvasSize.height)) px")
+            BarDivider()
+            Text("\(model.colorSettings.workingSpace.displayName) · \(model.colorSettings.bitDepth.displayName)")
+            BarDivider()
+            Text("\(model.allLayers.count) layer\(model.allLayers.count == 1 ? "" : "s")")
+            Spacer(minLength: 0)
+            Text(editorState.activeTool.displayName)
         }
-        .allowsHitTesting(true)
+        .font(.system(size: 10.5))
+        .foregroundStyle(Theme.textDim)
+        .lineLimit(1)
+        .padding(.horizontal, 8)
+        .frame(height: 24)
+        .background(Theme.chrome)
+        .hairline(.top)
     }
 }
 
@@ -2372,7 +2396,7 @@ private struct WorkspaceOverlay: View {
                     smart.move(to: CGPoint(x: rect.minX, y: sy))
                     smart.addLine(to: CGPoint(x: rect.maxX, y: sy))
                 }
-                context.stroke(smart, with: .color(.orange),
+                context.stroke(smart, with: .color(Theme.smartGuide),
                                style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
             }
             .allowsHitTesting(false)
@@ -2387,9 +2411,13 @@ private struct WorkspaceOverlay: View {
         ZStack(alignment: .topLeading) {
             Canvas { context, size in
                 context.fill(Path(CGRect(x: 0, y: 0, width: size.width, height: 22)),
-                             with: .color(Color(nsColor: .windowBackgroundColor).opacity(0.94)))
+                             with: .color(Theme.chrome))
                 context.fill(Path(CGRect(x: 0, y: 0, width: 22, height: size.height)),
-                             with: .color(Color(nsColor: .windowBackgroundColor).opacity(0.94)))
+                             with: .color(Theme.chrome))
+                var edges = Path()
+                edges.move(to: CGPoint(x: 0, y: 22.5)); edges.addLine(to: CGPoint(x: size.width, y: 22.5))
+                edges.move(to: CGPoint(x: 22.5, y: 0)); edges.addLine(to: CGPoint(x: 22.5, y: size.height))
+                context.stroke(edges, with: .color(Theme.border), lineWidth: 1)
                 let step = niceRulerStep
                 let inverse = canvasTransform.inverted()
                 let minX = CGPoint(x: 22, y: 22).applying(inverse).x
@@ -2399,8 +2427,8 @@ private struct WorkspaceOverlay: View {
                     let screen = CGPoint(x: x, y: 0).applying(canvasTransform).x
                     var tick = Path()
                     tick.move(to: CGPoint(x: screen, y: 14)); tick.addLine(to: CGPoint(x: screen, y: 22))
-                    context.stroke(tick, with: .color(.secondary), lineWidth: 0.5)
-                    context.draw(Text("\(Int(x))").font(.system(size: 8)).foregroundStyle(.secondary),
+                    context.stroke(tick, with: .color(Theme.textFaint), lineWidth: 1)
+                    context.draw(Text("\(Int(x))").font(.system(size: 8.5)).foregroundStyle(Theme.textDim),
                                  at: CGPoint(x: screen + 3, y: 7), anchor: .leading)
                     x += step
                 }
@@ -2411,7 +2439,7 @@ private struct WorkspaceOverlay: View {
                     let screen = CGPoint(x: 0, y: y).applying(canvasTransform).y
                     var tick = Path()
                     tick.move(to: CGPoint(x: 14, y: screen)); tick.addLine(to: CGPoint(x: 22, y: screen))
-                    context.stroke(tick, with: .color(.secondary), lineWidth: 0.5)
+                    context.stroke(tick, with: .color(Theme.textFaint), lineWidth: 1)
                     y += step
                 }
             }

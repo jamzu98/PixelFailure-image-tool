@@ -8,13 +8,11 @@ struct ImageInspector: View {
 
     var body: some View {
         if let source = document.model.layer(id: layerID)?.source {
-            Section("Original") {
+            InspectorSection("Original") {
                 Button("Revert to Original") {
                     document.revertLayerToSource(id: layerID, undoManager: undoManager)
                 }
-                Text("Restores \(source.displayName) as it was before pixels were baked. Everything painted, filled, or rasterized since is discarded (undoable).")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                .help("Restore \(source.displayName), discarding baked edits")
             }
         }
         cropSection
@@ -27,7 +25,7 @@ struct ImageInspector: View {
     // MARK: - Crop
 
     private var cropSection: some View {
-        Section("Crop") {
+        InspectorSection("Crop") {
             cropSlider("Left", key: \.minX)
             cropSlider("Top", key: \.minY)
             cropSlider("Width", key: \.width)

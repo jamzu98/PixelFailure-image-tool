@@ -19,34 +19,46 @@ struct EditorView: View {
     }
 
     var body: some View {
-        HSplitView {
-            LayerListView(document: document, editorState: editorState, renderStore: renderStore)
-                .frame(minWidth: 200, idealWidth: 230, maxWidth: 320)
+        VStack(spacing: 0) {
+            // Always present at a fixed height so switching tools never
+            // shifts the canvas.
+            ToolOptionsBar(document: document, editorState: editorState)
 
-            VStack(spacing: 0) {
-                // Always present at a fixed height so switching tools never
-                // shifts the canvas or tool strip.
-                ToolOptionsBar(document: document, editorState: editorState)
-                Divider()
+            HSplitView {
                 HStack(spacing: 0) {
                     ToolStrip(document: document, editorState: editorState)
-                    Divider()
-                    CanvasViewport(document: document, editorState: editorState, renderStore: renderStore,
-                                   animationTime: editorState.animationLayerID == nil
-                                       ? nil : editorState.animationPlayhead)
+                    VStack(spacing: 0) {
+                        CanvasViewport(document: document, editorState: editorState, renderStore: renderStore,
+                                       animationTime: editorState.animationLayerID == nil
+                                           ? nil : editorState.animationPlayhead)
+                        if let animationLayerID = editorState.animationLayerID {
+                            AnimationTimelineDock(document: document, editorState: editorState,
+                                                  layerID: animationLayerID, renderStore: renderStore)
+                                .hairline(.top)
+                        }
+                    }
                 }
-                if let animationLayerID = editorState.animationLayerID {
-                    Divider()
-                    AnimationTimelineDock(document: document, editorState: editorState,
-                                          layerID: animationLayerID, renderStore: renderStore)
-                }
-            }
-            .frame(minWidth: 460, maxWidth: .infinity, maxHeight: .infinity)
-            .layoutPriority(1)
+                .frame(minWidth: 460, maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(1)
 
-            InspectorView(document: document, editorState: editorState, renderStore: renderStore)
-                .frame(minWidth: 280, idealWidth: 310, maxWidth: 380)
+                GeometryReader { dock in
+                    VSplitView {
+                        InspectorView(document: document, editorState: editorState, renderStore: renderStore)
+                            .frame(minHeight: 180, maxHeight: .infinity)
+                        VStack(spacing: 0) {
+                            PalettePanel(document: document, editorState: editorState, renderStore: renderStore)
+                            LayerListView(document: document, editorState: editorState, renderStore: renderStore)
+                        }
+                        // Properties carries the most controls; keep it the
+                        // larger half of the dock.
+                        .frame(minHeight: 240, maxHeight: max(240, dock.size.height * 0.45))
+                    }
+                }
+                .frame(minWidth: 280, idealWidth: 310, maxWidth: 420)
+                .background(Theme.panel)
+            }
         }
+        .background(Theme.chrome)
         .frame(minWidth: 1120, minHeight: 640)
         .focusedSceneValue(\.editorFocus, EditorFocus(document: document,
                                                       editorState: editorState,
@@ -55,7 +67,7 @@ struct EditorView: View {
         .toolbar { toolbarContent }
         // Paint the title bar as one solid strip; otherwise each split pane's
         // background (layers, canvas, inspector) bleeds up into it as sections.
-        .toolbarBackground(Color(nsColor: .windowBackgroundColor), for: .windowToolbar)
+        .toolbarBackground(Theme.chrome, for: .windowToolbar)
         .toolbarBackgroundVisibility(.visible, for: .windowToolbar)
         .sheet(isPresented: Binding(get: { editorState.showExportSheet },
                                     set: { editorState.showExportSheet = $0 })) {
@@ -85,7 +97,7 @@ struct EditorView: View {
                 Button("Discard", role: .destructive) { discardPendingRecovery() }
                 Button("Later", role: .cancel) { pendingRecoveryURL = nil }
             } message: {
-                Text("PixelFailure found an autosave left by an interrupted session.")
+                Text("An autosave from an interrupted session was found.")
             }
         .onDrop(of: [.fileURL, .image], isTargeted: nil) { providers in
             handleDrop(providers)
@@ -154,7 +166,7 @@ struct EditorView: View {
             }
             .keyboardShortcut("r", modifiers: .command)
             .disabled(selectedPatternLayerID == nil)
-            .help("Reroll the selected pattern layer's seed (⌘R)")
+            .help("Reroll Seed (⌘R)")
 
             Button {
                 rerollSelected(randomizeParams: true)
@@ -163,7 +175,7 @@ struct EditorView: View {
             }
             .keyboardShortcut("r", modifiers: [.command, .option])
             .disabled(selectedPatternLayerID == nil)
-            .help("Reroll seed and randomize parameters (⌥⌘R)")
+            .help("Randomize (⌥⌘R)")
 
             Button {
                 editorState.showExportSheet = true
@@ -171,7 +183,7 @@ struct EditorView: View {
                 Label("Export", systemImage: "square.and.arrow.up")
             }
             .keyboardShortcut("e", modifiers: .command)
-            .help("Export artwork (⌘E)")
+            .help("Export (⌘E)")
 
             Menu {
                 Button("Share Rendered PNG…") { shareRenderedArtwork() }
@@ -333,36 +345,39 @@ private struct OnboardingView: View {
     let complete: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Image(systemName: "circle.grid.cross")
-                .font(.system(size: 48, weight: .medium))
-                .foregroundStyle(.tint)
-            Text("Welcome to PixelFailure")
-                .font(.largeTitle.bold())
-            Text("Build deterministic generative artwork, combine it with images and editable vectors, then finish it with selections, masks, adjustments, and retouching.")
-                .foregroundStyle(.secondary)
-            Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 12) {
-                onboardingRow("sidebar.left", "Layers", "Drag layers into groups; Shift-click selects several.")
-                onboardingRow("cursorarrow.motionlines", "Canvas", "Use V to move, B to paint, and P for editable paths.")
-                onboardingRow("dice", "Generative", "⌘R rerolls a seed; the variations grid explores complete parameter combinations.")
-                onboardingRow("square.and.arrow.up", "Export", "⌘E exports raster assets, PDF, SVG, or layered PSD.")
+        VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("PixelFailure")
+                    .font(.system(size: 22, weight: .semibold))
+                Text("Generative artwork, images, and vectors in one layered canvas.")
+                    .foregroundStyle(Theme.textDim)
+            }
+            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 10) {
+                onboardingRow("dice", "⌘R", "Reroll a pattern")
+                onboardingRow("cursorarrow", "V  B  P", "Move, brush, pen")
+                onboardingRow("square.2.layers.3d", "⌘G", "Group layers")
+                onboardingRow("square.and.arrow.up", "⌘E", "Export PNG, SVG, PDF, PSD")
             }
             HStack {
                 Spacer()
-                Button("Start Creating", action: complete)
+                Button("Get Started", action: complete)
                     .keyboardShortcut(.defaultAction)
             }
         }
-        .padding(32)
-        .frame(width: 620)
+        .padding(28)
+        .frame(width: 420)
     }
 
     @ViewBuilder
-    private func onboardingRow(_ icon: String, _ title: String, _ detail: String) -> some View {
+    private func onboardingRow(_ icon: String, _ keys: String, _ detail: String) -> some View {
         GridRow {
-            Image(systemName: icon).frame(width: 28)
-            Text(title).fontWeight(.semibold)
-            Text(detail).foregroundStyle(.secondary)
+            Image(systemName: icon)
+                .foregroundStyle(Theme.icon)
+                .frame(width: 20)
+            Text(keys)
+                .font(.system(size: 11, weight: .medium).monospaced())
+                .foregroundStyle(Theme.textDim)
+            Text(detail)
         }
     }
 }

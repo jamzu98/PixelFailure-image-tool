@@ -1,10 +1,10 @@
+import AppKit
 import SwiftUI
 import ImageIO
 import UniformTypeIdentifiers
 
-/// Palette strip at the bottom of the inspector: palette picker (built-in +
-/// user-saved), editable swatches, shuffle, save, and extraction from an
-/// image layer or straight from an image file on disk.
+/// Swatches panel: palette picker (built-in + user-saved), editable
+/// swatches, cycle, harmony, extraction, and save.
 struct PalettePanel: View {
     @ObservedObject var document: PixelDocument
     @Bindable var editorState: EditorState
@@ -16,25 +16,26 @@ struct PalettePanel: View {
     @State private var showFileExtractor = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Palette")
-                    .font(.headline)
-                Spacer()
+        VStack(spacing: 0) {
+            PanelHeader(title: "Swatches") {
                 Button {
                     // One gesture per browsing session: click through palettes
                     // with the popover open, get a single undo step at the end.
                     document.beginGesture()
                     showPicker = true
                 } label: {
-                    HStack(spacing: 3) {
+                    HStack(spacing: 4) {
                         Text(document.model.palette.name)
+                            .foregroundStyle(Theme.textDim)
                         Image(systemName: "chevron.down")
-                            .font(.system(size: 8, weight: .semibold))
+                            .font(.system(size: 7, weight: .bold))
+                            .foregroundStyle(Theme.textFaint)
                     }
-                    .font(.caption)
+                    .font(.system(size: 10.5))
+                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.plain)
+                .help("Choose Palette")
                 .popover(isPresented: $showPicker, arrowEdge: .bottom) {
                     PalettePickerList(document: document)
                 }
@@ -45,30 +46,22 @@ struct PalettePanel: View {
                 }
             }
 
-            HStack(spacing: 6) {
-                ForEach(document.model.palette.colors.indices, id: \.self) { i in
-                    // The getter guards the index: AppKit can re-query a
-                    // swatch's binding after the palette has shrunk (e.g.
-                    // eyedropper grew it, then a palette switch removed rows).
-                    ColorPicker("", selection: Binding(
-                        get: {
-                            let colors = document.model.palette.colors
-                            return colors.indices.contains(i) ? colors[i].color : Color.clear
-                        },
-                        set: { newValue in
-                            document.update(undoManager, actionName: "Edit Swatch") { model in
-                                guard model.palette.colors.indices.contains(i) else { return }
-                                model.palette.colors[i] = RGBAColor(colorValue: newValue,
-                                                                    in: model.colorSettings.workingSpace)
-                                model.palette.name = "Custom"
-                            }
+            HStack(spacing: 4) {
+                // Snapshot values, not live indices: AppKit can call back
+                // after the palette has shrunk (e.g. eyedropper grew it, then
+                // a palette switch removed rows).
+                ForEach(Array(document.model.palette.colors.enumerated()), id: \.offset) { i, swatch in
+                    SwatchWell(color: swatch.color) { newValue in
+                        document.update(undoManager, actionName: "Edit Swatch") { model in
+                            guard model.palette.colors.indices.contains(i) else { return }
+                            model.palette.colors[i] = RGBAColor(colorValue: newValue,
+                                                                in: model.colorSettings.workingSpace)
+                            model.palette.name = "Custom"
                         }
-                    ))
-                    .labelsHidden()
-                    .frame(width: 28)
+                    }
                 }
 
-                Spacer()
+                Spacer(minLength: 6)
 
                 Button {
                     document.update(undoManager, actionName: "Shuffle Palette") { model in
@@ -79,60 +72,51 @@ struct PalettePanel: View {
                 } label: {
                     Image(systemName: "arrow.triangle.2.circlepath")
                 }
-                .buttonStyle(.borderless)
-                .help("Cycle swatch order")
+                .help("Cycle Order")
 
-                Button {
-                    saveName = suggestedSaveName
-                    showSaveDialog = true
-                } label: {
-                    Image(systemName: "bookmark")
-                }
-                .buttonStyle(.borderless)
-                .help("Save current palette for reuse in any document")
-            }
-
-            HStack(spacing: 4) {
                 Menu {
-                    ForEach(PaletteHarmony.allCases, id: \.self) { harmony in
-                        Button(harmony.displayName) {
-                            document.update(undoManager, actionName: "Palette Harmony") {
-                                $0.palette = $0.palette.harmony(harmony)
+                    Section("Harmony") {
+                        ForEach(PaletteHarmony.allCases, id: \.self) { harmony in
+                            Button(harmony.displayName) {
+                                document.update(undoManager, actionName: "Palette Harmony") {
+                                    $0.palette = $0.palette.harmony(harmony)
+                                }
                             }
                         }
                     }
+                    Section("Extract") {
+                        Button("From Image Layer") { extractFromLayer() }
+                            .disabled(extractionSourceLayer == nil)
+                        Button("From File…") { showFileExtractor = true }
+                    }
+                    Divider()
+                    Button("Save Palette…") {
+                        saveName = suggestedSaveName
+                        showSaveDialog = true
+                    }
                 } label: {
-                    Label("Harmony", systemImage: "circle.hexagongrid")
-                        .font(.caption)
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.icon)
                 }
-
-                Button {
-                    extractFromLayer()
-                } label: {
-                    Label("Extract from Image", systemImage: "eyedropper.halffull")
-                        .font(.caption)
-                }
-                .disabled(extractionSourceLayer == nil)
-                .help("Build a palette from an image layer (uses the selected image layer, or the topmost one)")
-
-                Button {
-                    showFileExtractor = true
-                } label: {
-                    Image(systemName: "folder")
-                        .font(.caption)
-                }
-                .help("Extract a palette from an image file without importing it")
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .frame(width: 24, height: 24)
+                .help("Palette Actions")
             }
+            .buttonStyle(IconButtonStyle())
+            .padding(.horizontal, 8)
+            .frame(height: 40)
+            .overlay(alignment: .bottom) { Rectangle().fill(Theme.border).frame(height: 1) }
         }
-        .padding(12)
+        .background(Theme.panel)
+        .panelStyle()
         .alert("Save Palette", isPresented: $showSaveDialog) {
             TextField("Name", text: $saveName)
             Button("Save") {
                 UserPaletteStore.shared.save(document.model.palette, named: saveName)
             }
             Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Saved palettes are available in every document from the palette menu.")
         }
         .fileImporter(isPresented: $showFileExtractor, allowedContentTypes: [.image]) { result in
             extractFromFile(result)
@@ -200,13 +184,6 @@ private struct PalettePickerList: View {
                     }
                 }
 
-                Divider()
-                    .padding(.vertical, 2)
-                Text("Click to preview — the last one you pick stays.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.bottom, 4)
             }
             .padding(8)
         }
@@ -233,9 +210,9 @@ private struct PalettePickerList: View {
                 HStack(spacing: 8) {
                     HStack(spacing: 2) {
                         ForEach(palette.colors.indices, id: \.self) { i in
-                            RoundedRectangle(cornerRadius: 3)
+                            RoundedRectangle(cornerRadius: 2)
                                 .fill(palette.colors[i].color)
-                                .frame(width: 15, height: 15)
+                                .frame(width: 14, height: 14)
                         }
                     }
                     Text(palette.name)
@@ -245,14 +222,14 @@ private struct PalettePickerList: View {
                     if isCurrent {
                         Image(systemName: "checkmark")
                             .font(.caption.weight(.semibold))
-                            .foregroundStyle(Color.accentColor)
+                            .foregroundStyle(Theme.accent)
                     }
                 }
                 .padding(.horizontal, 8)
                 .padding(.vertical, 5)
                 .contentShape(Rectangle())
-                .background(isCurrent ? Color.accentColor.opacity(0.18) : Color.clear,
-                            in: RoundedRectangle(cornerRadius: 6))
+                .background(isCurrent ? Theme.rowSelected : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 4))
             }
             .buttonStyle(.plain)
 
@@ -268,5 +245,52 @@ private struct PalettePickerList: View {
                 .help("Remove this saved palette")
             }
         }
+    }
+}
+
+/// A flat color chip that edits its color in the shared system color panel.
+struct SwatchWell: View {
+    let color: Color
+    var size = CGSize(width: 26, height: 22)
+    var help = "Edit Swatch"
+    let onChange: (Color) -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 3)
+            .fill(color)
+            .overlay(RoundedRectangle(cornerRadius: 3)
+                .stroke(isHovering ? Theme.textDim : Color.white.opacity(0.12), lineWidth: 1))
+            .frame(width: size.width, height: size.height)
+            .contentShape(Rectangle())
+            .onHover { isHovering = $0 }
+            .onTapGesture {
+                ColorPanelBridge.shared.open(color: NSColor(color)) { onChange(Color(nsColor: $0)) }
+            }
+            .help(help)
+    }
+}
+
+/// Routes NSColorPanel changes to whichever swatch opened it last.
+@MainActor
+final class ColorPanelBridge: NSObject {
+    static let shared = ColorPanelBridge()
+    private var onChange: ((NSColor) -> Void)?
+
+    func open(color: NSColor, onChange: @escaping (NSColor) -> Void) {
+        let panel = NSColorPanel.shared
+        self.onChange = nil
+        panel.setTarget(nil)
+        panel.setAction(nil)
+        panel.showsAlpha = true
+        panel.color = color
+        self.onChange = onChange
+        panel.setTarget(self)
+        panel.setAction(#selector(colorChanged(_:)))
+        panel.orderFront(nil)
+    }
+
+    @objc private func colorChanged(_ sender: NSColorPanel) {
+        onChange?(sender.color)
     }
 }

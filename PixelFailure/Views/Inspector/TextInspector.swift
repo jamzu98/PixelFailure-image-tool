@@ -11,10 +11,14 @@ struct TextInspector: View {
     @State private var rangeLength = 1
 
     var body: some View {
-        Section("Text") {
+        InspectorSection("Text") {
             TextEditor(text: textBinding)
-                .font(.body)
+                .font(.system(size: 12))
+                .scrollContentBackground(.hidden)
+                .padding(4)
                 .frame(minHeight: 48, maxHeight: 96)
+                .background(Theme.field, in: RoundedRectangle(cornerRadius: 3))
+                .overlay(RoundedRectangle(cornerRadius: 3).stroke(Theme.fieldBorder, lineWidth: 1))
                 .focused($textFocused)
                 .onChange(of: textFocused) { _, focused in
                     // One undo step per editing session instead of per keystroke.
@@ -28,7 +32,7 @@ struct TextInspector: View {
             FontFamilyPicker(selection: modify(\.fontFamily, action: "Font"),
                              families: availableFamilies)
 
-            Picker("Weight", selection: modify(\.weight, action: "Weight")) {
+            PanelPicker("Weight", selection: modify(\.weight, action: "Weight")) {
                 ForEach(FontWeightChoice.allCases, id: \.self) { weight in
                     Text(weight.displayName).tag(weight)
                 }
@@ -37,18 +41,18 @@ struct TextInspector: View {
             Toggle("Italic", isOn: modify(\.italic, action: "Italic"))
             Toggle("All Caps", isOn: modify(\.allCaps, action: "All Caps"))
 
-            sliderRow("Size", value: \.size, range: 8...800, defaultValue: 160, action: "Text Size")
-            sliderRow("Tracking", value: \.tracking, range: -20...120, defaultValue: 8, action: "Tracking")
+            sliderRow("Size", value: \.size, range: 8...800, defaultValue: 160, fractionDigits: 0, action: "Text Size")
+            sliderRow("Tracking", value: \.tracking, range: -20...120, defaultValue: 8, fractionDigits: 0, action: "Tracking")
             sliderRow("Line Height", value: \.lineHeight, range: 0.7...2.2, defaultValue: 1.1, action: "Line Height")
 
-            Picker("Alignment", selection: modify(\.alignment, action: "Alignment")) {
+            PanelPicker("Alignment", selection: modify(\.alignment, action: "Alignment")) {
                 ForEach(TextAlignmentChoice.allCases, id: \.self) { alignment in
                     Text(alignment.displayName).tag(alignment)
                 }
             }
             .pickerStyle(.segmented)
 
-            ColorPicker("Color", selection: Binding(
+            PanelColorPicker("Color", selection: Binding(
                 get: { config.color.color(in: document.model.colorSettings.workingSpace) },
                 set: { newValue in
                     document.update(undoManager, actionName: "Text Color") { model in
@@ -82,7 +86,7 @@ struct TextInspector: View {
                               format: .number.precision(.fractionLength(0)))
                         .frame(width: 62)
                 }
-                Picker("Vertical", selection: Binding(
+                PanelPicker("Vertical", selection: Binding(
                     get: { config.verticalAlignment ?? .top },
                     set: { value in document.update(undoManager, actionName: "Vertical Alignment") {
                         $0.modifyLayer(id: layerID) { $0.modifyText { $0.verticalAlignment = value } }
@@ -114,7 +118,7 @@ struct TextInspector: View {
 
             let pathLayers = document.model.allLayers.filter(\.kind.isPath)
             if !pathLayers.isEmpty {
-                Picker("Text Path", selection: Binding(
+                PanelPicker("Text Path", selection: Binding(
                     get: { config.pathLayerID },
                     set: { value in
                         document.update(undoManager, actionName: "Text on Path") {
@@ -246,7 +250,7 @@ struct TextInspector: View {
 
     private func sliderRow(_ label: String, value keyPath: WritableKeyPath<TextConfig, Double>,
                            range: ClosedRange<Double>, defaultValue: Double,
-                           action: String) -> some View {
+                           fractionDigits: Int = 2, action: String) -> some View {
         LabeledContent(label) {
             NumericSlider(value: Binding(
                 get: { document.model.layer(id: layerID)?.textConfig?[keyPath: keyPath] ?? config[keyPath: keyPath] },
@@ -257,7 +261,7 @@ struct TextInspector: View {
                         }
                     }
                 }
-            ), range: range, defaultValue: defaultValue) { editing in
+            ), range: range, defaultValue: defaultValue, fractionDigits: fractionDigits) { editing in
                 if editing { document.beginGesture() } else { document.endGesture(undoManager, actionName: action) }
             }
         }
@@ -280,14 +284,21 @@ private struct FontFamilyPicker: View {
                 HStack(spacing: 4) {
                     Text(selection)
                         .font(FontFamilyPreview.font(for: selection, size: 12))
+                        .foregroundStyle(Theme.text)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                    Spacer(minLength: 0)
                     Image(systemName: "chevron.up.chevron.down")
                         .font(.system(size: 8, weight: .semibold))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Theme.textDim)
                 }
+                .padding(.horizontal, 6)
+                .frame(maxWidth: .infinity, minHeight: 22)
+                .background(Theme.field, in: RoundedRectangle(cornerRadius: 3))
+                .overlay(RoundedRectangle(cornerRadius: 3).stroke(Theme.fieldBorder, lineWidth: 1))
+                .contentShape(Rectangle())
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(.plain)
             .popover(isPresented: $isOpen, arrowEdge: .bottom) {
                 FontFamilyPickerList(selection: $selection, families: families, isOpen: $isOpen)
             }

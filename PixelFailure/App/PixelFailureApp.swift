@@ -3,10 +3,18 @@ import SwiftUI
 
 @main
 struct PixelFailureApp: App {
+    init() {
+        // A pro editor runs dark regardless of the system appearance, so
+        // artwork colors are judged against neutral gray chrome.
+        NSApplication.shared.appearance = NSAppearance(named: .darkAqua)
+        TitlebarClickThrough.install()
+    }
+
     var body: some Scene {
         DocumentGroup(newDocument: { PixelDocument() }) { configuration in
             EditorView(document: configuration.document)
         }
+        .defaultSize(width: 1440, height: 900)
         // One slim bar: title and toolbar items share a single compact row.
         .windowToolbarStyle(.unifiedCompact(showsTitle: true))
         .commands {

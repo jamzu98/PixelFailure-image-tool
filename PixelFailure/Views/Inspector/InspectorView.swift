@@ -10,92 +10,198 @@ struct InspectorView: View {
     @State private var draftWidth: Int = 0
     @State private var draftHeight: Int = 0
     @State private var snapshotName = ""
+    @AppStorage("inspector.tab") private var tab: InspectorTab = .properties
+
+    enum InspectorTab: String { case properties, history }
 
     var body: some View {
         VStack(spacing: 0) {
-            Form {
-                if editorState.selectedLayerIDs.count > 1 {
-                    multiSelectionSection
-                } else if let layer = document.model.layer(id: editorState.selectedLayerID) {
-                    commonSection(layer)
-                    maskSection(layer)
-                    compositingSection(layer)
-                    switch layer.kind {
-                    case .pattern(let config):
-                        PatternInspector(document: document, editorState: editorState,
-                                         layerID: layer.id, config: config,
-                                         renderStore: renderStore)
-                    case .image(let config):
-                        ImageInspector(document: document, layerID: layer.id, config: config)
-                    case .text(let config):
-                        TextInspector(document: document, layerID: layer.id, config: config)
-                    case .fill(let config):
-                        FillInspector(document: document, layerID: layer.id, config: config)
-                    case .shape(let config):
-                        ShapeInspector(document: document, layerID: layer.id, config: config)
-                    case .group(let config):
-                        Section("Group") {
-                            Text("\(config.children.count) layer\(config.children.count == 1 ? "" : "s") inside")
-                                .foregroundStyle(.secondary)
-                            Text("Opacity, blend mode, transform, and mask apply to the whole group. Ungroup with ⇧⌘G.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    case .adjustment(let config):
-                        EffectStackSection(document: document, title: "Adjustments",
-                                           target: .layer(layer.id), effects: config.effects,
-                                           footnote: "Applies non-destructively to visible layers below in this container.")
-                    case .path(let config):
-                        pathSection(layerID: layer.id, config: config)
+            PanelTabBar(tabs: [(InspectorTab.properties, "Properties"), (.history, "History")],
+                        selection: $tab)
+            switch tab {
+            case .properties:
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        titleRow
+                        propertiesContent
                     }
-                } else {
-                    canvasSection
                 }
-                historySection
+                .scrollIndicators(.automatic)
+            case .history:
+                historyPanel
             }
-            .formStyle(.grouped)
+        }
+        .background(Theme.panel)
+        .panelStyle()
+    }
 
-            Divider()
+    // MARK: - Title
 
-            PalettePanel(document: document, editorState: editorState, renderStore: renderStore)
+    private var titleRow: some View {
+        let selected = document.model.layer(id: editorState.selectedLayerID)
+        let count = editorState.selectedLayerIDs.count
+        let icon = count > 1 ? "square.stack.3d.up" : (selected?.kind.iconName ?? "aspectratio")
+        let title = count > 1 ? "\(count) Layers" : (selected?.name ?? "Canvas")
+        let subtitle: String = {
+            if count > 1 { return "Multiple selection" }
+            guard let selected else {
+                return "\(Int(document.model.canvasSize.width)) × \(Int(document.model.canvasSize.height)) px"
+            }
+            return selected.kind.kindName
+        }()
+        return HStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.icon)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.textDim)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            if let selected, document.model.isEffectivelyLocked(selected.id) {
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.textDim)
+                    .help("Locked")
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 40)
+        .overlay(alignment: .bottom) { Rectangle().fill(Theme.separator).frame(height: 1) }
+    }
+
+    @ViewBuilder
+    private var propertiesContent: some View {
+        if editorState.selectedLayerIDs.count > 1 {
+            multiSelectionSection
+        } else if let layer = document.model.layer(id: editorState.selectedLayerID) {
+            switch layer.kind {
+            case .pattern(let config):
+                PatternInspector(document: document, editorState: editorState,
+                                 layerID: layer.id, config: config,
+                                 renderStore: renderStore)
+            case .image(let config):
+                ImageInspector(document: document, layerID: layer.id, config: config)
+            case .text(let config):
+                TextInspector(document: document, layerID: layer.id, config: config)
+            case .fill(let config):
+                FillInspector(document: document, layerID: layer.id, config: config)
+            case .shape(let config):
+                ShapeInspector(document: document, layerID: layer.id, config: config)
+            case .group:
+                EmptyView()
+            case .adjustment(let config):
+                EffectStackSection(document: document, title: "Adjustments",
+                                   target: .layer(layer.id), effects: config.effects)
+            case .path(let config):
+                pathSection(layerID: layer.id, config: config)
+            }
+            transformSection(layer)
+            compositingSection(layer)
+            maskSection(layer)
+        } else {
+            canvasSection
         }
     }
 
-    private var historySection: some View {
-        Section("History & Snapshots") {
-            DisclosureGroup("Recent History (\(document.history.count))") {
-                ForEach(Array(document.history.reversed())) { state in
-                    Button {
-                        document.jumpToHistory(state.id, undoManager: undoManager)
-                    } label: {
-                        HStack {
-                            Text(state.name)
-                            Spacer()
-                            Text(state.createdAt, style: .time).foregroundStyle(.secondary)
+    // MARK: - History
+
+    private var historyPanel: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(document.history.reversed())) { state in
+                        Button {
+                            document.jumpToHistory(state.id, undoManager: undoManager)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "circle.fill")
+                                    .font(.system(size: 4))
+                                    .foregroundStyle(Theme.textFaint)
+                                Text(state.name)
+                                    .lineLimit(1)
+                                Spacer(minLength: 4)
+                                Text(state.createdAt, style: .time)
+                                    .font(.system(size: 10).monospacedDigit())
+                                    .foregroundStyle(Theme.textFaint)
+                            }
+                            .padding(.horizontal, 12)
+                            .frame(height: 24)
+                            .contentShape(Rectangle())
                         }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
+                    if document.history.isEmpty {
+                        Text("No history yet")
+                            .foregroundStyle(Theme.textFaint)
+                            .padding(12)
+                    }
                 }
+                .padding(.vertical, 4)
             }
-            HStack {
-                TextField("Snapshot name", text: $snapshotName, prompt: Text("Snapshot"))
-                Button("Save") {
-                    let name = snapshotName.trimmingCharacters(in: .whitespacesAndNewlines)
-                    document.createCheckpoint(name: name.isEmpty ? "Snapshot" : name)
-                    snapshotName = ""
+
+            if !document.checkpoints.isEmpty {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("Snapshots")
+                        .font(Theme.headerFont)
+                        .padding(.horizontal, 12)
+                        .frame(height: 26)
+                    ForEach(document.checkpoints) { state in
+                        Button {
+                            document.restoreCheckpoint(state.id, undoManager: undoManager)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "camera")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(Theme.textDim)
+                                Text(state.name).lineLimit(1)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 12)
+                            .frame(height: 24)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Restore snapshot")
+                    }
                 }
+                .overlay(alignment: .top) { Rectangle().fill(Theme.separator).frame(height: 1) }
             }
-            ForEach(document.checkpoints) { state in
-                Button("Restore \(state.name)") {
-                    document.restoreCheckpoint(state.id, undoManager: undoManager)
+
+            HStack(spacing: 6) {
+                TextField("Snapshot name", text: $snapshotName)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { saveSnapshot() }
+                Button {
+                    saveSnapshot()
+                } label: {
+                    Image(systemName: "camera")
                 }
+                .buttonStyle(IconButtonStyle(size: 22))
+                .help("New Snapshot")
             }
+            .padding(.horizontal, 8)
+            .frame(height: 34)
+            .background(Theme.header)
+            .hairline(.top)
         }
+    }
+
+    private func saveSnapshot() {
+        let name = snapshotName.trimmingCharacters(in: .whitespacesAndNewlines)
+        document.createCheckpoint(name: name.isEmpty ? "Snapshot \(document.checkpoints.count + 1)" : name)
+        snapshotName = ""
     }
 
     @ViewBuilder
     private func compositingSection(_ layer: Layer) -> some View {
-        Section("Compositing") {
+        InspectorSection("Layer Style") {
             Toggle("Clip to Layer Below", isOn: Binding(
                 get: { document.model.layer(id: layer.id)?.clipsToBelow ?? false },
                 set: { value in
@@ -107,7 +213,7 @@ struct InspectorView: View {
             ForEach(layer.styles) { style in
                 DisclosureGroup(style.type.displayName) {
                     Toggle("Enabled", isOn: styleBinding(layer.id, style, \.isEnabled))
-                    ColorPicker("Color", selection: Binding(
+                    PanelColorPicker("Color", selection: Binding(
                         get: { style.color.color(in: document.model.colorSettings.workingSpace) },
                         set: { color in
                             updateStyle(layer.id, style.id, action: "Style Color") {
@@ -116,20 +222,20 @@ struct InspectorView: View {
                     }))
                     LabeledContent("Size") {
                         NumericSlider(value: styleBinding(layer.id, style, \.size),
-                                      range: 0...120, defaultValue: 16)
+                                      range: 0...120, defaultValue: 16, fractionDigits: 0)
                     }
                     LabeledContent("Opacity") {
                         NumericSlider(value: styleBinding(layer.id, style, \.opacity),
-                                      range: 0...1, defaultValue: 0.6)
+                                      range: 0...1, defaultValue: 0.6, percent: true)
                     }
                     if style.type == .dropShadow {
                         LabeledContent("Offset X") {
                             NumericSlider(value: styleBinding(layer.id, style, \.offsetX),
-                                          range: -150...150, defaultValue: 12)
+                                          range: -150...150, defaultValue: 12, fractionDigits: 0)
                         }
                         LabeledContent("Offset Y") {
                             NumericSlider(value: styleBinding(layer.id, style, \.offsetY),
-                                          range: -150...150, defaultValue: 12)
+                                          range: -150...150, defaultValue: 12, fractionDigits: 0)
                         }
                     }
                     Button("Remove Style", role: .destructive) {
@@ -139,7 +245,8 @@ struct InspectorView: View {
                     }
                 }
             }
-            Menu("Add Layer Style") {
+        } accessory: {
+            Menu {
                 ForEach(LayerStyleType.allCases, id: \.self) { type in
                     Button(type.displayName) {
                         document.update(undoManager, actionName: "Add \(type.displayName)") {
@@ -147,7 +254,15 @@ struct InspectorView: View {
                         }
                     }
                 }
+            } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Theme.icon)
             }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Add Layer Style")
         }
     }
 
@@ -171,46 +286,13 @@ struct InspectorView: View {
         })
     }
 
-    // MARK: - Common layer controls
+    // MARK: - Transform
 
     @ViewBuilder
-    private func commonSection(_ layer: Layer) -> some View {
-        Section("Layer") {
-            LabeledContent("Opacity") {
-                NumericSlider(value: Binding(
-                    get: { document.model.layer(id: layer.id)?.opacity ?? 1 },
-                    set: { newValue in
-                        document.updateDuringGesture { model in
-                            model.modifyLayer(id: layer.id) { $0.opacity = newValue }
-                        }
-                    }
-                ), range: 0...1, defaultValue: 1) { editing in
-                    if editing { document.beginGesture() } else { document.endGesture(undoManager, actionName: "Opacity") }
-                }
-            }
-
-            Picker("Blend Mode", selection: Binding(
-                get: { document.model.layer(id: layer.id)?.blendMode ?? .normal },
-                set: { newValue in
-                    document.update(undoManager, actionName: "Blend Mode") { model in
-                        model.modifyLayer(id: layer.id) { $0.blendMode = newValue }
-                    }
-                }
-            )) {
-                ForEach(LayerBlendMode.allCases, id: \.self) { mode in
-                    Text(mode.displayName).tag(mode)
-                }
-            }
-
-            if document.model.isEffectivelyLocked(layer.id) {
-                Label("Layer is locked — transform and painting are disabled.", systemImage: "lock.fill")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            // Numeric transform: position and on-canvas size (size edits scale).
+    private func transformSection(_ layer: Layer) -> some View {
+        InspectorSection("Transform") {
             LabeledContent("Position") {
-                HStack(spacing: 4) {
+                HStack(spacing: 6) {
                     numericField("X", value: Binding(
                         get: { Double(document.model.layer(id: layer.id)?.transform.position.x ?? 0) },
                         set: { newValue in
@@ -230,7 +312,7 @@ struct InspectorView: View {
 
             LabeledContent("Size") {
                 let naturalSize = renderStore.naturalSize(for: layer, model: document.model)
-                HStack(spacing: 4) {
+                HStack(spacing: 6) {
                     numericField("W", value: Binding(
                         get: {
                             let current = document.model.layer(id: layer.id) ?? layer
@@ -268,7 +350,7 @@ struct InspectorView: View {
                             model.modifyLayer(id: layer.id) { $0.transform.scale = pow(2, newValue) }
                         }
                     }
-                ), range: -4...4, defaultValue: 0) { editing in
+                ), range: -4...4, defaultValue: 0, showsValue: false) { editing in
                     if editing { document.beginGesture() } else { document.endGesture(undoManager, actionName: "Scale") }
                 }
             }
@@ -287,13 +369,13 @@ struct InspectorView: View {
             }
 
             LabeledContent("Skew") {
-                HStack(spacing: 4) {
-                    numericField("X°", value: Binding(
+                HStack(spacing: 6) {
+                    numericField("X", value: Binding(
                         get: { document.model.layer(id: layer.id)?.transform.skewXDegrees ?? 0 },
                         set: { value in document.update(undoManager, actionName: "Skew") {
                             $0.modifyLayer(id: layer.id) { $0.transform.skewXDegrees = value }
                         }}))
-                    numericField("Y°", value: Binding(
+                    numericField("Y", value: Binding(
                         get: { document.model.layer(id: layer.id)?.transform.skewYDegrees ?? 0 },
                         set: { value in document.update(undoManager, actionName: "Skew") {
                             $0.modifyLayer(id: layer.id) { $0.transform.skewYDegrees = value }
@@ -301,59 +383,78 @@ struct InspectorView: View {
                 }
             }
 
-            HStack {
-                Button("Corner Pin") {
-                    document.update(undoManager, actionName: "Corner Pin") {
-                        $0.modifyLayer(id: layer.id) { $0.transform.deformation = .identityCornerPin }
+            LabeledContent("Align") {
+                HStack(spacing: 0) {
+                    ForEach(PixelDocument.AlignEdge.allCases, id: \.self) { edge in
+                        alignButton(edge, ids: [layer.id])
                     }
-                }
-                Button("Warp 3×3") {
-                    let points = (0..<3).flatMap { row in (0..<3).map { column in
-                        CGPoint(x: Double(column) / 2, y: Double(row) / 2)
-                    }}
-                    document.update(undoManager, actionName: "Warp Mesh") {
-                        $0.modifyLayer(id: layer.id) {
-                            $0.transform.deformation = .warpMesh(columns: 3, rows: 3, points: points)
-                        }
-                    }
-                }
-                if layer.transform.deformation != nil {
-                    Button("Clear Distort") {
-                        document.update(undoManager, actionName: "Clear Distortion") {
-                            $0.modifyLayer(id: layer.id) { $0.transform.deformation = nil }
-                        }
-                    }
-                }
-            }
-            if layer.transform.deformation != nil {
-                deformationControls(layer)
-                Button("Perspective Crop to Distortion") {
-                    document.perspectiveCrop(to: layer.id, renderStore: renderStore,
-                                             undoManager: undoManager)
                 }
             }
 
-            HStack {
-                Button("Center") {
+            HStack(spacing: 0) {
+                Button {
                     document.update(undoManager, actionName: "Center Layer") { model in
                         let center = model.canvasCenter
                         model.modifyLayer(id: layer.id) { $0.transform.position = center }
                     }
-                }
-                Button("Reset") {
+                } label: { Image(systemName: "plus.viewfinder") }
+                    .help("Center on Canvas")
+                Button {
+                    document.flipLayer(id: layer.id, horizontally: true, undoManager: undoManager)
+                } label: { Image(systemName: "arrow.left.and.right.righttriangle.left.righttriangle.right") }
+                    .help("Flip Horizontal")
+                Button {
+                    document.flipLayer(id: layer.id, horizontally: false, undoManager: undoManager)
+                } label: { Image(systemName: "arrow.up.and.down.righttriangle.up.righttriangle.down") }
+                    .help("Flip Vertical")
+                Button {
                     document.update(undoManager, actionName: "Reset Transform") { model in
                         let center = model.canvasCenter
                         model.modifyLayer(id: layer.id) {
                             $0.transform = LayerTransform(position: center)
                         }
                     }
+                } label: { Image(systemName: "arrow.counterclockwise") }
+                    .help("Reset Transform")
+
+                Spacer(minLength: 8)
+
+                Menu("Distort") {
+                    Button("Corner Pin") {
+                        document.update(undoManager, actionName: "Corner Pin") {
+                            $0.modifyLayer(id: layer.id) { $0.transform.deformation = .identityCornerPin }
+                        }
+                    }
+                    Button("Warp 3×3") {
+                        let points = (0..<3).flatMap { row in (0..<3).map { column in
+                            CGPoint(x: Double(column) / 2, y: Double(row) / 2)
+                        }}
+                        document.update(undoManager, actionName: "Warp Mesh") {
+                            $0.modifyLayer(id: layer.id) {
+                                $0.transform.deformation = .warpMesh(columns: 3, rows: 3, points: points)
+                            }
+                        }
+                    }
+                    if layer.transform.deformation != nil {
+                        Divider()
+                        Button("Perspective Crop") {
+                            document.perspectiveCrop(to: layer.id, renderStore: renderStore,
+                                                     undoManager: undoManager)
+                        }
+                        Button("Clear Distortion") {
+                            document.update(undoManager, actionName: "Clear Distortion") {
+                                $0.modifyLayer(id: layer.id) { $0.transform.deformation = nil }
+                            }
+                        }
+                    }
                 }
-                Button("Flip H") {
-                    document.flipLayer(id: layer.id, horizontally: true, undoManager: undoManager)
-                }
-                Button("Flip V") {
-                    document.flipLayer(id: layer.id, horizontally: false, undoManager: undoManager)
-                }
+                .fixedSize()
+            }
+            .buttonStyle(IconButtonStyle())
+            .padding(.leading, Theme.labelWidth + 8)
+
+            if layer.transform.deformation != nil {
+                deformationControls(layer)
             }
         }
         .disabled(document.model.isEffectivelyLocked(layer.id))
@@ -366,7 +467,7 @@ struct InspectorView: View {
         case .warpMesh(_, _, let points): points
         case nil: []
         }
-        DisclosureGroup("Distortion Points") {
+        DisclosureGroup("Points") {
             ForEach(points.indices, id: \.self) { index in
                 LabeledContent("P\(index + 1)") {
                     HStack(spacing: 4) {
@@ -381,8 +482,6 @@ struct InspectorView: View {
                     }
                 }
             }
-            Text("Coordinates are normalized to the layer; values outside 0…1 are allowed.")
-                .font(.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -407,56 +506,47 @@ struct InspectorView: View {
 
     @ViewBuilder
     private var multiSelectionSection: some View {
-        Section("\(editorState.selectedLayerIDs.count) Layers Selected") {
-            Button("Group Layers  ⌘G") {
-                if let id = document.groupLayers(ids: editorState.selectedLayerIDs, undoManager: undoManager) {
+        let ids = editorState.selectedLayerIDs
+        InspectorSection("Arrange") {
+            LabeledContent("Align") {
+                HStack(spacing: 0) {
+                    ForEach(PixelDocument.AlignEdge.allCases, id: \.self) { edge in
+                        alignButton(edge, ids: ids)
+                    }
+                }
+            }
+            LabeledContent("Distribute") {
+                HStack(spacing: 6) {
+                    Button("Horizontal") {
+                        document.distributeLayers(ids: ids, horizontally: true,
+                                                  renderStore: renderStore, undoManager: undoManager)
+                    }
+                    Button("Vertical") {
+                        document.distributeLayers(ids: ids, horizontally: false,
+                                                  renderStore: renderStore, undoManager: undoManager)
+                    }
+                }
+                .disabled(ids.count < 3)
+                .help(ids.count < 3 ? "Needs three or more layers" : "")
+            }
+            Button("Group Layers") {
+                if let id = document.groupLayers(ids: ids, undoManager: undoManager) {
                     editorState.selectedLayerID = id
                 }
             }
+            .padding(.leading, Theme.labelWidth + 8)
         }
 
-        Section("Align") {
-            HStack {
-                ForEach([PixelDocument.AlignEdge.left, .centerH, .right], id: \.self) { edge in
-                    alignButton(edge)
-                }
-            }
-            HStack {
-                ForEach([PixelDocument.AlignEdge.top, .centerV, .bottom], id: \.self) { edge in
-                    alignButton(edge)
-                }
-            }
-        }
-
-        Section("Distribute") {
-            HStack {
-                Button("Horizontally") {
-                    document.distributeLayers(ids: editorState.selectedLayerIDs, horizontally: true,
-                                              renderStore: renderStore, undoManager: undoManager)
-                }
-                Button("Vertically") {
-                    document.distributeLayers(ids: editorState.selectedLayerIDs, horizontally: false,
-                                              renderStore: renderStore, undoManager: undoManager)
-                }
-            }
-            .disabled(editorState.selectedLayerIDs.count < 3)
-            if editorState.selectedLayerIDs.count < 3 {
-                Text("Select three or more layers to distribute.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-
-        let booleanEligible = editorState.selectedLayerIDs.filter {
+        let booleanEligible = ids.filter {
             guard let layer = document.model.layer(id: $0) else { return false }
             return layer.kind.isPath || layer.kind.isShape
         }
         if booleanEligible.count >= 2 {
-            Section("Boolean Paths") {
-                HStack {
+            InspectorSection("Combine Paths") {
+                HStack(spacing: 6) {
                     ForEach(PixelDocument.BooleanPathOperation.allCases, id: \.self) { operation in
                         Button(operation.displayName) {
-                            if let id = document.booleanPath(ids: editorState.selectedLayerIDs,
+                            if let id = document.booleanPath(ids: ids,
                                                              operation: operation,
                                                              undoManager: undoManager) {
                                 editorState.selectedLayerID = id
@@ -470,10 +560,10 @@ struct InspectorView: View {
 
     @ViewBuilder
     private func pathSection(layerID: UUID, config: PathConfig) -> some View {
-        Section("Path") {
+        InspectorSection("Path") {
             Text(config.commands == nil
-                 ? "\(config.nodes.count) editable nodes" : "Boolean path commands")
-                .foregroundStyle(.secondary)
+                 ? "\(config.nodes.count) nodes" : "Compound path")
+                .foregroundStyle(Theme.textDim)
             Toggle("Closed", isOn: Binding(
                 get: { config.isClosed },
                 set: { value in
@@ -491,7 +581,7 @@ struct InspectorView: View {
                     }
                 }))
             if let fill = config.fill {
-                ColorPicker("Fill Color", selection: Binding(
+                PanelColorPicker("Fill Color", selection: Binding(
                     get: { fill.color(in: document.model.colorSettings.workingSpace) },
                     set: { color in
                         document.update(undoManager, actionName: "Path Fill Color") {
@@ -511,7 +601,7 @@ struct InspectorView: View {
                     }
                 }))
             if let stroke = config.stroke {
-                ColorPicker("Stroke Color", selection: Binding(
+                PanelColorPicker("Stroke Color", selection: Binding(
                     get: { stroke.color(in: document.model.colorSettings.workingSpace) },
                     set: { color in
                         document.update(undoManager, actionName: "Path Stroke Color") {
@@ -520,7 +610,7 @@ struct InspectorView: View {
                             }
                         }
                 }))
-                LabeledContent("Stroke Width") {
+                LabeledContent("Width") {
                     NumericSlider(value: Binding(
                         get: { config.strokeWidth },
                         set: { value in
@@ -537,29 +627,25 @@ struct InspectorView: View {
     }
 
     private func numericField(_ label: String, value: Binding<Double>) -> some View {
-        HStack(spacing: 2) {
-            Text(label)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            TextField(label, value: value, format: .number.precision(.fractionLength(0...1)))
-                .textFieldStyle(.roundedBorder)
-                .multilineTextAlignment(.trailing)
-                .frame(width: 62)
-        }
+        PanelNumberField(label: label, value: value, fractionDigits: 1, width: 58)
     }
 
-    private func alignButton(_ edge: PixelDocument.AlignEdge) -> some View {
-        Button(edge.displayName) {
-            document.alignLayers(ids: editorState.selectedLayerIDs, edge: edge,
+    private func alignButton(_ edge: PixelDocument.AlignEdge, ids: Set<UUID>) -> some View {
+        Button {
+            document.alignLayers(ids: ids, edge: edge,
                                  renderStore: renderStore, undoManager: undoManager)
+        } label: {
+            Image(systemName: edge.symbolName)
         }
+        .buttonStyle(IconButtonStyle(size: 24))
+        .help("Align \(edge.displayName)")
     }
 
     // MARK: - Mask
 
     @ViewBuilder
     private func maskSection(_ layer: Layer) -> some View {
-        Section("Mask") {
+        InspectorSection("Mask") {
             if let mask = layer.mask {
                 Toggle("Enabled", isOn: Binding(
                     get: { mask.isEnabled },
@@ -578,7 +664,7 @@ struct InspectorView: View {
                     }
                 ))
                 if let pattern = mask.pattern {
-                    Picker("Pattern", selection: Binding(
+                    PanelPicker("Pattern", selection: Binding(
                         get: { pattern.generator },
                         set: { generator in
                             document.setPatternMask(on: layer.id, generator: generator,
@@ -595,12 +681,12 @@ struct InspectorView: View {
                             layer.mask?.pattern?.params.set(key, value)
                         }
                     }
-                    Button("Reroll Pattern Mask") {
+                    Button("Reroll Mask") {
                         document.rerollPatternMask(on: layer.id, undoManager: undoManager)
                     }
                 } else {
                     let isEditing = editorState.editingMaskLayerID == layer.id
-                    Button(isEditing ? "Done Editing Mask" : "Edit Mask (Paint)") {
+                    Button(isEditing ? "Done Editing" : "Paint Mask") {
                         if isEditing {
                             editorState.editingMaskLayerID = nil
                             editorState.activeTool = .move
@@ -617,25 +703,23 @@ struct InspectorView: View {
                     document.deleteMask(from: layer.id, undoManager: undoManager)
                 }
             } else {
-                HStack {
-                    Button("Add Mask") {
+                HStack(spacing: 6) {
+                    Button("Reveal All") {
                         document.addMask(to: layer.id, hideAll: false, renderStore: renderStore, undoManager: undoManager)
                     }
-                    Button("Add Hiding Mask") {
+                    Button("Hide All") {
                         document.addMask(to: layer.id, hideAll: true, renderStore: renderStore, undoManager: undoManager)
                     }
-                }
-                Menu("Pattern Mask") {
-                    ForEach(GeneratorType.allCases, id: \.self) { type in
-                        Button(type.displayName) {
-                            document.setPatternMask(on: layer.id, generator: type,
-                                                    renderStore: renderStore, undoManager: undoManager)
+                    Menu("Pattern") {
+                        ForEach(GeneratorType.allCases, id: \.self) { type in
+                            Button(type.displayName) {
+                                document.setPatternMask(on: layer.id, generator: type,
+                                                        renderStore: renderStore, undoManager: undoManager)
+                            }
                         }
                     }
+                    .fixedSize()
                 }
-                Text("Masks hide parts of the layer: paint black to hide, white to reveal.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -644,54 +728,42 @@ struct InspectorView: View {
 
     @ViewBuilder
     private var canvasSection: some View {
-        Section("Canvas") {
+        InspectorSection("Document") {
             LabeledContent("Size") {
-                HStack(spacing: 4) {
-                    TextField("W", value: $draftWidth, format: .number.grouping(.never))
-                        .frame(width: 64)
-                        .multilineTextAlignment(.trailing)
-                    Text("×")
-                    TextField("H", value: $draftHeight, format: .number.grouping(.never))
-                        .frame(width: 64)
-                        .multilineTextAlignment(.trailing)
-                    Text("px")
-                        .foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    PanelNumberField(label: "W", value: Binding(
+                        get: { Double(draftWidth) }, set: { draftWidth = Int($0) }), width: 58)
+                    PanelNumberField(label: "H", value: Binding(
+                        get: { Double(draftHeight) }, set: { draftHeight = Int($0) }), width: 58)
                 }
-                .textFieldStyle(.roundedBorder)
             }
 
             if draftSizeDiffers {
-                Button("Apply Size") { applyDraftSize() }
-                    .keyboardShortcut(.defaultAction)
+                HStack(spacing: 6) {
+                    Button("Apply") { applyDraftSize() }
+                        .keyboardShortcut(.defaultAction)
+                    Button("Revert") { syncDraftSize() }
+                }
+                .padding(.leading, Theme.labelWidth + 8)
             }
 
             LabeledContent("Resolution") {
-                HStack {
-                    TextField("DPI", value: Binding(
+                HStack(spacing: 6) {
+                    PanelNumberField(label: nil, value: Binding(
                         get: { document.model.printSettings.dpi },
                         set: { dpi in document.update(undoManager, actionName: "Print Resolution") {
                             $0.printSettings.dpi = max(1, dpi)
-                        }}), format: .number.precision(.fractionLength(0)))
-                        .frame(width: 62)
-                    Text("dpi").foregroundStyle(.secondary)
+                        }}), width: 58)
+                    Text("dpi").foregroundStyle(Theme.textDim)
                 }
             }
             let physical = document.model.printSettings.physicalSize(for: document.model.canvasSize)
-            Text(String(format: "Print size %.2f × %.2f in", physical.width, physical.height))
-                .font(.caption).foregroundStyle(.secondary)
-
-            Button("Add Full-canvas Export Slice") {
-                document.update(undoManager, actionName: "Add Export Slice") {
-                    $0.exportSlices.append(ExportSlice(name: "Artwork",
-                                                       rect: CGRect(origin: .zero, size: $0.canvasSize)))
-                }
-            }
-            ForEach(document.model.exportSlices) { slice in
-                Text("\(slice.name) · \(slice.scales.map { "@\($0)x" }.joined(separator: ", "))")
-                    .font(.caption)
+            LabeledContent("Print Size") {
+                Text(String(format: "%.2f × %.2f in", physical.width, physical.height))
+                    .foregroundStyle(Theme.textDim)
             }
 
-            ColorPicker("Background", selection: Binding(
+            PanelColorPicker("Background", selection: Binding(
                 get: { document.model.background.color(in: document.model.colorSettings.workingSpace) },
                 set: { newValue in
                     document.update(undoManager, actionName: "Background Color") { model in
@@ -700,28 +772,8 @@ struct InspectorView: View {
                     }
                 }
             ))
-            Text("Type any resolution above, or pick a preset from the toolbar. Select a layer to edit its settings.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .onAppear { syncDraftSize() }
-        .onChange(of: document.model.canvasSize) { _, _ in syncDraftSize() }
 
-        colorSection
-
-        EffectStackSection(document: document,
-                           title: "Canvas Effects",
-                           target: .canvas,
-                           effects: document.model.canvasEffects,
-                           footnote: "Applied to the whole composite. Affects PNG export and the preview; SVG export skips them.")
-
-        workspaceSection
-    }
-
-    @ViewBuilder
-    private var colorSection: some View {
-        Section("Color") {
-            Picker("Working Space", selection: Binding(
+            PanelPicker("Color Space", selection: Binding(
                 get: { document.model.colorSettings.workingSpace },
                 set: { value in
                     document.update(undoManager, actionName: "Working Color Space") {
@@ -730,7 +782,9 @@ struct InspectorView: View {
                 })) {
                 ForEach(WorkingColorSpace.allCases, id: \.self) { Text($0.displayName).tag($0) }
             }
-            Picker("Bit Depth", selection: Binding(
+            .help("Embedded in exports. Switching reassigns existing colors to the new gamut.")
+
+            PanelPicker("Bit Depth", selection: Binding(
                 get: { document.model.colorSettings.bitDepth },
                 set: { value in
                     document.update(undoManager, actionName: "Raster Bit Depth") {
@@ -739,15 +793,47 @@ struct InspectorView: View {
                 })) {
                 ForEach(RasterBitDepth.allCases, id: \.self) { Text($0.displayName).tag($0) }
             }
-            Text("Exports embed the working-space profile. Switching the space reassigns existing color values to the new gamut; imported images keep their own profiles. 16-bit keeps smooth gradients band-free and exports via PNG and TIFF.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            .help("16-bit avoids banding in gradients")
         }
+        .onAppear { syncDraftSize() }
+        .onChange(of: document.model.canvasSize) { _, _ in syncDraftSize() }
+
+        EffectStackSection(document: document,
+                           title: "Canvas Effects",
+                           target: .canvas,
+                           effects: document.model.canvasEffects)
+
+        InspectorSection("Export Slices") {
+            ForEach(document.model.exportSlices) { slice in
+                HStack {
+                    Text(slice.name)
+                    Spacer()
+                    Text(slice.scales.map { "@\($0)x" }.joined(separator: " "))
+                        .foregroundStyle(Theme.textDim)
+                }
+            }
+            if document.model.exportSlices.isEmpty {
+                Text("None").foregroundStyle(Theme.textFaint)
+            }
+        } accessory: {
+            Button {
+                document.update(undoManager, actionName: "Add Export Slice") {
+                    $0.exportSlices.append(ExportSlice(name: "Artwork",
+                                                       rect: CGRect(origin: .zero, size: $0.canvasSize)))
+                }
+            } label: {
+                Image(systemName: "plus")
+            }
+            .buttonStyle(IconButtonStyle(size: 20))
+            .help("Add Full-Canvas Slice")
+        }
+
+        workspaceSection
     }
 
     @ViewBuilder
     private var workspaceSection: some View {
-        Section("Workspace") {
+        InspectorSection("View") {
             Toggle("Rulers", isOn: workspaceBinding(\.showsRulers, action: "Toggle Rulers"))
             Toggle("Smart Guides", isOn: workspaceBinding(\.smartGuidesEnabled,
                                                            action: "Toggle Smart Guides"))
@@ -760,23 +846,24 @@ struct InspectorView: View {
                 }))
             if document.model.workspace.grid.isVisible {
                 LabeledContent("Grid Spacing") {
-                    TextField("px", value: Binding(
+                    PanelNumberField(label: nil, value: Binding(
                         get: { document.model.workspace.grid.spacing },
                         set: { value in
                             document.update(undoManager, actionName: "Grid Spacing") {
                                 $0.workspace.grid.spacing = min(max(value, 4), 2000)
                             }
-                        }), format: .number.precision(.fractionLength(0)))
-                    .frame(width: 70)
+                        }), width: 58)
                 }
-                Stepper("Subdivisions: \(document.model.workspace.grid.subdivisions)",
-                        value: Binding(
-                            get: { document.model.workspace.grid.subdivisions },
-                            set: { value in
-                                document.update(undoManager, actionName: "Grid Subdivisions") {
-                                    $0.workspace.grid.subdivisions = min(max(value, 1), 10)
-                                }
-                            }), in: 1...10)
+                LabeledContent("Subdivisions") {
+                    Stepper("\(document.model.workspace.grid.subdivisions)",
+                            value: Binding(
+                                get: { document.model.workspace.grid.subdivisions },
+                                set: { value in
+                                    document.update(undoManager, actionName: "Grid Subdivisions") {
+                                        $0.workspace.grid.subdivisions = min(max(value, 1), 10)
+                                    }
+                                }), in: 1...10)
+                }
                 Toggle("Snap to Grid", isOn: Binding(
                     get: { document.model.workspace.grid.snapsToGrid },
                     set: { value in
@@ -788,32 +875,38 @@ struct InspectorView: View {
         }
 
         if !document.model.workspace.guides.isEmpty {
-            Section("Guides") {
+            InspectorSection("Guides") {
                 ForEach(document.model.workspace.guides) { guide in
-                    HStack {
+                    HStack(spacing: 6) {
                         Image(systemName: guide.orientation == .vertical
                               ? "line.vertical" : "line.horizontal")
-                        TextField("Position", value: Binding(
+                            .foregroundStyle(Theme.textDim)
+                            .frame(width: 14)
+                        PanelNumberField(label: nil, value: Binding(
                             get: { document.model.workspace.guides.first(where: { $0.id == guide.id })?.position ?? guide.position },
                             set: { value in
                                 document.update(undoManager, actionName: "Move Guide") { model in
                                     guard let index = model.workspace.guides.firstIndex(where: { $0.id == guide.id }) else { return }
                                     model.workspace.guides[index].position = value
                                 }
-                            }), format: .number.precision(.fractionLength(0)))
+                            }), width: 70)
+                        Spacer()
                         Button {
                             document.update(undoManager, actionName: "Delete Guide") {
                                 $0.workspace.guides.removeAll { $0.id == guide.id }
                             }
                         } label: { Image(systemName: "trash") }
-                            .buttonStyle(.borderless)
+                            .buttonStyle(IconButtonStyle(size: 20))
                     }
                 }
-                Button("Clear Guides") {
+            } accessory: {
+                Button("Clear") {
                     document.update(undoManager, actionName: "Clear Guides") {
                         $0.workspace.guides.removeAll()
                     }
                 }
+                .buttonStyle(.borderless)
+                .font(.system(size: 10))
             }
         }
     }
@@ -843,5 +936,34 @@ struct InspectorView: View {
         draftWidth = width
         draftHeight = height
         document.setCanvasSize(CGSize(width: width, height: height), undoManager: undoManager)
+    }
+}
+
+extension PixelDocument.AlignEdge {
+    var symbolName: String {
+        switch self {
+        case .left: "align.horizontal.left"
+        case .centerH: "align.horizontal.center"
+        case .right: "align.horizontal.right"
+        case .top: "align.vertical.top"
+        case .centerV: "align.vertical.center"
+        case .bottom: "align.vertical.bottom"
+        }
+    }
+}
+
+extension LayerKind {
+    /// Short type label shown under layer names.
+    var kindName: String {
+        switch self {
+        case .pattern(let config): config.generator.displayName
+        case .image: "Image"
+        case .text: "Text"
+        case .fill(let config): config.style.displayName
+        case .shape(let config): config.kind.displayName
+        case .group(let config): "Group · \(config.children.count)"
+        case .adjustment: "Adjustment"
+        case .path: "Path"
+        }
     }
 }

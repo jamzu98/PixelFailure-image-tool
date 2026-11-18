@@ -1,7 +1,8 @@
+import AppKit
 import SwiftUI
 
-/// Left sidebar: layers listed top-of-stack first, with visibility toggles,
-/// inline rename, drag reorder, and add/remove controls.
+/// Layers panel: layers listed top-of-stack first, with visibility toggles,
+/// double-click rename, drag reorder, and add/remove controls.
 struct LayerListView: View {
     @ObservedObject var document: PixelDocument
     @Bindable var editorState: EditorState
@@ -30,102 +31,235 @@ struct LayerListView: View {
         return walk(document.model.layers, depth: 0)
     }
 
+    @State private var anchorID: UUID?
+    @State private var renamingID: UUID?
+    @State private var dropTargetID: UUID?
+
     var body: some View {
         VStack(spacing: 0) {
-            List(selection: multiSelectionBinding) {
-                ForEach(displayedRows) { entry in
-                    LayerRow(document: document,
-                             layer: entry.layer,
-                             depth: entry.depth,
-                             isExpanded: editorState.expandedGroups.contains(entry.layer.id),
-                             renderStore: renderStore,
-                             onToggleExpand: {
-                                 if editorState.expandedGroups.contains(entry.layer.id) {
-                                     editorState.expandedGroups.remove(entry.layer.id)
-                                 } else {
-                                     editorState.expandedGroups.insert(entry.layer.id)
-                                 }
-                             })
-                        .tag(entry.layer.id)
-                        .draggable(entry.layer.id.uuidString)
-                        .dropDestination(for: String.self) { identifiers, _ in
-                            guard let raw = identifiers.first,
-                                  let sourceID = UUID(uuidString: raw) else { return false }
-                            return dropLayer(sourceID, onto: entry.layer)
-                        }
-                        .contextMenu {
-                            rowContextMenu(entry.layer)
-                        }
+            PanelHeader(title: "Layers") { EmptyView() }
+            layerControls
+
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(displayedRows) { entry in
+                        row(entry)
+                    }
                 }
             }
-            .listStyle(.sidebar)
-
-            Divider()
-
-            // Canvas pseudo-row: selects "nothing", which shows the canvas
-            // settings (size, background) in the inspector.
-            Button {
-                editorState.selectedLayerID = nil
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "aspectratio")
-                        .foregroundStyle(.secondary)
-                        .frame(width: 16)
-                    Text("Canvas")
-                    Spacer()
-                    Text("\(Int(document.model.canvasSize.width)) × \(Int(document.model.canvasSize.height))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            .contextMenu {
+                Menu("New Layer") {
+                    AddLayerMenuItems(document: document, editorState: editorState)
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
-                .contentShape(Rectangle())
-                .background(editorState.selectedLayerID == nil ? Color.accentColor.opacity(0.22) : Color.clear,
-                            in: RoundedRectangle(cornerRadius: 6))
             }
-            .buttonStyle(.plain)
+
+            canvasRow
+            footer
+        }
+        .background(Theme.panel)
+        .panelStyle()
+    }
+
+    // MARK: - Blend / opacity
+
+    private var layerControls: some View {
+        let layer = document.model.layer(id: editorState.selectedLayerID)
+        return HStack(spacing: 8) {
+            Picker("Blend Mode", selection: Binding(
+                get: { layer?.blendMode ?? .normal },
+                set: { newValue in
+                    guard let id = layer?.id else { return }
+                    document.update(undoManager, actionName: "Blend Mode") { model in
+                        model.modifyLayer(id: id) { $0.blendMode = newValue }
+                    }
+                }
+            )) {
+                ForEach(LayerBlendMode.allCases, id: \.self) { mode in
+                    Text(mode.displayName).tag(mode)
+                }
+            }
+            .labelsHidden()
+            .frame(minWidth: 80, maxWidth: 110)
+
+            Spacer(minLength: 0)
+
+            Text("Opacity")
+                .foregroundStyle(Theme.textDim)
+                .fixedSize()
+            NumericSlider(value: Binding(
+                get: { layer.flatMap { document.model.layer(id: $0.id)?.opacity } ?? 1 },
+                set: { newValue in
+                    guard let id = layer?.id else { return }
+                    document.updateDuringGesture { model in
+                        model.modifyLayer(id: id) { $0.opacity = newValue }
+                    }
+                }
+            ), range: 0...1, defaultValue: 1, percent: true) { editing in
+                if editing { document.beginGesture() } else { document.endGesture(undoManager, actionName: "Opacity") }
+            }
+            .frame(width: 112)
+        }
+        .disabled(layer == nil)
+        .padding(.horizontal, 8)
+        .frame(height: 34)
+        .overlay(alignment: .bottom) { Rectangle().fill(Theme.separator).frame(height: 1) }
+    }
+
+    // MARK: - Rows
+
+    private func row(_ entry: RowEntry) -> some View {
+        let id = entry.layer.id
+        return LayerRow(document: document,
+                        layer: entry.layer,
+                        depth: entry.depth,
+                        isSelected: editorState.selectedLayerIDs.contains(id),
+                        isExpanded: editorState.expandedGroups.contains(id),
+                        isRenaming: Binding(get: { renamingID == id },
+                                            set: { renamingID = $0 ? id : nil }),
+                        isDropTarget: dropTargetID == id,
+                        renderStore: renderStore,
+                        onToggleExpand: {
+                            if editorState.expandedGroups.contains(id) {
+                                editorState.expandedGroups.remove(id)
+                            } else {
+                                editorState.expandedGroups.insert(id)
+                            }
+                        })
+            .onTapGesture {
+                // Second click of a double-click renames in place.
+                if (NSApp.currentEvent?.clickCount ?? 1) >= 2 {
+                    renamingID = id
+                } else {
+                    select(id)
+                }
+            }
+            .draggable(id.uuidString)
             .dropDestination(for: String.self) { identifiers, _ in
                 guard let raw = identifiers.first,
                       let sourceID = UUID(uuidString: raw) else { return false }
-                return document.moveLayer(id: sourceID, to: nil,
-                                          at: document.model.layers.count,
-                                          undoManager: undoManager)
+                return dropLayer(sourceID, onto: entry.layer)
+            } isTargeted: { targeted in
+                if targeted { dropTargetID = id } else if dropTargetID == id { dropTargetID = nil }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-            .help("Canvas settings (size, background color)")
-
-            Divider()
-
-            HStack(spacing: 8) {
-                Menu {
-                    AddLayerMenuItems(document: document, editorState: editorState)
-                } label: {
-                    Image(systemName: "plus")
-                }
-                .menuIndicator(.hidden)
-                .frame(width: 28)
-
-                Button {
-                    if let id = editorState.selectedLayerID {
-                        document.deleteLayer(id: id, undoManager: undoManager)
-                        editorState.selectedLayerID = nil
-                    }
-                } label: {
-                    Image(systemName: "minus")
-                }
-                .disabled(editorState.selectedLayerID == nil)
-
-                Spacer()
+            .contextMenu {
+                rowContextMenu(entry.layer)
             }
-            .buttonStyle(.borderless)
-            .padding(8)
-        }
     }
 
-    private var multiSelectionBinding: Binding<Set<UUID>> {
-        Binding(get: { editorState.selectedLayerIDs },
-                set: { editorState.selectedLayerIDs = $0 })
+    /// Click selects; ⌘-click toggles; ⇧-click extends from the last click.
+    private func select(_ id: UUID) {
+        let flags = NSEvent.modifierFlags
+        if flags.contains(.command) {
+            if editorState.selectedLayerIDs.contains(id) {
+                editorState.selectedLayerIDs.remove(id)
+            } else {
+                editorState.selectedLayerIDs.insert(id)
+            }
+        } else if flags.contains(.shift), let anchorID,
+                  let from = displayedRows.firstIndex(where: { $0.id == anchorID }),
+                  let to = displayedRows.firstIndex(where: { $0.id == id }) {
+            let range = min(from, to)...max(from, to)
+            editorState.selectedLayerIDs = Set(displayedRows[range].map(\.id))
+            return
+        } else {
+            editorState.selectedLayerIDs = [id]
+        }
+        anchorID = id
+    }
+
+    /// Selecting "Canvas" (no layer) shows document settings in Properties.
+    private var canvasRow: some View {
+        let isSelected = editorState.selectedLayerIDs.isEmpty
+        return HStack(spacing: 8) {
+            Color.clear.frame(width: 18)
+            RoundedRectangle(cornerRadius: 2)
+                .fill(document.model.background.color)
+                .overlay(RoundedRectangle(cornerRadius: 2).stroke(Theme.separator, lineWidth: 1))
+                .frame(width: 30, height: 30)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Canvas")
+                    .italic()
+                Text("\(Int(document.model.canvasSize.width)) × \(Int(document.model.canvasSize.height))")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.textDim)
+            }
+            Spacer()
+            Image(systemName: "lock.fill")
+                .font(.system(size: 9))
+                .foregroundStyle(Theme.textFaint)
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 42)
+        .background(isSelected ? Theme.rowSelected : Color.clear)
+        .contentShape(Rectangle())
+        .onTapGesture { editorState.selectedLayerID = nil }
+        .dropDestination(for: String.self) { identifiers, _ in
+            guard let raw = identifiers.first,
+                  let sourceID = UUID(uuidString: raw) else { return false }
+            return document.moveLayer(id: sourceID, to: nil,
+                                      at: document.model.layers.count,
+                                      undoManager: undoManager)
+        }
+        .overlay(alignment: .top) { Rectangle().fill(Theme.separator).frame(height: 1) }
+    }
+
+    // MARK: - Footer
+
+    private var footer: some View {
+        let selectedID = editorState.selectedLayerID
+        let selectedLayer = document.model.layer(id: selectedID)
+        return HStack(spacing: 2) {
+            Spacer()
+            Button {
+                if let id = selectedID {
+                    document.addMask(to: id, hideAll: false, renderStore: renderStore, undoManager: undoManager)
+                }
+            } label: { Image(systemName: "circle.lefthalf.filled") }
+                .disabled(selectedLayer == nil || selectedLayer?.mask != nil)
+                .help("Add Mask")
+
+            Button {
+                if let id = document.groupLayers(ids: editorState.selectedLayerIDs, undoManager: undoManager) {
+                    editorState.selectedLayerID = id
+                }
+            } label: { Image(systemName: "folder.badge.plus") }
+                .disabled(editorState.selectedLayerIDs.isEmpty)
+                .help("Group (⌘G)")
+
+            Menu {
+                AddLayerMenuItems(document: document, editorState: editorState)
+            } label: {
+                Image(systemName: "plus.square")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.icon)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .frame(width: 24, height: 24)
+            .help("New Layer")
+
+            Button {
+                if let id = selectedID, let newID = document.duplicateLayer(id: id, undoManager: undoManager) {
+                    editorState.selectedLayerID = newID
+                }
+            } label: { Image(systemName: "plus.square.on.square") }
+                .disabled(selectedID == nil)
+                .help("Duplicate (⌘J)")
+
+            Button {
+                if let id = selectedID {
+                    document.deleteLayer(id: id, undoManager: undoManager)
+                    editorState.selectedLayerID = nil
+                }
+            } label: { Image(systemName: "trash") }
+                .disabled(selectedID == nil)
+                .help("Delete Layer")
+        }
+        .buttonStyle(IconButtonStyle())
+        .padding(.horizontal, 6)
+        .frame(height: 30)
+        .background(Theme.header)
+        .hairline(.top)
     }
 
     @ViewBuilder
@@ -229,83 +363,177 @@ private struct LayerRow: View {
     @ObservedObject var document: PixelDocument
     let layer: Layer
     var depth: Int = 0
+    var isSelected: Bool
     var isExpanded: Bool = false
+    @Binding var isRenaming: Bool
+    var isDropTarget: Bool
     let renderStore: RenderStore
     var onToggleExpand: () -> Void = {}
     @Environment(\.undoManager) private var undoManager
     @State private var draftName: String = ""
+    @State private var isHovering = false
+    @FocusState private var nameFocused: Bool
 
     var body: some View {
         HStack(spacing: 6) {
-            if depth > 0 {
-                Spacer()
-                    .frame(width: CGFloat(depth) * 14)
-            }
-
-            if layer.kind.isGroup {
-                Button(action: onToggleExpand) {
-                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 10)
-                }
-                .buttonStyle(.borderless)
-            }
-
             Button {
                 document.update(undoManager, actionName: layer.isVisible ? "Hide Layer" : "Show Layer") { model in
                     model.modifyLayer(id: layer.id) { $0.isVisible.toggle() }
                 }
             } label: {
                 Image(systemName: layer.isVisible ? "eye" : "eye.slash")
-                    .foregroundStyle(layer.isVisible ? .primary : .tertiary)
+                    .font(.system(size: 10))
+                    .foregroundStyle(layer.isVisible ? Theme.icon : Theme.textFaint)
+                    .frame(width: 18, height: 30)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(.plain)
+            .help(layer.isVisible ? "Hide" : "Show")
 
-            // Content thumbnail with the kind icon as fallback.
-            Group {
-                if let thumbnail = renderStore.thumbnail(for: layer, model: document.model) {
-                    Image(decorative: thumbnail, scale: 1)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
+            if depth > 0 {
+                Color.clear.frame(width: CGFloat(depth) * 14)
+            }
+
+            if layer.kind.isGroup {
+                Button(action: onToggleExpand) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(Theme.textDim)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .frame(width: 12, height: 30)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+
+            thumbnail
+
+            VStack(alignment: .leading, spacing: 1) {
+                if isRenaming {
+                    TextField("Layer", text: $draftName)
+                        .textFieldStyle(.plain)
+                        .padding(.horizontal, 3)
+                        .background(Theme.field)
+                        .overlay(Rectangle().stroke(Theme.accent, lineWidth: 1))
+                        .focused($nameFocused)
+                        .onAppear {
+                            draftName = layer.name
+                            nameFocused = true
+                        }
+                        .onSubmit { commitRename() }
+                        .onChange(of: nameFocused) { _, focused in if !focused { commitRename() } }
+                        .onKeyPress(.escape) {
+                            isRenaming = false
+                            return .handled
+                        }
                 } else {
-                    Image(systemName: layer.kind.iconName)
-                        .foregroundStyle(.secondary)
+                    Text(layer.name)
+                        .lineLimit(1)
+                        .foregroundStyle(layer.isVisible ? Theme.text : Theme.textDim)
+                }
+                if layer.kind.kindName != layer.name {
+                    Text(layer.kind.kindName)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.textFaint)
+                        .lineLimit(1)
                 }
             }
-            .frame(width: 28, height: 28)
-            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 4))
-            .overlay(RoundedRectangle(cornerRadius: 4).stroke(.separator, lineWidth: 0.5))
 
-            TextField("Layer", text: $draftName)
-                .textFieldStyle(.plain)
-                .onSubmit {
-                    let name = draftName.trimmingCharacters(in: .whitespaces)
-                    guard !name.isEmpty, name != layer.name else { return }
-                    document.update(undoManager, actionName: "Rename Layer") { model in
-                        model.modifyLayer(id: layer.id) { $0.name = name }
-                    }
-                }
+            Spacer(minLength: 2)
 
+            if layer.clipsToBelow {
+                Image(systemName: "arrow.turn.left.down")
+                    .font(.system(size: 9))
+                    .foregroundStyle(Theme.textDim)
+                    .help("Clipped to layer below")
+            }
+            if !layer.styles.isEmpty {
+                Text("fx")
+                    .font(.system(size: 10, weight: .semibold).italic())
+                    .foregroundStyle(Theme.textDim)
+            }
             if layer.mask != nil {
                 Image(systemName: "circle.lefthalf.filled")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .help("Has a mask")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.textDim)
+                    .help("Has mask")
             }
-
-            Button {
-                document.toggleLock(id: layer.id, undoManager: undoManager)
-            } label: {
-                Image(systemName: layer.isLocked ? "lock.fill" : "lock.open")
-                    .font(.caption)
-                    .foregroundStyle(layer.isLocked ? .primary : .quaternary)
+            if layer.isLocked || isHovering {
+                Button {
+                    document.toggleLock(id: layer.id, undoManager: undoManager)
+                } label: {
+                    Image(systemName: layer.isLocked ? "lock.fill" : "lock.open")
+                        .font(.system(size: 9))
+                        .foregroundStyle(layer.isLocked ? Theme.textDim : Theme.textFaint)
+                        .frame(width: 16, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(layer.isLocked ? "Unlock" : "Lock")
             }
-            .buttonStyle(.borderless)
-            .help(layer.isLocked ? "Unlock layer" : "Lock layer")
         }
-        .opacity(layer.isVisible ? 1 : 0.55)
-        .onAppear { draftName = layer.name }
-        .onChange(of: layer.name) { _, newValue in draftName = newValue }
+        .padding(.leading, 4)
+        .padding(.trailing, 8)
+        .frame(height: 42)
+        .background(isSelected ? Theme.rowSelected : (isHovering ? Theme.hover.opacity(0.45) : Color.clear))
+        .overlay(alignment: .top) {
+            if isDropTarget { Rectangle().fill(Theme.accent).frame(height: 2) }
+        }
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Theme.header).frame(height: 1)
+        }
+        .contentShape(Rectangle())
+        .onHover { isHovering = $0 }
+    }
+
+    private var thumbnail: some View {
+        ZStack {
+            CheckerboardBackground()
+            if let image = renderStore.thumbnail(for: layer, model: document.model) {
+                Image(decorative: image, scale: 1)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+            } else {
+                Image(systemName: layer.kind.iconName)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.icon)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Theme.field)
+            }
+        }
+        .frame(width: 30, height: 30)
+        .clipShape(RoundedRectangle(cornerRadius: 2))
+        .overlay(RoundedRectangle(cornerRadius: 2)
+            .stroke(isSelected ? Theme.textDim : Theme.separator, lineWidth: 1))
+    }
+
+    private func commitRename() {
+        guard isRenaming else { return }
+        let name = draftName.trimmingCharacters(in: .whitespaces)
+        isRenaming = false
+        guard !name.isEmpty, name != layer.name else { return }
+        document.update(undoManager, actionName: "Rename Layer") { model in
+            model.modifyLayer(id: layer.id) { $0.name = name }
+        }
+    }
+}
+
+/// Transparency checkerboard used behind layer thumbnails.
+struct CheckerboardBackground: View {
+    var cell: CGFloat = 4
+
+    var body: some View {
+        Canvas { context, size in
+            context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(Color(white: 0.82)))
+            var dark = Path()
+            let columns = Int(ceil(size.width / cell)), rows = Int(ceil(size.height / cell))
+            for row in 0..<rows {
+                for column in 0..<columns where (row + column).isMultiple(of: 2) {
+                    dark.addRect(CGRect(x: CGFloat(column) * cell, y: CGFloat(row) * cell,
+                                        width: cell, height: cell))
+                }
+            }
+            context.fill(dark, with: .color(Color(white: 0.66)))
+        }
     }
 }

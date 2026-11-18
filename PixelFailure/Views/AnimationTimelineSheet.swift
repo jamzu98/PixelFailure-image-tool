@@ -27,10 +27,10 @@ struct AnimationTimelineDock: View {
     var body: some View {
         VStack(spacing: 10) {
             HStack {
-                Label("Generator Timeline", systemImage: "diamond.fill")
-                    .font(.headline)
+                Text("Timeline")
+                    .font(Theme.headerFont)
                 if let layer = document.model.layer(id: layerID) {
-                    Text(layer.name).foregroundStyle(.secondary)
+                    Text(layer.name).foregroundStyle(Theme.textDim)
                 }
                 Spacer()
                 Button("Reset") {
@@ -42,7 +42,7 @@ struct AnimationTimelineDock: View {
                                     isPresented: $showResetConfirmation) {
                     Button("Reset Timeline", role: .destructive) { resetTimeline() }
                 } message: {
-                    Text("This removes every keyframe for this layer. This can be undone.")
+                    Text("Removes all keyframes on this layer.")
                 }
                 Button {
                     editorState.isAnimationPlaying = false
@@ -51,8 +51,8 @@ struct AnimationTimelineDock: View {
                 } label: {
                     Image(systemName: "xmark")
                 }
-                .buttonStyle(.borderless)
-                .help("Close timeline")
+                .buttonStyle(IconButtonStyle(size: 20))
+                .help("Close Timeline")
             }
 
             HStack(spacing: 10) {
@@ -67,7 +67,7 @@ struct AnimationTimelineDock: View {
                 timelineTrack
 
                 Text(String(format: "%.2f s", editorState.animationPlayhead))
-                    .font(.caption.monospacedDigit())
+                    .font(.system(size: 11).monospacedDigit())
                     .frame(width: 62)
 
                 Button {
@@ -114,12 +114,12 @@ struct AnimationTimelineDock: View {
                 TextField("Width", value: $outputWidth, format: .number)
                     .frame(width: 76)
                     .textFieldStyle(.roundedBorder)
-                Text("px").font(.caption)
+                Text("px").foregroundStyle(Theme.textDim)
                 if let progress = exportProgress {
                     ProgressView(value: progress).frame(width: 90)
                     Button("Cancel") { exportTask?.cancel() }
                 } else {
-                    Button("Export Animation…") { exportAnimation() }
+                    Button("Export…") { exportAnimation() }
                         .disabled(keyframes.isEmpty)
                 }
             }
@@ -129,8 +129,9 @@ struct AnimationTimelineDock: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .padding(12)
-        .background(.bar)
+        .padding(10)
+        .background(Theme.chrome)
+        .panelStyle()
         .fixedSize(horizontal: false, vertical: true)
         .task(id: editorState.isAnimationPlaying) {
             guard editorState.isAnimationPlaying else { return }

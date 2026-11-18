@@ -7,8 +7,8 @@ struct FillInspector: View {
     @Environment(\.undoManager) private var undoManager
 
     var body: some View {
-        Section("Fill") {
-            Picker("Style", selection: Binding(
+        InspectorSection("Fill") {
+            PanelPicker("Style", selection: Binding(
                 get: { config.style },
                 set: { newValue in
                     modify("Fill Style") { $0.style = newValue }
@@ -39,7 +39,7 @@ struct FillInspector: View {
             // Color stops.
             ForEach(config.colors.indices, id: \.self) { i in
                 HStack {
-                    ColorPicker(config.style == .solid ? "Color" : "Stop \(i + 1)", selection: Binding(
+                    PanelColorPicker(config.style == .solid ? "Color" : "Stop \(i + 1)", selection: Binding(
                         get: { config.colors[i].color(in: document.model.colorSettings.workingSpace) },
                         set: { newValue in
                             modify("Fill Color") { fill in

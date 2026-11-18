@@ -45,78 +45,99 @@ struct AddLayerMenuItems: View {
     }
 }
 
-/// Vertical tool palette on the left edge of the viewport.
+/// Vertical tool column on the left edge of the viewport, grouped like
+/// Photoshop's: move, select, crop/sample, retouch, vector, navigate.
 struct ToolStrip: View {
-    @ObservedObject var document: PixelDocument
-    @Bindable var editorState: EditorState
-
-    var body: some View {
-        ScrollView(.vertical) {
-            VStack(spacing: 4) {
-                ForEach(EditorTool.allCases) { tool in
-                    Button {
-                        editorState.activeTool = tool
-                        if tool != .crop { editorState.cropDraft = nil }
-                    } label: {
-                        Image(systemName: tool.systemImage)
-                            .font(.system(size: 14))
-                            .frame(width: 30, height: 28)
-                            .background(editorState.activeTool == tool ? Color.accentColor.opacity(0.28) : Color.clear,
-                                        in: RoundedRectangle(cornerRadius: 6))
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("\(tool.displayName) (\(String(tool.shortcutKey).uppercased()))")
-                }
-
-                Divider()
-                    .frame(width: 24)
-                    .padding(.vertical, 2)
-
-                Menu {
-                    AddLayerMenuItems(document: document, editorState: editorState)
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 14))
-                        .frame(width: 30, height: 28)
-                        .contentShape(Rectangle())
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .frame(width: 30)
-                .help("Add layer")
-            }
-        }
-        .scrollIndicators(.hidden)
-        .padding(.vertical, 8)
-        .padding(.horizontal, 5)
-        .background(Color(nsColor: .windowBackgroundColor))
-    }
-}
-
-/// Contextual options for the active tool, shown along the viewport's top.
-struct ToolOptionsBar: View {
     @ObservedObject var document: PixelDocument
     @Bindable var editorState: EditorState
     @Environment(\.undoManager) private var undoManager
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(editorState.activeTool.displayName)
-                .font(.caption.weight(.semibold))
+    private static let groups: [[EditorTool]] = [
+        [.move],
+        [.marquee, .lasso, .wand],
+        [.crop, .eyedropper],
+        [.brush, .eraser, .clone, .heal, .smudge, .dodge, .burn],
+        [.pen, .node],
+        [.hand, .zoom],
+    ]
 
-            HStack(spacing: 14) {
-                switch editorState.activeTool {
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollView(.vertical) {
+                VStack(spacing: 2) {
+                    ForEach(Self.groups.indices, id: \.self) { index in
+                        if index > 0 {
+                            Rectangle()
+                                .fill(Theme.separator)
+                                .frame(width: 20, height: 1)
+                                .padding(.vertical, 4)
+                        }
+                        ForEach(Self.groups[index]) { tool in
+                            toolButton(tool)
+                        }
+                    }
+                }
+                .padding(.vertical, 8)
+            }
+            .scrollIndicators(.never)
+
+            // Foreground (brush) over background (canvas), Photoshop-style.
+            ZStack(alignment: .topLeading) {
+                SwatchWell(color: document.model.background.color(in: document.model.colorSettings.workingSpace),
+                           size: CGSize(width: 18, height: 18), help: "Canvas Background") { newValue in
+                    document.update(undoManager, actionName: "Background Color") { model in
+                        model.background = RGBAColor(colorValue: newValue, in: model.colorSettings.workingSpace)
+                    }
+                }
+                .offset(x: 9, y: 9)
+                SwatchWell(color: editorState.brush.color.color(in: document.model.colorSettings.workingSpace),
+                           size: CGSize(width: 18, height: 18), help: "Brush Color") { newValue in
+                    editorState.brush.color = RGBAColor(colorValue: newValue,
+                                                        in: document.model.colorSettings.workingSpace)
+                }
+            }
+            .frame(width: 27, height: 27, alignment: .topLeading)
+            .padding(.bottom, 12)
+        }
+        .frame(width: 40)
+        .background(Theme.chrome)
+        .hairline(.trailing)
+    }
+
+    private func toolButton(_ tool: EditorTool) -> some View {
+        Button {
+            editorState.activeTool = tool
+            if tool != .crop { editorState.cropDraft = nil }
+        } label: {
+            Image(systemName: tool.systemImage)
+                .font(.system(size: 13))
+        }
+        .buttonStyle(IconButtonStyle(size: 30, isActive: editorState.activeTool == tool))
+        .accessibilityLabel(tool.displayName)
+        .help("\(tool.displayName) (\(String(tool.shortcutKey).uppercased()))")
+    }
+}
+
+/// Contextual options for the active tool, in a slim bar across the top.
+struct ToolOptionsBar: View {
+    @ObservedObject var document: PixelDocument
+    @Bindable var editorState: EditorState
+    @Environment(\.undoManager) private var undoManager
+    @State private var showsDynamics = false
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: editorState.activeTool.systemImage)
+                .font(.system(size: 13))
+                .foregroundStyle(Theme.text)
+                .frame(width: 28, height: 24)
+                .background(Theme.toolActive, in: RoundedRectangle(cornerRadius: 4))
+                .help(editorState.activeTool.displayName)
+            BarDivider()
+
+            switch editorState.activeTool {
             case .brush, .eraser, .clone, .heal, .smudge, .dodge, .burn:
                 brushOptions
-            case .crop:
-                Text("Drag the crop rectangle, then Apply — or press Return. Esc cancels.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            case .zoom:
-                Text("Click to zoom in, ⌥-click to zoom out.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             case .eyedropper:
                 eyedropperOptions
             case .marquee:
@@ -124,13 +145,13 @@ struct ToolOptionsBar: View {
                     get: { editorState.marqueeEllipse },
                     set: { editorState.marqueeEllipse = $0 }
                 )) {
-                    Text("Rectangle").tag(false)
-                    Text("Ellipse").tag(true)
+                    Image(systemName: "rectangle.dashed").help("Rectangle").tag(false)
+                    Image(systemName: "circle.dashed").help("Ellipse").tag(true)
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 160)
+                .labelsHidden()
+                .fixedSize()
                 featherControl
-                selectionHint
             case .lasso:
                 Picker("", selection: Binding(
                     get: { editorState.lassoPolygonal },
@@ -140,67 +161,53 @@ struct ToolOptionsBar: View {
                     Text("Polygonal").tag(true)
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 160)
+                .labelsHidden()
+                .fixedSize()
                 featherControl
-                if editorState.lassoPolygonal {
-                    Text("Click to add points · Return or click the start to close · Esc cancels.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    selectionHint
-                }
             case .wand:
-                HStack(spacing: 4) {
-                    Text("Tolerance")
-                        .font(.caption)
+                option("Tolerance") {
                     NumericSlider(value: Binding(
                         get: { editorState.wandTolerance },
                         set: { editorState.wandTolerance = $0 }
-                    ), range: 0.02...0.9, defaultValue: 0.25)
-                    .frame(width: 110)
+                    ), range: 0.02...0.9, defaultValue: 0.25, percent: true)
+                    .frame(width: 150)
                 }
                 featherControl
-                selectionHint
-            case .move:
-                Text("Click to select · drag to move · handles scale and rotate · Esc deselects.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             case .hand:
-                Text("Drag to pan")
-                    .font(.caption).foregroundStyle(.secondary)
-                Text("Rotate")
-                    .font(.caption)
-                NumericSlider(value: Binding(
-                    get: { editorState.canvasRotationDegrees },
-                    set: { editorState.canvasRotationDegrees = $0 }),
-                    range: -180...180, defaultValue: 0, fractionDigits: 1)
-                    .frame(width: 130)
-                Button("Reset View") { editorState.canvasRotationDegrees = 0 }
-            case .pen:
-                Text("Click to create path nodes · Return to close the path.")
-                    .font(.caption).foregroundStyle(.secondary)
-            case .node:
-                Text("Drag anchors and control handles on the selected path.")
-                    .font(.caption).foregroundStyle(.secondary)
+                option("Rotate View") {
+                    NumericSlider(value: Binding(
+                        get: { editorState.canvasRotationDegrees },
+                        set: { editorState.canvasRotationDegrees = $0 }),
+                        range: -180...180, defaultValue: 0, fractionDigits: 0)
+                        .frame(width: 170)
+                }
+                Button("Reset") { editorState.canvasRotationDegrees = 0 }
+            case .move, .crop, .zoom, .pen, .node:
+                EmptyView()
             }
-                Spacer(minLength: 0)
-            }
+            Spacer(minLength: 0)
         }
-        .padding(.horizontal, 12)
-        // Fixed height: the bar's contents change per tool, but the bar
-        // itself never grows, shrinks, or disappears — no layout jumps.
-        .frame(height: 52)
+        .padding(.horizontal, 6)
+        // Fixed height: contents change per tool, the bar never jumps.
+        .frame(height: 36)
         .frame(maxWidth: .infinity)
-        .background(.bar)
+        .background(Theme.chrome)
+        .hairline(.bottom)
+        .panelStyle()
         .clipped()
+    }
+
+    private func option<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
+        HStack(spacing: 6) {
+            Text(label).foregroundStyle(Theme.textDim)
+            content()
+        }
     }
 
     /// Feather applies to the current selection immediately and becomes the
     /// default for the next one.
     private var featherControl: some View {
-        HStack(spacing: 4) {
-            Text("Feather")
-                .font(.caption)
+        option("Feather") {
             NumericSlider(value: Binding(
                 get: { editorState.selection?.feather ?? editorState.featherDefault },
                 set: { newValue in
@@ -208,24 +215,15 @@ struct ToolOptionsBar: View {
                     editorState.selection?.feather = newValue
                 }
             ), range: 0...80, defaultValue: 0, fractionDigits: 0)
-            .frame(width: 100)
-            Text("\(Int((editorState.selection?.feather ?? editorState.featherDefault).rounded()))")
-                .font(.caption.monospacedDigit())
-                .frame(width: 24, alignment: .leading)
+            .frame(width: 150)
         }
-    }
-
-    private var selectionHint: some View {
-        Text("⇧ adds · ⌥ subtracts · Esc deselects.")
-            .font(.caption)
-            .foregroundStyle(.secondary)
+        .help("⇧ adds · ⌥ subtracts")
     }
 
     @ViewBuilder
     private var eyedropperOptions: some View {
-        Text("Click to pick a color — into text color, background, or the targeted swatch:")
-            .font(.caption)
-            .foregroundStyle(.secondary)
+        Text("Sample to")
+            .foregroundStyle(Theme.textDim)
 
         // Which swatch the next pick replaces; advances automatically.
         HStack(spacing: 5) {
@@ -237,8 +235,8 @@ struct ToolOptionsBar: View {
                 } label: {
                     Circle()
                         .fill(swatch.color)
-                        .stroke(isTarget ? Color.accentColor : .secondary.opacity(0.4),
-                                lineWidth: isTarget ? 2.5 : 1)
+                        .stroke(isTarget ? Theme.accent : Theme.fieldBorder,
+                                lineWidth: isTarget ? 2 : 1)
                         .frame(width: 16, height: 16)
                 }
                 .buttonStyle(.plain)
@@ -251,7 +249,7 @@ struct ToolOptionsBar: View {
     private var brushOptions: some View {
         let brush = editorState.brush
 
-        Picker("Preset", selection: Binding(
+        Picker("", selection: Binding(
             get: { brush.selectedPresetID },
             set: { id in
                 if let preset = brush.presets.first(where: { $0.id == id }) {
@@ -260,18 +258,23 @@ struct ToolOptionsBar: View {
             })) {
             ForEach(brush.presets) { preset in Text(preset.name).tag(preset.id) }
         }
-        .frame(width: 130)
+        .labelsHidden()
+        .frame(width: 120)
 
         Menu {
             Button("Import Presets…") { importBrushPresets(into: brush) }
             Button("Export Custom Presets…") { exportBrushPresets(brush.customPresets) }
                 .disabled(brush.customPresets.isEmpty)
-        } label: { Image(systemName: "paintbrush.pointed") }
+        } label: { Image(systemName: "ellipsis.circle") }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Brush Presets")
 
         if editorState.editingMaskLayerID != nil {
-            Label("Editing Mask", systemImage: "circle.lefthalf.filled")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(Color.accentColor)
+            Label("Mask", systemImage: "circle.lefthalf.filled")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Theme.accent)
 
             Picker("", selection: Binding(
                 get: { editorState.maskBrushReveals },
@@ -281,7 +284,8 @@ struct ToolOptionsBar: View {
                 Text("Reveal").tag(true)
             }
             .pickerStyle(.segmented)
-            .frame(width: 140)
+            .labelsHidden()
+            .fixedSize()
 
             Button("Done") {
                 editorState.editingMaskLayerID = nil
@@ -289,86 +293,77 @@ struct ToolOptionsBar: View {
             }
         }
 
-        HStack(spacing: 4) {
-            Text("Size")
-                .font(.caption)
+        option("Size") {
             NumericSlider(value: Binding(get: { brush.size }, set: { brush.size = $0 }),
                           range: 4...600, defaultValue: 120, fractionDigits: 0)
-                .frame(width: 120)
-            Text("\(Int(brush.size))")
-                .font(.caption.monospacedDigit())
-                .frame(width: 30, alignment: .leading)
+                .frame(width: 150)
         }
-        Menu("Dynamics") {
-            LabeledContent("Spacing") {
-                NumericSlider(value: Binding(get: { brush.spacing }, set: { brush.spacing = $0 }),
-                              range: 0.03...1, defaultValue: 0.15)
-                    .frame(width: 130)
+        option("Hardness") {
+            NumericSlider(value: Binding(get: { brush.hardness }, set: { brush.hardness = $0 }),
+                          range: 0...1, defaultValue: 0.6, percent: true)
+                .frame(width: 130)
+        }
+        option("Opacity") {
+            NumericSlider(value: Binding(get: { brush.opacity }, set: { brush.opacity = $0 }),
+                          range: 0.05...1, defaultValue: 1, percent: true)
+                .frame(width: 130)
+        }
+        Button {
+            showsDynamics.toggle()
+        } label: {
+            Image(systemName: "slider.horizontal.3")
+        }
+        .buttonStyle(IconButtonStyle(size: 24, isActive: showsDynamics))
+        .help("Brush Dynamics")
+        .popover(isPresented: $showsDynamics, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 6) {
+                LabeledContent("Spacing") {
+                    NumericSlider(value: Binding(get: { brush.spacing }, set: { brush.spacing = $0 }),
+                                  range: 0.03...1, defaultValue: 0.15)
+                }
+                LabeledContent("Smoothing") {
+                    NumericSlider(value: Binding(get: { brush.smoothing }, set: { brush.smoothing = $0 }),
+                                  range: 0...0.95, defaultValue: 0.25)
+                }
+                LabeledContent("Scatter") {
+                    NumericSlider(value: Binding(get: { brush.scatter }, set: { brush.scatter = $0 }),
+                                  range: 0...2, defaultValue: 0)
+                }
+                LabeledContent("Size Jitter") {
+                    NumericSlider(value: Binding(get: { brush.sizeJitter }, set: { brush.sizeJitter = $0 }),
+                                  range: 0...1, defaultValue: 0)
+                }
+                LabeledContent("Opacity Jitter") {
+                    NumericSlider(value: Binding(get: { brush.opacityJitter }, set: { brush.opacityJitter = $0 }),
+                                  range: 0...1, defaultValue: 0)
+                }
+                LabeledContent("Angle Jitter") {
+                    NumericSlider(value: Binding(get: { brush.angleJitter }, set: { brush.angleJitter = $0 }),
+                                  range: 0...1, defaultValue: 0)
+                }
+                LabeledContent("Tip Aspect") {
+                    NumericSlider(value: Binding(get: { brush.tipAspect }, set: { brush.tipAspect = $0 }),
+                                  range: 0.1...1, defaultValue: 1)
+                }
+                LabeledContent("Grain") {
+                    NumericSlider(value: Binding(get: { brush.grain }, set: { brush.grain = $0 }),
+                                  range: 0...1, defaultValue: 0)
+                }
+                Toggle("Pressure → Size", isOn: Binding(get: { brush.pressureControlsSize },
+                                                         set: { brush.pressureControlsSize = $0 }))
+                Toggle("Pressure → Opacity", isOn: Binding(get: { brush.pressureControlsOpacity },
+                                                            set: { brush.pressureControlsOpacity = $0 }))
             }
-            LabeledContent("Smoothing") {
-                NumericSlider(value: Binding(get: { brush.smoothing }, set: { brush.smoothing = $0 }),
-                              range: 0...0.95, defaultValue: 0.25)
-                    .frame(width: 130)
-            }
-            LabeledContent("Scatter") {
-                NumericSlider(value: Binding(get: { brush.scatter }, set: { brush.scatter = $0 }),
-                              range: 0...2, defaultValue: 0)
-                    .frame(width: 130)
-            }
-            LabeledContent("Size Jitter") {
-                NumericSlider(value: Binding(get: { brush.sizeJitter }, set: { brush.sizeJitter = $0 }),
-                              range: 0...1, defaultValue: 0)
-                    .frame(width: 130)
-            }
-            LabeledContent("Opacity Jitter") {
-                NumericSlider(value: Binding(get: { brush.opacityJitter }, set: { brush.opacityJitter = $0 }),
-                              range: 0...1, defaultValue: 0)
-                    .frame(width: 130)
-            }
-            LabeledContent("Angle Jitter") {
-                NumericSlider(value: Binding(get: { brush.angleJitter }, set: { brush.angleJitter = $0 }),
-                              range: 0...1, defaultValue: 0).frame(width: 130)
-            }
-            LabeledContent("Tip Aspect") {
-                NumericSlider(value: Binding(get: { brush.tipAspect }, set: { brush.tipAspect = $0 }),
-                              range: 0.1...1, defaultValue: 1).frame(width: 130)
-            }
-            LabeledContent("Grain") {
-                NumericSlider(value: Binding(get: { brush.grain }, set: { brush.grain = $0 }),
-                              range: 0...1, defaultValue: 0).frame(width: 130)
-            }
-            Toggle("Pressure → Size", isOn: Binding(get: { brush.pressureControlsSize },
-                                                     set: { brush.pressureControlsSize = $0 }))
-            Toggle("Pressure → Opacity", isOn: Binding(get: { brush.pressureControlsOpacity },
-                                                        set: { brush.pressureControlsOpacity = $0 }))
+            .padding(12)
+            .frame(width: 300)
+            .panelStyle()
         }
         if editorState.activeTool == .clone || editorState.activeTool == .heal {
-            Text(editorState.cloneSourceCanvas == nil
-                 ? "⌥-click to set source" : "Source set · ⌥-click to replace")
-                .font(.caption).foregroundStyle(editorState.cloneSourceCanvas == nil ? .orange : .secondary)
-        }
-        HStack(spacing: 4) {
-            Text("Hardness")
-                .font(.caption)
-            NumericSlider(value: Binding(get: { brush.hardness }, set: { brush.hardness = $0 }),
-                          range: 0...1, defaultValue: 0.6)
-                .frame(width: 90)
-        }
-        HStack(spacing: 4) {
-            Text("Opacity")
-                .font(.caption)
-            NumericSlider(value: Binding(get: { brush.opacity }, set: { brush.opacity = $0 }),
-                          range: 0.05...1, defaultValue: 1)
-                .frame(width: 90)
+            Text(editorState.cloneSourceCanvas == nil ? "⌥-click to set source" : "Source set")
+                .foregroundStyle(editorState.cloneSourceCanvas == nil ? Theme.warning : Theme.textDim)
         }
         if editorState.activeTool == .brush && editorState.editingMaskLayerID == nil {
-            ColorPicker("", selection: Binding(
-                get: { brush.color.color(in: document.model.colorSettings.workingSpace) },
-                set: { brush.color = RGBAColor(colorValue: $0, in: document.model.colorSettings.workingSpace) }
-            ))
-            .labelsHidden()
-            .frame(width: 30)
-
+            BarDivider()
             // Quick palette swatches for the brush. Enumerated snapshot, not
             // live indices — see PalettePanel for the crash this avoids.
             HStack(spacing: 4) {
@@ -376,10 +371,10 @@ struct ToolOptionsBar: View {
                     Button {
                         brush.color = swatch
                     } label: {
-                        Circle()
+                        RoundedRectangle(cornerRadius: 2)
                             .fill(swatch.color)
-                            .stroke(.secondary.opacity(0.4), lineWidth: 1)
-                            .frame(width: 13, height: 13)
+                            .stroke(Theme.fieldBorder, lineWidth: 1)
+                            .frame(width: 16, height: 16)
                     }
                     .buttonStyle(.plain)
                 }

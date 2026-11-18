@@ -21,6 +21,10 @@ struct NumericSlider<Value>: View where Value: BinaryFloatingPoint, Value.Stride
     let defaultValue: Value
     var step: Value.Stride?
     var fractionDigits = 2
+    /// Shows an editable value box to the right of the track.
+    var showsValue = true
+    /// Displays and accepts the value as a percentage of 1.
+    var percent = false
     var onEditingChanged: (Bool) -> Void = { _ in }
 
     @State private var showsValueEditor = false
@@ -28,6 +32,16 @@ struct NumericSlider<Value>: View where Value: BinaryFloatingPoint, Value.Stride
     @FocusState private var valueEditorFocused: Bool
 
     var body: some View {
+        HStack(spacing: 6) {
+            slider
+            if showsValue {
+                SliderValueField(value: Double(value), fractionDigits: fractionDigits,
+                                 percent: percent) { commit(Value($0)) }
+            }
+        }
+    }
+
+    private var slider: some View {
         NumericSliderBridge(
             value: Binding(get: { Double(value) }, set: { value = Value($0) }),
             range: Double(range.lowerBound)...Double(range.upperBound),
@@ -38,7 +52,7 @@ struct NumericSlider<Value>: View where Value: BinaryFloatingPoint, Value.Stride
                 value = Value(originalValue)
                 openValueEditor(value: originalValue)
             })
-            .help("⌘-click to reset · double-click to enter a value")
+            .help("⌘-click to reset")
             .popover(isPresented: $showsValueEditor, arrowEdge: .bottom) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Value")
@@ -80,6 +94,50 @@ struct NumericSlider<Value>: View where Value: BinaryFloatingPoint, Value.Stride
         onEditingChanged(true)
         value = Value(normalized)
         onEditingChanged(false)
+    }
+}
+
+/// The editable number box beside a slider. Commits on Return or when focus
+/// leaves; mirrors the slider while not being edited.
+private struct SliderValueField: View {
+    let value: Double
+    let fractionDigits: Int
+    let percent: Bool
+    let commit: (Double) -> Void
+    @State private var text = ""
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        TextField("", text: $text)
+            .textFieldStyle(.plain)
+            .font(.system(size: 10.5).monospacedDigit())
+            .multilineTextAlignment(.trailing)
+            .padding(.horizontal, 4)
+            .frame(width: 44, height: 18)
+            .background(Theme.field, in: RoundedRectangle(cornerRadius: 3))
+            .overlay(RoundedRectangle(cornerRadius: 3)
+                .stroke(isFocused ? Theme.accent : Theme.fieldBorder, lineWidth: 1))
+            .focused($isFocused)
+            .onSubmit { apply() }
+            .onChange(of: isFocused) { _, focused in if !focused { apply() } }
+            .onAppear { sync() }
+            .onChange(of: value) { _, _ in if !isFocused { sync() } }
+    }
+
+    private func sync() {
+        text = percent
+            ? "\(Int((value * 100).rounded()))%"
+            : String(format: "%.*f", fractionDigits, value)
+    }
+
+    private func apply() {
+        let cleaned = text.replacingOccurrences(of: "%", with: "")
+            .replacingOccurrences(of: ",", with: ".")
+            .trimmingCharacters(in: .whitespaces)
+        guard let number = Double(cleaned), number.isFinite else { sync(); return }
+        let proposed = percent ? number / 100 : number
+        if abs(proposed - value) > 1e-9 { commit(proposed) }
+        sync()
     }
 }
 
@@ -180,7 +238,7 @@ struct ParamControls: View {
     private func control(for spec: ParamSpec) -> some View {
         switch spec.kind {
         case .slider(let min, let max):
-            LabeledContent("\(spec.label): \(formattedValue(spec))") {
+            LabeledContent(spec.label) {
                 NumericSlider(value: gestureBinding(spec), range: min...max,
                               defaultValue: spec.defaultValue, fractionDigits: 2) { editing in
                     if editing {
@@ -192,7 +250,7 @@ struct ParamControls: View {
             }
 
         case .intSlider(let min, let max):
-            LabeledContent("\(spec.label): \(values.int(spec.key, Int(spec.defaultValue)))") {
+            LabeledContent(spec.label) {
                 NumericSlider(value: gestureBinding(spec, rounded: true),
                               range: Double(min)...Double(max),
                               defaultValue: spec.defaultValue, step: 1,
@@ -216,7 +274,7 @@ struct ParamControls: View {
             ))
 
         case .choice(let options):
-            Picker(spec.label, selection: Binding(
+            PanelPicker(spec.label, selection: Binding(
                 get: { Swift.min(values.int(spec.key, Int(spec.defaultValue)), options.count - 1) },
                 set: { newValue in
                     document.update(undoManager, actionName: spec.label) { model in
@@ -229,11 +287,6 @@ struct ParamControls: View {
                 }
             }
         }
-    }
-
-    private func formattedValue(_ spec: ParamSpec) -> String {
-        let value = values.double(spec.key, spec.defaultValue)
-        return value.formatted(.number.precision(.fractionLength(0...2)))
     }
 
     private func gestureBinding(_ spec: ParamSpec, rounded: Bool = false) -> Binding<Double> {
