@@ -29,6 +29,11 @@ struct PixelFailureApp: App {
             SelectCommands()
         }
 
+        Settings {
+            SettingsView()
+        }
+        .windowResizability(.contentSize)
+
         Window("Home", id: HomeModel.windowID) {
             HomeView()
         }
@@ -41,10 +46,65 @@ struct PixelFailureApp: App {
     }
 }
 
+/// A menu item bound to a rebindable command.
+struct ActionButton: View {
+    let action: ShortcutAction
+    let focus: EditorFocus?
+    var title: String?
+
+    init(_ action: ShortcutAction, _ focus: EditorFocus?, title: String? = nil) {
+        self.action = action
+        self.focus = focus
+        self.title = title
+    }
+
+    var body: some View {
+        Button(title ?? action.title) {
+            if let focus { EditorActions.perform(action, focus) }
+        }
+        .keyboardShortcut(ShortcutStore.shared.menuShortcut(action))
+        .disabled(!EditorActions.canPerform(action, focus))
+    }
+}
+
+/// A checkable menu item bound to a rebindable toggle command.
+struct ActionToggle: View {
+    let action: ShortcutAction
+    let focus: EditorFocus?
+    let isOn: Bool
+
+    init(_ action: ShortcutAction, _ focus: EditorFocus?, isOn: Bool) {
+        self.action = action
+        self.focus = focus
+        self.isOn = isOn
+    }
+
+    var body: some View {
+        Toggle(action.title, isOn: Binding(
+            get: { isOn },
+            set: { _ in if let focus { EditorActions.perform(action, focus) } }
+        ))
+        .keyboardShortcut(ShortcutStore.shared.menuShortcut(action))
+        .disabled(focus == nil)
+    }
+}
+
+/// App-level menu item (works with no document open).
+private struct AppActionButton: View {
+    let action: ShortcutAction
+    let perform: () -> Void
+
+    var body: some View {
+        Button(action.title, action: perform)
+            .keyboardShortcut(ShortcutStore.shared.menuShortcut(action))
+    }
+}
+
 struct FileCommands: Commands {
     @Environment(\.openWindow) private var openWindow
     @Environment(\.newDocument) private var newDocument
     @Environment(\.openDocument) private var openDocument
+    @FocusedValue(\.editorFocus) private var focus
 
     private var launcher: DocumentLauncher {
         DocumentLauncher(newDocument: newDocument, openDocument: openDocument)
@@ -52,22 +112,22 @@ struct FileCommands: Commands {
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
-            Button("New…") { HomeModel.shared.show(.new, using: openWindow) }
-                .keyboardShortcut("n", modifiers: .command)
-            Button("New Blank Canvas") {
+            AppActionButton(action: .newDocument) { HomeModel.shared.show(.new, using: openWindow) }
+            AppActionButton(action: .newBlankCanvas) {
                 var settings = NewDocumentStore.shared.lastUsed
                 settings.name = "Untitled"
                 settings.starterGenerator = nil
                 launcher.create(settings)
             }
-            .keyboardShortcut("n", modifiers: [.command, .option])
-            Button("Home") { HomeModel.shared.show(.home, using: openWindow) }
+            AppActionButton(action: .showHome) { HomeModel.shared.show(.home, using: openWindow) }
         }
         // SwiftUI keeps its own Open… / Open Recent for projects; images
         // open as a new canvas of their own size, as in Photoshop.
         CommandGroup(after: .newItem) {
-            Button("Open Image as Canvas…") { launcher.presentOpenPanel() }
-                .keyboardShortcut("o", modifiers: [.command, .option])
+            AppActionButton(action: .openImageAsCanvas) { launcher.presentOpenPanel() }
+        }
+        CommandGroup(after: .saveItem) {
+            ActionButton(.export, focus)
         }
     }
 }
@@ -76,17 +136,24 @@ struct ViewCommands: Commands {
     @FocusedValue(\.editorFocus) private var focus
 
     var body: some Commands {
-        CommandGroup(after: .sidebar) {
-            Toggle("Show Navigator", isOn: Binding(
-                get: { focus?.document.model.workspace.showsNavigator ?? false },
-                set: { value in
-                    guard let focus else { return }
-                    focus.document.update(focus.undoManager, actionName: "Toggle Navigator") {
-                        $0.workspace.showsNavigator = value
-                    }
-                }
-            ))
-            .disabled(focus == nil)
+        CommandGroup(before: .toolbar) {
+            ActionButton(.zoomIn, focus)
+            ActionButton(.zoomOut, focus)
+            ActionButton(.fitOnScreen, focus)
+            ActionButton(.actualPixels, focus)
+            ActionButton(.resetViewRotation, focus)
+            Divider()
+            let workspace = focus?.document.model.workspace
+            ActionToggle(.toggleRulers, focus, isOn: workspace?.showsRulers ?? false)
+            ActionToggle(.toggleGrid, focus, isOn: workspace?.grid.isVisible ?? false)
+            ActionToggle(.toggleGuides, focus, isOn: focus?.editorState.showsGuides ?? true)
+            ActionToggle(.toggleSmartGuides, focus, isOn: workspace?.smartGuidesEnabled ?? false)
+            ActionToggle(.toggleSnap, focus, isOn: workspace?.grid.snapsToGrid ?? false)
+            ActionButton(.clearGuides, focus)
+            Divider()
+            ActionToggle(.toggleNavigator, focus, isOn: workspace?.showsNavigator ?? false)
+            ActionToggle(.togglePanels, focus, isOn: !(focus?.editorState.panelsHidden ?? false))
+            Divider()
         }
     }
 }
@@ -96,11 +163,11 @@ struct EditorCommands: Commands {
 
     var body: some Commands {
         CommandGroup(after: .pasteboard) {
-            Button("Deselect Layers") {
-                focus?.editorState.selectedLayerID = nil
-            }
-            .keyboardShortcut("a", modifiers: [.command, .shift])
-            .disabled(focus?.editorState.selectedLayerID == nil)
+            Divider()
+            ActionButton(.fillForeground, focus)
+            ActionButton(.fillBackground, focus)
+            ActionButton(.freeTransform, focus)
+            ActionButton(.deselectLayers, focus)
         }
     }
 }
@@ -119,33 +186,15 @@ struct SelectCommands: Commands {
 
     var body: some Commands {
         CommandMenu("Select") {
-            Button("Select All") {
-                guard let focus else { return }
-                focus.editorState.selection = .all(canvasSize: focus.document.model.canvasSize)
-            }
-            .keyboardShortcut("a", modifiers: .command)
-            .disabled(focus == nil)
-
-            Button("Deselect") {
-                focus?.editorState.selection = nil
-            }
-            .keyboardShortcut("d", modifiers: .command)
-            .disabled(!hasSelection)
-
-            Button("Invert Selection") {
-                guard let focus, let selection = focus.editorState.selection else { return }
-                focus.editorState.selection = selection.inverted(canvasSize: focus.document.model.canvasSize)
-            }
-            .keyboardShortcut("i", modifiers: [.command, .shift])
-            .disabled(!hasSelection)
+            ActionButton(.selectAll, focus)
+            ActionButton(.deselect, focus)
+            ActionButton(.reselect, focus)
+            ActionButton(.invertSelection, focus)
+            ActionButton(.selectAllLayers, focus)
 
             Divider()
 
-            Button("Subject") {
-                guard let focus else { return }
-                focus.editorState.vision.selectSubject(inverted: false, focus: focus)
-            }
-            .disabled(focus == nil)
+            ActionButton(.selectSubject, focus, title: "Subject")
             Button("Background") {
                 guard let focus else { return }
                 focus.editorState.vision.selectSubject(inverted: true, focus: focus)
@@ -224,15 +273,7 @@ struct SelectCommands: Commands {
             }
             .disabled(!hasSelection || focus?.editorState.selectedLayerID == nil)
 
-            Button("Fill Selection with Brush Color") {
-                guard let focus, let selection = focus.editorState.selection,
-                      let layer = selectedImageLayer else { return }
-                focus.document.fillPixels(selection: selection, layerID: layer.id,
-                                          color: focus.editorState.brush.color,
-                                          renderStore: focus.renderStore,
-                                          undoManager: focus.undoManager)
-            }
-            .disabled(!hasSelection || selectedImageLayer == nil)
+            ActionButton(.fillForeground, focus, title: "Fill Selection with Foreground Color")
 
             Button("Delete Selected Pixels") {
                 guard let focus, let selection = focus.editorState.selection,
@@ -300,28 +341,30 @@ struct LayerCommands: Commands {
                 }
             }
             .disabled(focus == nil)
+            ActionButton(.newLayer, focus, title: "New Paint Layer")
+            ActionButton(.duplicateLayer, focus)
 
             Divider()
 
-            Button("Group Layers") {
-                guard let focus, !focus.editorState.selectedLayerIDs.isEmpty else { return }
-                if let id = focus.document.groupLayers(ids: focus.editorState.selectedLayerIDs,
-                                                       undoManager: focus.undoManager) {
-                    focus.editorState.selectedLayerID = id
-                }
-            }
-            .keyboardShortcut("g", modifiers: .command)
-            .disabled(focus?.editorState.selectedLayerIDs.isEmpty ?? true)
+            ActionButton(.reroll, focus)
+            ActionButton(.randomize, focus)
 
-            Button("Ungroup") {
-                guard let focus, let id = focus.editorState.selectedLayerID else { return }
-                focus.document.ungroup(id: id, undoManager: focus.undoManager)
-                focus.editorState.selectedLayerIDs = []
+            Divider()
+
+            ActionButton(.groupLayers, focus)
+            ActionButton(.ungroup, focus)
+            ActionButton(.clippingMask, focus)
+
+            Menu("Arrange") {
+                ActionButton(.bringToFront, focus)
+                ActionButton(.bringForward, focus)
+                ActionButton(.sendBackward, focus)
+                ActionButton(.sendToBack, focus)
+                Divider()
+                ActionButton(.selectLayerAbove, focus)
+                ActionButton(.selectLayerBelow, focus)
             }
-            .keyboardShortcut("g", modifiers: [.command, .shift])
-            .disabled(focus?.editorState.selectedLayerID.flatMap {
-                focus?.document.model.layer(id: $0)?.kind.isGroup
-            } != true)
+            .disabled(focus == nil)
 
             Menu("Align") {
                 ForEach(PixelDocument.AlignEdge.allCases, id: \.self) { edge in
@@ -351,18 +394,7 @@ struct LayerCommands: Commands {
 
             Divider()
 
-            Button("Duplicate Layer") {
-                guard let focus, let id = focus.editorState.selectedLayerID else { return }
-                focus.editorState.selectedLayerID = focus.document.duplicateLayer(id: id, undoManager: focus.undoManager)
-            }
-            .keyboardShortcut("j", modifiers: .command)
-            .disabled(focus?.editorState.selectedLayerID == nil)
-
-            Button("Rasterize Layer") {
-                guard let focus, let id = focus.editorState.selectedLayerID else { return }
-                focus.document.rasterizeLayer(id: id, renderStore: focus.renderStore, undoManager: focus.undoManager)
-            }
-            .disabled(focus?.editorState.selectedLayerID == nil)
+            ActionButton(.rasterize, focus)
 
             Button("Super Resolution 2×") {
                 guard let focus, let id = focus.editorState.selectedLayerID else { return }
@@ -373,25 +405,10 @@ struct LayerCommands: Commands {
                 focus?.document.model.layer(id: $0)?.kind.isImage
             } != true)
 
-            Button("Flip Horizontal") {
-                guard let focus, let id = focus.editorState.selectedLayerID else { return }
-                focus.document.flipLayer(id: id, horizontally: true, undoManager: focus.undoManager)
-            }
-            .keyboardShortcut("h", modifiers: [.command, .shift])
-            .disabled(focus?.editorState.selectedLayerID == nil)
-
-            Button("Flip Vertical") {
-                guard let focus, let id = focus.editorState.selectedLayerID else { return }
-                focus.document.flipLayer(id: id, horizontally: false, undoManager: focus.undoManager)
-            }
-            .disabled(focus?.editorState.selectedLayerID == nil)
-
-            Button("Lock/Unlock Layer") {
-                guard let focus, let id = focus.editorState.selectedLayerID else { return }
-                focus.document.toggleLock(id: id, undoManager: focus.undoManager)
-            }
-            .keyboardShortcut("l", modifiers: [.command, .shift])
-            .disabled(focus?.editorState.selectedLayerID == nil)
+            ActionButton(.flipHorizontal, focus)
+            ActionButton(.flipVertical, focus)
+            ActionButton(.lockLayer, focus)
+            ActionButton(.toggleVisibility, focus)
 
             Menu("Add Mask") {
                 Button("Reveal All") {
@@ -409,12 +426,7 @@ struct LayerCommands: Commands {
 
             Divider()
 
-            Button("Delete Layer") {
-                guard let focus, let id = focus.editorState.selectedLayerID else { return }
-                focus.document.deleteLayer(id: id, undoManager: focus.undoManager)
-                focus.editorState.selectedLayerID = nil
-            }
-            .disabled(focus?.editorState.selectedLayerID == nil)
+            ActionButton(.deleteLayer, focus)
         }
     }
 }

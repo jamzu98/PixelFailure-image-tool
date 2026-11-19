@@ -81,22 +81,41 @@ struct ToolStrip: View {
             }
             .scrollIndicators(.never)
 
-            // Foreground (brush) over background (canvas), Photoshop-style.
+            // Foreground over background, Photoshop-style (D resets, X swaps).
+            let space = document.model.colorSettings.workingSpace
+            let shortcuts = ShortcutStore.shared
             ZStack(alignment: .topLeading) {
-                SwatchWell(color: document.model.background.color(in: document.model.colorSettings.workingSpace),
-                           size: CGSize(width: 18, height: 18), help: "Canvas Background") { newValue in
-                    document.update(undoManager, actionName: "Background Color") { model in
-                        model.background = RGBAColor(colorValue: newValue, in: model.colorSettings.workingSpace)
+                SwatchWell(color: editorState.brush.secondaryColor.color(in: space),
+                           size: CGSize(width: 18, height: 18),
+                           help: "Background Color") { newValue in
+                    editorState.brush.secondaryColor = RGBAColor(colorValue: newValue, in: space)
+                }
+                .offset(x: 10, y: 10)
+                SwatchWell(color: editorState.brush.color.color(in: space),
+                           size: CGSize(width: 18, height: 18),
+                           help: "Foreground Color") { newValue in
+                    editorState.brush.color = RGBAColor(colorValue: newValue, in: space)
+                }
+                Button { editorState.brush.swapColors() } label: {
+                    Image(systemName: "arrow.left.arrow.right").font(.system(size: 7, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Theme.textDim)
+                .frame(width: 9, height: 9)
+                .offset(x: 19, y: 0)
+                .help("Swap Colors" + shortcuts.hint(.swapColors))
+                Button { editorState.brush.resetColors() } label: {
+                    ZStack(alignment: .topLeading) {
+                        Rectangle().fill(.white).frame(width: 5, height: 5).offset(x: 2, y: 2)
+                        Rectangle().fill(.black).stroke(Theme.textDim, lineWidth: 0.5).frame(width: 5, height: 5)
                     }
+                    .frame(width: 9, height: 9, alignment: .topLeading)
                 }
-                .offset(x: 9, y: 9)
-                SwatchWell(color: editorState.brush.color.color(in: document.model.colorSettings.workingSpace),
-                           size: CGSize(width: 18, height: 18), help: "Brush Color") { newValue in
-                    editorState.brush.color = RGBAColor(colorValue: newValue,
-                                                        in: document.model.colorSettings.workingSpace)
-                }
+                .buttonStyle(.plain)
+                .offset(x: 0, y: 20)
+                .help("Default Colors" + shortcuts.hint(.defaultColors))
             }
-            .frame(width: 27, height: 27, alignment: .topLeading)
+            .frame(width: 28, height: 28, alignment: .topLeading)
             .padding(.bottom, 12)
         }
         .frame(width: 40)
@@ -106,15 +125,14 @@ struct ToolStrip: View {
 
     private func toolButton(_ tool: EditorTool) -> some View {
         Button {
-            editorState.activeTool = tool
-            if tool != .crop { editorState.cropDraft = nil }
+            EditorActions.select(tool, editorState)
         } label: {
             Image(systemName: tool.systemImage)
                 .font(.system(size: 13))
         }
         .buttonStyle(IconButtonStyle(size: 30, isActive: editorState.activeTool == tool))
         .accessibilityLabel(tool.displayName)
-        .help("\(tool.displayName) (\(String(tool.shortcutKey).uppercased()))")
+        .help(tool.displayName + ShortcutStore.shared.hint(.forTool(tool)))
     }
 }
 

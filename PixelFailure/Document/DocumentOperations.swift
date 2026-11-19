@@ -43,6 +43,10 @@ extension PixelDocument {
     func addPatternLayer(_ type: GeneratorType, undoManager: UndoManager?) -> UUID {
         let generator = type.generator
         var config = PatternConfig(generator: type, params: ParamValues(defaults: generator.specs))
+        if Preferences.shared.newPatternParameters == .randomized {
+            config.params = ParamValues.randomized(specs: generator.specs, seed: config.seed,
+                                                   keeping: config.params)
+        }
         if generator.needsSourceImage {
             config.sourceImageLayerID = model.layers.last(where: { $0.kind.isImage })?.id
         }
@@ -796,8 +800,10 @@ extension PixelDocument {
 
     /// Reroll a pattern layer's seed; optionally randomize its parameters too.
     @MainActor
-    func reroll(layerID: UUID, randomizeParams: Bool, undoManager: UndoManager?) {
+    func reroll(layerID: UUID, randomizeParams: Bool, newPalette: Palette? = nil,
+                undoManager: UndoManager?) {
         update(undoManager, actionName: randomizeParams ? "Randomize" : "Reroll Seed") { model in
+            if let newPalette { model.palette = newPalette }
             model.modifyLayer(id: layerID) { layer in
                 layer.modifyPattern { config in
                     let seed = SeededRNG.randomSeed()

@@ -12,7 +12,8 @@ struct SelectionAntsView: View {
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 15.0,
-                                paused: editorState.selection == nil
+                                paused: !Preferences.shared.animatesSelectionEdges
+                                    || editorState.selection == nil
                                     && editorState.selectionDraft == nil
                                     && editorState.lassoVertices == nil)) { context in
             let phase = CGFloat(context.date.timeIntervalSinceReferenceDate

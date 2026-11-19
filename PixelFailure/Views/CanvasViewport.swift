@@ -57,6 +57,7 @@ struct CanvasViewport: View {
     @State private var surfaceTask: Task<Void, Never>?
     @State private var snapContext: SnapContext?
     @FocusState private var isFocused: Bool
+    private var prefs: Preferences { .shared }
 
     private struct InteractionStart {
         let affine: CGAffineTransform
@@ -144,7 +145,7 @@ struct CanvasViewport: View {
     var body: some View {
         VStack(spacing: 0) {
             viewport
-            statusBar
+            if prefs.showsStatusBar { statusBar }
         }
     }
 
@@ -161,7 +162,7 @@ struct CanvasViewport: View {
             } ?? paintInvalidation
 
             ZStack {
-                Theme.canvas
+                prefs.canvasSurroundColor
 
                 PointerEventBridge(onPointer: { sample in
                     editorState.pointerSample = sample
@@ -285,6 +286,10 @@ struct CanvasViewport: View {
                 nudgeSelection(press)
             }
             .onKeyPress(.delete) {
+                // ⌥⌫ / ⌘⌫ are fills (keyboard router); only a bare ⌫ deletes.
+                guard NSEvent.modifierFlags.intersection([.command, .option, .control]).isEmpty else {
+                    return .ignored
+                }
                 // With a selection over an image layer, delete clears pixels;
                 // otherwise it deletes the layer (move tool only).
                 if let selection = editorState.selection,
@@ -347,9 +352,6 @@ struct CanvasViewport: View {
                 applyCrop()
                 return .handled
             }
-            .onKeyPress(phases: .down) { press in
-                toolShortcut(press)
-            }
             .onTapGesture(count: 1) { location in
                 isFocused = true
                 handleTap(at: location, viewSize: viewSize, scale: scale, canvasTransform: canvasTransform)
@@ -360,7 +362,7 @@ struct CanvasViewport: View {
                     hoverLocation = location
                     isHoveringViewport = true
                     setCursor(cursor(at: location, canvasTransform: canvasTransform, scale: scale))
-                    if editorState.activeTool == .objectSelect, dragMode == nil {
+                    if editorState.activeTool == .objectSelect, dragMode == nil, prefs.smartSelectHoverPreview {
                         editorState.vision.hover(at: location.applying(canvasTransform.inverted()),
                                                  focus: visionFocus)
                     }
@@ -375,15 +377,16 @@ struct CanvasViewport: View {
                     editorState.vision.commit(editorState)
                     editorState.vision.clearHover()
                 }
-                if new == .objectSelect { editorState.vision.prefetch(focus: visionFocus) }
+                if new == .objectSelect, prefs.smartSelectPrefetch { editorState.vision.prefetch(focus: visionFocus) }
                 // Tool switched by shortcut while hovering: update immediately
                 // instead of waiting for the next mouse move.
                 setCursor(cursor(at: hoverLocation, canvasTransform: canvasTransform, scale: scale))
                 scheduleInteractionPreparation()
             }
-            .onModifierKeysChanged(mask: .option) { _, _ in
+            .onModifierKeysChanged(mask: [.option, .capsLock]) { _, _ in
                 // Modifier presses don't produce hover events; refresh so the
-                // zoom cursor flips between +/- the moment option changes.
+                // zoom cursor flips between +/- (and ⇪ toggles the precise
+                // brush cursor) the moment the modifier changes.
                 guard isHoveringViewport else { return }
                 setCursor(cursor(at: hoverLocation, canvasTransform: canvasTransform, scale: scale))
             }
@@ -415,6 +418,15 @@ struct CanvasViewport: View {
             } action: { newSize in
                 viewportSize = newSize
             }
+            .onChange(of: editorState.viewportCommand) { _, command in
+                guard let command else { return }
+                performViewportCommand(command.kind)
+                editorState.viewportCommand = nil
+            }
+            .onChange(of: editorState.brush.size) { _, _ in
+                guard isHoveringViewport else { return }
+                setCursor(cursor(at: hoverLocation, canvasTransform: canvasTransform, scale: scale))
+            }
         }
         .clipped()
         .onChange(of: document.isContinuousEditing) { _, _ in updateViewportQuality() }
@@ -432,7 +444,9 @@ struct CanvasViewport: View {
         .onChange(of: document.model) { _, _ in
             scheduleInteractionPreparation()
             editorState.vision.documentChanged()
-            if editorState.activeTool == .objectSelect { editorState.vision.prefetch(focus: visionFocus) }
+            if editorState.activeTool == .objectSelect, prefs.smartSelectPrefetch {
+                editorState.vision.prefetch(focus: visionFocus)
+            }
         }
         .onChange(of: pan) { _, _ in scheduleInteractionPreparation() }
         .onChange(of: zoomLevel) { _, _ in scheduleInteractionPreparation() }
@@ -894,7 +908,9 @@ struct CanvasViewport: View {
     /// ownership of the higher-level tool gestures.
     private func handlePreciseScroll(dx: CGFloat, dy: CGFloat, location: CGPoint,
                                      modifiers: NSEvent.ModifierFlags) {
-        if modifiers.contains(.option) || modifiers.contains(.command) {
+        // With "Zoom with Scroll Wheel", plain scrolling zooms and ⌥/⌘ pans.
+        let zoomModifier = modifiers.contains(.option) || modifiers.contains(.command)
+        if zoomModifier != prefs.zoomWithScrollWheel {
             let currentScale = effectiveZoom(viewSize: viewportSize)
             let factor = 1 + dy * 0.01
             let newScale = min(max(currentScale * factor, 0.02), 12)
@@ -1102,7 +1118,7 @@ struct CanvasViewport: View {
                                                   y: entry.start.position.y + local.dy)
                         if entries.count == 1, let snapContext {
                             newPosition = snapped(newPosition, context: snapContext,
-                                                  tolerance: 8 / scale)
+                                                  tolerance: prefs.snapDistance / scale)
                         }
                         var transform = entry.start
                         transform.position = newPosition
@@ -1270,7 +1286,12 @@ struct CanvasViewport: View {
         case .node:
             return .arrow
         case .brush, .eraser, .clone, .heal, .smudge, .dodge, .burn:
-            return Cursors.brush(diameter: editorState.brush.size * scale)
+            // Caps Lock switches to the precise cursor, as in Photoshop.
+            if prefs.brushCursor == .precise || NSEvent.modifierFlags.contains(.capsLock) {
+                return .crosshair
+            }
+            return Cursors.brush(diameter: editorState.brush.size * scale,
+                                 crosshair: prefs.brushCursor == .tipCrosshair)
         case .crop:
             return cropCursor(at: location, canvasTransform: canvasTransform)
         case .move:
@@ -1339,6 +1360,10 @@ struct CanvasViewport: View {
         case .zoom:
             let zoomOut = NSEvent.modifierFlags.contains(.option)
             let newScale = min(max(zoomOut ? scale / 1.5 : scale * 1.5, 0.02), 12)
+            guard prefs.zoomToClickedPoint else {
+                zoom(to: newScale, from: scale)
+                return
+            }
             // Keep the clicked canvas point stationary under the cursor.
             let canvas = document.model.canvasSize
             pan = CGSize(width: (location.x - canvasPoint.x * newScale) - (viewSize.width - canvas.width * newScale) / 2,
@@ -1371,14 +1396,34 @@ struct CanvasViewport: View {
         }
     }
 
-    private func toolShortcut(_ press: KeyPress) -> KeyPress.Result {
-        guard press.modifiers.isEmpty else { return .ignored }
-        for tool in EditorTool.allCases where String(tool.shortcutKey) == press.characters.lowercased() {
-            editorState.activeTool = tool
-            if tool != .crop { editorState.cropDraft = nil }
-            return .handled
+    // MARK: - View commands
+
+    /// Photoshop's preset zoom stops, clamped to the viewport's 2%–1200%.
+    private static let zoomStops: [CGFloat] = [
+        0.02, 0.03, 0.04, 0.05, 0.0625, 0.0833, 0.125, 0.1667, 0.25, 0.3333, 0.5, 0.6667,
+        1, 1.5, 2, 3, 4, 5, 6, 7, 8, 10, 12,
+    ]
+
+    private func performViewportCommand(_ kind: ViewportCommand.Kind) {
+        let scale = effectiveZoom(viewSize: viewportSize)
+        switch kind {
+        case .zoomIn:
+            zoom(to: Self.zoomStops.first { $0 > scale * 1.001 } ?? 12, from: scale)
+        case .zoomOut:
+            zoom(to: Self.zoomStops.last { $0 < scale / 1.001 } ?? 0.02, from: scale)
+        case .fit:
+            zoomLevel = nil
+            pan = .zero
+        case .actualPixels:
+            zoom(to: 1, from: scale)
         }
-        return .ignored
+    }
+
+    /// Zooms about the viewport center.
+    private func zoom(to newScale: CGFloat, from scale: CGFloat) {
+        let ratio = newScale / max(scale, 0.0001)
+        pan = CGSize(width: pan.width * ratio, height: pan.height * ratio)
+        zoomLevel = newScale
     }
 
     // MARK: - Painting
@@ -2122,9 +2167,7 @@ struct CanvasViewport: View {
     private func nudgeSelection(_ press: KeyPress) -> KeyPress.Result {
         let entries = moveEntries(for: topmostSelectedIDs)
         guard !entries.isEmpty else { return .ignored }
-        let step: CGFloat = press.modifiers.contains(.shift)
-            ? document.model.canvasSize.width * 0.01
-            : document.model.canvasSize.width * 0.001
+        let step = CGFloat(press.modifiers.contains(.shift) ? prefs.shiftNudgeDistance : prefs.nudgeDistance)
         var dx: CGFloat = 0, dy: CGFloat = 0
         switch press.key {
         case .leftArrow: dx = -step
@@ -2153,27 +2196,26 @@ struct CanvasViewport: View {
         return HStack(spacing: 10) {
             HStack(spacing: 0) {
                 Button {
-                    zoomLevel = max(scale / 1.4, 0.02)
+                    performViewportCommand(.zoomOut)
                 } label: { Image(systemName: "minus") }
-                    .help("Zoom Out")
+                    .help("Zoom Out" + ShortcutStore.shared.hint(.zoomOut))
                 Text("\(Int((scale * 100).rounded()))%")
                     .font(.system(size: 10.5).monospacedDigit())
                     .foregroundStyle(Theme.text)
                     .frame(width: 42)
                 Button {
-                    zoomLevel = min(scale * 1.4, 12)
+                    performViewportCommand(.zoomIn)
                 } label: { Image(systemName: "plus") }
-                    .help("Zoom In")
+                    .help("Zoom In" + ShortcutStore.shared.hint(.zoomIn))
                 Button {
-                    zoomLevel = nil
-                    pan = .zero
+                    performViewportCommand(.fit)
                 } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
-                    .help("Fit on Screen")
+                    .help("Fit on Screen" + ShortcutStore.shared.hint(.fitOnScreen))
                 Button {
                     zoomLevel = 1
                     pan = .zero
                 } label: { Text("1:1").font(.system(size: 9.5, weight: .medium)) }
-                    .help("Actual Pixels")
+                    .help("Actual Pixels" + ShortcutStore.shared.hint(.actualPixels))
             }
             .buttonStyle(IconButtonStyle(size: 20))
 
@@ -2424,10 +2466,13 @@ private struct WorkspaceOverlay: View {
     let canvasTransform: CGAffineTransform
     let scale: CGFloat
     @Environment(\.undoManager) private var undoManager
+    private var prefs: Preferences { .shared }
+    /// Pixel grid appears from 600% zoom.
+    private static let pixelGridScale: CGFloat = 6
 
     var body: some View {
         ZStack(alignment: .topLeading) {
-            Canvas { context, _ in
+            Canvas { context, size in
                 let canvas = document.model.canvasSize
                 let rect = CGRect(origin: .zero, size: canvas).applying(canvasTransform)
                 if document.model.workspace.grid.isVisible {
@@ -2450,12 +2495,40 @@ private struct WorkspaceOverlay: View {
                             minor.addLine(to: CGPoint(x: rect.maxX, y: sy))
                             y += step; count += 1
                         }
-                        context.stroke(minor, with: .color(.primary.opacity(0.13)), lineWidth: 0.5)
+                        context.stroke(minor, with: .color(prefs.gridColor), lineWidth: 0.5)
+                    }
+                }
+
+                // Pixel grid at high zoom, over the visible part of the canvas.
+                if prefs.showsPixelGrid, scale >= Self.pixelGridScale {
+                    let inverse = canvasTransform.inverted()
+                    let viewCorners = [CGPoint.zero, CGPoint(x: size.width, y: 0),
+                                       CGPoint(x: 0, y: size.height), CGPoint(x: size.width, y: size.height)]
+                        .map { $0.applying(inverse) }
+                    let minX = max(0, floor(viewCorners.map(\.x).min() ?? 0))
+                    let maxX = min(canvas.width, ceil(viewCorners.map(\.x).max() ?? 0))
+                    let minY = max(0, floor(viewCorners.map(\.y).min() ?? 0))
+                    let maxY = min(canvas.height, ceil(viewCorners.map(\.y).max() ?? 0))
+                    if maxX > minX, maxY > minY, (maxX - minX) + (maxY - minY) < 2400 {
+                        var pixels = Path()
+                        var x = minX
+                        while x <= maxX {
+                            pixels.move(to: CGPoint(x: x, y: minY).applying(canvasTransform))
+                            pixels.addLine(to: CGPoint(x: x, y: maxY).applying(canvasTransform))
+                            x += 1
+                        }
+                        var y = minY
+                        while y <= maxY {
+                            pixels.move(to: CGPoint(x: minX, y: y).applying(canvasTransform))
+                            pixels.addLine(to: CGPoint(x: maxX, y: y).applying(canvasTransform))
+                            y += 1
+                        }
+                        context.stroke(pixels, with: .color(.gray.opacity(0.35)), lineWidth: 0.5)
                     }
                 }
 
                 var guidePath = Path()
-                for guide in document.model.workspace.guides {
+                for guide in document.model.workspace.guides where editorState.showsGuides {
                     if guide.orientation == .vertical {
                         let x = CGPoint(x: guide.position, y: 0).applying(canvasTransform).x
                         guidePath.move(to: CGPoint(x: x, y: rect.minY))
@@ -2466,7 +2539,7 @@ private struct WorkspaceOverlay: View {
                         guidePath.addLine(to: CGPoint(x: rect.maxX, y: y))
                     }
                 }
-                context.stroke(guidePath, with: .color(.blue.opacity(0.8)), lineWidth: 1)
+                context.stroke(guidePath, with: .color(prefs.guideColor), lineWidth: 1)
 
                 var smart = Path()
                 if let x = editorState.smartGuideX {
@@ -2479,7 +2552,7 @@ private struct WorkspaceOverlay: View {
                     smart.move(to: CGPoint(x: rect.minX, y: sy))
                     smart.addLine(to: CGPoint(x: rect.maxX, y: sy))
                 }
-                context.stroke(smart, with: .color(Theme.smartGuide),
+                context.stroke(smart, with: .color(prefs.smartGuideColor),
                                style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
             }
             .allowsHitTesting(false)

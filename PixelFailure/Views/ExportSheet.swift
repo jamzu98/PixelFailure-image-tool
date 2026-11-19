@@ -24,7 +24,7 @@ struct ExportSheet: View {
     let renderStore: RenderStore
     @Environment(\.dismiss) private var dismiss
 
-    private enum Format: String, CaseIterable {
+    enum Format: String, CaseIterable {
         case png = "PNG", jpeg = "JPEG", tiff = "TIFF", heic = "HEIC", webp = "WebP"
         case pdf = "PDF", svg = "SVG", psd = "PSD"
 
@@ -50,8 +50,9 @@ struct ExportSheet: View {
         var fileExtension: String { raster?.fileExtension ?? (self == .pdf ? "pdf" : self == .psd ? "psd" : "svg") }
     }
 
-    @State private var format: Format = .png
-    @State private var quality = 0.9
+    @State private var format: Format = Format(rawValue: Preferences.shared.defaultExportFormat)
+        .flatMap { $0.isAvailable ? $0 : nil } ?? .png
+    @State private var quality = Preferences.shared.defaultExportQuality
     @State private var presetIndex = 0
     @State private var customWidth = 3000
     @State private var customHeight = 3000
@@ -164,6 +165,9 @@ struct ExportSheet: View {
         panel.allowedContentTypes = [format.utType]
         panel.nameFieldStringValue = "Artwork.\(ext)"
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        if Preferences.shared.rememberExportFormat {
+            Preferences.shared.defaultExportFormat = format.rawValue
+        }
 
         isExporting = true
         errorMessage = nil

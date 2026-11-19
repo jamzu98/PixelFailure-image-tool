@@ -54,26 +54,10 @@ enum EditorTool: String, CaseIterable, Identifiable {
         }
     }
 
-    var shortcutKey: Character {
+    var isPaintTool: Bool {
         switch self {
-        case .move: "v"
-        case .marquee: "m"
-        case .lasso: "l"
-        case .wand: "w"
-        case .objectSelect: "q"
-        case .hand: "h"
-        case .zoom: "z"
-        case .eyedropper: "i"
-        case .brush: "b"
-        case .eraser: "e"
-        case .crop: "c"
-        case .clone: "s"
-        case .heal: "j"
-        case .smudge: "r"
-        case .dodge: "o"
-        case .burn: "u"
-        case .pen: "p"
-        case .node: "a"
+        case .brush, .eraser, .clone, .heal, .smudge, .dodge, .burn: true
+        default: false
         }
     }
 
@@ -135,7 +119,10 @@ final class BrushSettings {
     /// 0 = soft falloff, 1 = hard edge.
     var hardness: Double = 0.6
     var opacity: Double = 1.0
-    var color = RGBAColor(hex: "#EFE8D8")
+    /// Foreground color (what the brush paints).
+    var color = Preferences.shared.defaultForeground
+    /// Background color: X swaps it with the foreground, ⌘⌫ fills with it.
+    var secondaryColor = Preferences.shared.defaultBackground
     var spacing = 0.15
     var smoothing = 0.25
     var scatter = 0.0
@@ -149,6 +136,29 @@ final class BrushSettings {
     var selectedPresetID = "soft"
     var customPresets: [BrushPreset] = []
     var presets: [BrushPreset] { BrushPreset.builtIns + customPresets }
+
+    func swapColors() {
+        swap(&color, &secondaryColor)
+    }
+
+    func resetColors() {
+        color = Preferences.shared.defaultForeground
+        secondaryColor = Preferences.shared.defaultBackground
+    }
+
+    /// Photoshop-like [ ] steps: finer for small brushes.
+    func stepSize(larger: Bool) {
+        let step: Double = switch size {
+        case ..<10: 1
+        case ..<50: 5
+        case ..<100: 10
+        case ..<300: 25
+        default: 50
+        }
+        let next = larger ? (size + step) : (size - step)
+        // Land on the step grid so repeated presses stay round.
+        size = min(max((next / step).rounded() * step, 4), 600)
+    }
 
     func apply(_ preset: BrushPreset) {
         selectedPresetID = preset.id
@@ -182,6 +192,12 @@ final class EditorState {
     var expandedGroups: Set<UUID> = []
 
     var showExportSheet = false
+    /// Tab hides the tool strip, options bar, and dock (Photoshop-style).
+    var panelsHidden = false
+    /// Session-only guide visibility (guides themselves live in the document).
+    var showsGuides = true
+    /// Asks the canvas (which owns zoom and pan) to change the view.
+    var viewportCommand: ViewportCommand?
     var showImageImporter = false
 
     /// Non-persisted animation authoring state for this editor window.
@@ -215,7 +231,11 @@ final class EditorState {
 
     /// The active selection (canvas space). Session state, like in most
     /// editors — not part of the document.
-    var selection: CanvasSelection?
+    var selection: CanvasSelection? {
+        didSet { if let oldValue, selection == nil { lastSelection = oldValue } }
+    }
+    /// The selection before the last deselect, for Reselect (⇧⌘D).
+    var lastSelection: CanvasSelection?
     /// Live preview path while a marquee/lasso gesture is in flight.
     var selectionDraft: Path?
     /// Vertices collected by the polygonal lasso (nil = not building one).
@@ -225,15 +245,21 @@ final class EditorState {
     /// Lasso mode: false = freehand, true = polygonal (click to add points).
     var lassoPolygonal = false
     /// Magic wand color tolerance (0...1).
-    var wandTolerance = 0.25
+    var wandTolerance = Preferences.shared.defaultWandTolerance
     /// Feather (canvas px) applied to newly created selections.
-    var featherDefault = 0.0
+    var featherDefault = Preferences.shared.defaultFeather
     /// Vision-backed smart selection (Select Subject, Object Select tool).
     let vision = VisionSelectionController()
 
     /// Transient smart-guide feedback while moving a layer.
     var smartGuideX: Double?
     var smartGuideY: Double?
+}
+
+struct ViewportCommand: Equatable {
+    enum Kind { case zoomIn, zoomOut, fit, actualPixels }
+    let kind: Kind
+    let id = UUID()
 }
 
 /// Lets app-level menu commands reach the focused window's editor context.

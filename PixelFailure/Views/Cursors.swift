@@ -9,13 +9,14 @@ enum Cursors {
 
     private static var brushCache: [Int: NSCursor] = [:]
 
-    static func brush(diameter: Double) -> NSCursor {
+    static func brush(diameter: Double, crosshair: Bool = false) -> NSCursor {
         let clamped = min(max(diameter, 8), 300)
         // Bucket to 2px steps so zoom/size tweaks reuse cached cursors.
-        let key = Int((clamped / 2).rounded()) * 2
+        let bucket = Int((clamped / 2).rounded()) * 2
+        let key = crosshair ? -bucket : bucket
         if let cached = brushCache[key] { return cached }
 
-        let size = CGFloat(key) + 4
+        let size = CGFloat(bucket) + 4
         let image = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
             // Black-on-white double ring stays visible on any artwork.
             let outer = NSBezierPath(ovalIn: rect.insetBy(dx: 1.5, dy: 1.5))
@@ -26,10 +27,25 @@ enum Cursors {
             inner.lineWidth = 1
             NSColor.black.withAlphaComponent(0.85).setStroke()
             inner.stroke()
-            // Center dot for aim.
-            let dot = NSBezierPath(ovalIn: NSRect(x: rect.midX - 1, y: rect.midY - 1, width: 2, height: 2))
-            NSColor.black.withAlphaComponent(0.8).setFill()
-            dot.fill()
+            if crosshair {
+                let arm: CGFloat = 5
+                let cross = NSBezierPath()
+                cross.move(to: NSPoint(x: rect.midX - arm, y: rect.midY))
+                cross.line(to: NSPoint(x: rect.midX + arm, y: rect.midY))
+                cross.move(to: NSPoint(x: rect.midX, y: rect.midY - arm))
+                cross.line(to: NSPoint(x: rect.midX, y: rect.midY + arm))
+                cross.lineWidth = 2.5
+                NSColor.white.withAlphaComponent(0.85).setStroke()
+                cross.stroke()
+                cross.lineWidth = 1
+                NSColor.black.withAlphaComponent(0.9).setStroke()
+                cross.stroke()
+            } else {
+                // Center dot for aim.
+                let dot = NSBezierPath(ovalIn: NSRect(x: rect.midX - 1, y: rect.midY - 1, width: 2, height: 2))
+                NSColor.black.withAlphaComponent(0.8).setFill()
+                dot.fill()
+            }
             return true
         }
         let cursor = NSCursor(image: image, hotSpot: NSPoint(x: size / 2, y: size / 2))

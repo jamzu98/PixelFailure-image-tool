@@ -12,6 +12,9 @@ struct EditorView: View {
     @State private var recoveryID = UUID()
     @State private var recoveryTask: Task<Void, Never>?
     @State private var pendingRecoveryURL: URL?
+    @State private var keyboard = EditorKeyboardRouter()
+    private var prefs: Preferences { .shared }
+    private var shortcuts: ShortcutStore { .shared }
 
     init(document: PixelDocument) {
         self.document = document
@@ -22,11 +25,15 @@ struct EditorView: View {
         VStack(spacing: 0) {
             // Always present at a fixed height so switching tools never
             // shifts the canvas.
-            ToolOptionsBar(document: document, editorState: editorState, renderStore: renderStore)
+            if !editorState.panelsHidden {
+                ToolOptionsBar(document: document, editorState: editorState, renderStore: renderStore)
+            }
 
             HSplitView {
                 HStack(spacing: 0) {
-                    ToolStrip(document: document, editorState: editorState)
+                    if !editorState.panelsHidden {
+                        ToolStrip(document: document, editorState: editorState)
+                    }
                     VStack(spacing: 0) {
                         CanvasViewport(document: document, editorState: editorState, renderStore: renderStore,
                                        animationTime: editorState.animationLayerID == nil
@@ -41,6 +48,7 @@ struct EditorView: View {
                 .frame(minWidth: 460, maxWidth: .infinity, maxHeight: .infinity)
                 .layoutPriority(1)
 
+                if !editorState.panelsHidden {
                 GeometryReader { dock in
                     VSplitView {
                         InspectorView(document: document, editorState: editorState, renderStore: renderStore)
@@ -56,14 +64,13 @@ struct EditorView: View {
                 }
                 .frame(minWidth: 280, idealWidth: 310, maxWidth: 420)
                 .background(Theme.panel)
+                }
             }
         }
         .background(Theme.chrome)
         .frame(minWidth: 1120, minHeight: 640)
-        .focusedSceneValue(\.editorFocus, EditorFocus(document: document,
-                                                      editorState: editorState,
-                                                      renderStore: renderStore,
-                                                      undoManager: undoManager))
+        .focusedSceneValue(\.editorFocus, focus)
+        .background(WindowReader { keyboard.window = $0 })
         .toolbar { toolbarContent }
         // Paint the title bar as one solid strip; otherwise each split pane's
         // background (layers, canvas, inspector) bleeds up into it as sections.
@@ -105,23 +112,39 @@ struct EditorView: View {
         .onChange(of: document.model) { oldModel, newModel in
             renderStore.modelDidChange(from: oldModel, to: newModel)
             recoveryTask?.cancel()
+            guard prefs.autoRecoveryEnabled else { return }
+            let delay = prefs.autoRecoveryDelay
             recoveryTask = Task { @MainActor in
-                try? await Task.sleep(for: .seconds(2))
+                try? await Task.sleep(for: .seconds(delay))
                 guard !Task.isCancelled else { return }
                 _ = try? RecoveryStore.save(document, identifier: recoveryID)
             }
         }
+        .onChange(of: prefs.historyStates) { _, levels in undoManager?.levelsOfUndo = levels }
+        .onChange(of: undoManager) { _, _ in
+            keyboard.focus = focus
+            undoManager?.levelsOfUndo = prefs.historyStates
+        }
         .onAppear {
+            keyboard.focus = focus
+            keyboard.install()
+            undoManager?.levelsOfUndo = prefs.historyStates
             AutomationBridge.shared.activeDocument = document
             pendingRecoveryURL = RecoveryStore.available().first
         }
         .onDisappear {
+            keyboard.uninstall()
             recoveryTask?.cancel()
             RecoveryStore.discard(identifier: recoveryID)
             if AutomationBridge.shared.activeDocument === document {
                 AutomationBridge.shared.activeDocument = nil
             }
         }
+    }
+
+    private var focus: EditorFocus {
+        EditorFocus(document: document, editorState: editorState,
+                    renderStore: renderStore, undoManager: undoManager)
     }
 
     private func recoverPendingDocument() {
@@ -159,31 +182,29 @@ struct EditorView: View {
             }
             .help("Canvas size")
 
+            // Shortcuts for these live on the menu items (Layer, File).
             Button {
-                rerollSelected(randomizeParams: false)
+                EditorActions.perform(.reroll, focus)
             } label: {
                 Label("Reroll", systemImage: "dice")
             }
-            .keyboardShortcut("r", modifiers: .command)
             .disabled(selectedPatternLayerID == nil)
-            .help("Reroll Seed (⌘R)")
+            .help("Reroll Seed" + shortcuts.hint(.reroll))
 
             Button {
-                rerollSelected(randomizeParams: true)
+                EditorActions.perform(.randomize, focus)
             } label: {
                 Label("Randomize", systemImage: "sparkles")
             }
-            .keyboardShortcut("r", modifiers: [.command, .option])
             .disabled(selectedPatternLayerID == nil)
-            .help("Randomize (⌥⌘R)")
+            .help("Randomize" + shortcuts.hint(.randomize))
 
             Button {
                 editorState.showExportSheet = true
             } label: {
                 Label("Export", systemImage: "square.and.arrow.up")
             }
-            .keyboardShortcut("e", modifiers: .command)
-            .help("Export (⌘E)")
+            .help("Export" + shortcuts.hint(.export))
 
             Menu {
                 Button("Share Rendered PNG…") { shareRenderedArtwork() }
@@ -248,11 +269,6 @@ struct EditorView: View {
         guard let layer = document.model.layer(id: editorState.selectedLayerID),
               layer.kind.isPattern else { return nil }
         return layer.id
-    }
-
-    private func rerollSelected(randomizeParams: Bool) {
-        guard let id = selectedPatternLayerID else { return }
-        document.reroll(layerID: id, randomizeParams: randomizeParams, undoManager: undoManager)
     }
 
     // MARK: - Image import
@@ -353,10 +369,11 @@ private struct OnboardingView: View {
                     .foregroundStyle(Theme.textDim)
             }
             Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 10) {
-                onboardingRow("dice", "⌘R", "Reroll a pattern")
-                onboardingRow("cursorarrow", "V  B  P", "Move, brush, pen")
-                onboardingRow("square.2.layers.3d", "⌘G", "Group layers")
-                onboardingRow("square.and.arrow.up", "⌘E", "Export PNG, SVG, PDF, PSD")
+                onboardingRow("dice", keys(.reroll), "Reroll a pattern")
+                onboardingRow("cursorarrow", keys(.toolMove, .toolBrush, .toolPen), "Move, brush, pen")
+                onboardingRow("square.2.layers.3d", keys(.groupLayers), "Group layers")
+                onboardingRow("square.and.arrow.up", keys(.export), "Export PNG, SVG, PDF, PSD")
+                onboardingRow("keyboard", "⌘,", "Settings and keyboard shortcuts")
             }
             HStack {
                 Spacer()
@@ -366,6 +383,10 @@ private struct OnboardingView: View {
         }
         .padding(28)
         .frame(width: 420)
+    }
+
+    private func keys(_ actions: ShortcutAction...) -> String {
+        actions.map { ShortcutStore.shared.combo(for: $0)?.displayString ?? "—" }.joined(separator: "  ")
     }
 
     @ViewBuilder
