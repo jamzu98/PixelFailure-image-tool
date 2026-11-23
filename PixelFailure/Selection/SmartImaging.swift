@@ -69,7 +69,7 @@ nonisolated enum ContentAwareInpainting {
 /// super-resolution Core ML model. Kept behind one operation so a model can
 /// replace it without changing the document or UI contract.
 nonisolated enum ImageUpscaler {
-    private static let context = CIContext(options: [.cacheIntermediates: false])
+    private static var context: CIContext { CoreImageContext.shared }
 
     static func upscale2x(_ image: CGImage) -> CGImage? {
         let source = CIImage(cgImage: image)
@@ -77,6 +77,9 @@ nonisolated enum ImageUpscaler {
             kCIInputScaleKey: 2.0,
             kCIInputAspectRatioKey: 1.0,
         ]).applyingFilter("CISharpenLuminance", parameters: [kCIInputSharpnessKey: 0.25])
-        return context.createCGImage(scaled, from: scaled.extent)
+        // Keep the layer's gamut and depth instead of collapsing to sRGB 8-bit.
+        let space = image.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!
+        let format: CIFormat = image.bitsPerComponent > 8 ? .RGBA16 : .RGBA8
+        return context.createCGImage(scaled, from: scaled.extent, format: format, colorSpace: space)
     }
 }

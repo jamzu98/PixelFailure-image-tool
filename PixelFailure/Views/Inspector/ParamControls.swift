@@ -226,11 +226,30 @@ struct ParamControls: View {
     let values: ParamValues
     /// Writes one key/value into the model (the caller knows where the params live).
     let write: @MainActor (inout ProjectModel, _ key: String, _ value: Double) -> Void
+    /// Locked keys, shown with a lock toggle per row when `onToggleLock` is set.
+    var locked: Set<String> = []
+    var onToggleLock: ((String) -> Void)? = nil
     @Environment(\.undoManager) private var undoManager
 
     var body: some View {
         ForEach(specs) { spec in
-            control(for: spec)
+            if let onToggleLock {
+                HStack(spacing: 2) {
+                    control(for: spec)
+                    let isLocked = locked.contains(spec.key)
+                    Button { onToggleLock(spec.key) } label: {
+                        Image(systemName: isLocked ? "lock.fill" : "lock.open")
+                            .font(.system(size: 8.5, weight: .semibold))
+                            .foregroundStyle(isLocked ? Theme.accent : Theme.textFaint)
+                    }
+                    .buttonStyle(IconButtonStyle(size: 16))
+                    .opacity(spec.randomizable ? 1 : 0.35)
+                    .disabled(!spec.randomizable)
+                    .help(isLocked ? "Unlock" : "Lock: Randomize and Variations leave it alone")
+                }
+            } else {
+                control(for: spec)
+            }
         }
     }
 

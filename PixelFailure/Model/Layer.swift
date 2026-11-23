@@ -343,6 +343,19 @@ nonisolated enum GeneratorType: String, Codable, CaseIterable, Hashable, Sendabl
     case waves
     case rings
     case sampledGrid
+    case circlePacking
+    case contours
+    case stipple
+    case subdivision
+    case spaceFilling
+    case lSystem
+    case growth
+    case waveTiles
+    case stringArt
+    case noiseField
+    case voronoi
+    case plasma
+    case reactionDiffusion
 }
 
 nonisolated struct PatternConfig: Codable, Hashable, Sendable {
@@ -351,17 +364,24 @@ nonisolated struct PatternConfig: Codable, Hashable, Sendable {
     var params: ParamValues
     /// For image-driven generators: the image layer to sample.
     var sourceImageLayerID: UUID?
+    /// Shape, text or path layer whose outline limits where the pattern
+    /// draws (see the "Region" stage).
+    var regionLayerID: UUID?
+    /// Parameters that Randomize and Variations leave alone.
+    var lockedParams: Set<String>
 
     init(generator: GeneratorType, seed: UInt64 = SeededRNG.randomSeed(), params: ParamValues = ParamValues(),
-         sourceImageLayerID: UUID? = nil) {
+         sourceImageLayerID: UUID? = nil, regionLayerID: UUID? = nil, lockedParams: Set<String> = []) {
         self.generator = generator
         self.seed = seed
         self.params = params
         self.sourceImageLayerID = sourceImageLayerID
+        self.regionLayerID = regionLayerID
+        self.lockedParams = lockedParams
     }
 
     private enum CodingKeys: String, CodingKey {
-        case generator, seed, params, sourceImageLayerID
+        case generator, seed, params, sourceImageLayerID, regionLayerID, lockedParams
     }
 
     init(from decoder: Decoder) throws {
@@ -370,6 +390,18 @@ nonisolated struct PatternConfig: Codable, Hashable, Sendable {
         seed = try container.decode(UInt64.self, forKey: .seed)
         params = try container.decodeIfPresent(ParamValues.self, forKey: .params) ?? ParamValues()
         sourceImageLayerID = try container.decodeIfPresent(UUID.self, forKey: .sourceImageLayerID)
+        regionLayerID = try container.decodeIfPresent(UUID.self, forKey: .regionLayerID)
+        lockedParams = try container.decodeIfPresent(Set<String>.self, forKey: .lockedParams) ?? []
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(generator, forKey: .generator)
+        try container.encode(seed, forKey: .seed)
+        try container.encode(params, forKey: .params)
+        try container.encodeIfPresent(sourceImageLayerID, forKey: .sourceImageLayerID)
+        try container.encodeIfPresent(regionLayerID, forKey: .regionLayerID)
+        if !lockedParams.isEmpty { try container.encode(lockedParams.sorted(), forKey: .lockedParams) }
     }
 }
 

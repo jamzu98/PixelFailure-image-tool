@@ -811,7 +811,8 @@ extension PixelDocument {
                     if randomizeParams {
                         config.params = ParamValues.randomized(specs: config.generator.generator.specs,
                                                                seed: config.seed,
-                                                               keeping: config.params)
+                                                               keeping: config.params,
+                                                               locked: config.lockedParams)
                     }
                 }
             }

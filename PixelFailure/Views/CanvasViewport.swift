@@ -1055,6 +1055,10 @@ struct CanvasViewport: View {
                            editorState.cloneSourceCanvas == nil { break }
                         dragMode = .paint
                         startPaintSession()
+                        // Begin where the pointer went down: the first
+                        // reported move can already be well past it on a
+                        // fast stroke, and that stretch would otherwise be lost.
+                        extendPaintStroke(to: value.startLocation, canvasTransform: canvasTransform)
                     case .hand, .zoom, .eyedropper, .crop, .wand, .pen, .node:
                         dragMode = .pan(startPan: pan)
                     case .marquee:
@@ -2226,6 +2230,11 @@ struct CanvasViewport: View {
             BarDivider()
             Text("\(model.allLayers.count) layer\(model.allLayers.count == 1 ? "" : "s")")
             VisionStatusView(vision: editorState.vision)
+            if let task = document.backgroundTaskLabel {
+                BarDivider()
+                ProgressView().controlSize(.mini)
+                Text(task)
+            }
             Spacer(minLength: 0)
             Text(editorState.activeTool.displayName)
         }

@@ -95,13 +95,46 @@ nonisolated struct ParamValues: Codable, Hashable, Sendable {
     mutating func set(_ key: String, _ value: Double) { storage[key] = value }
     mutating func setArray(_ key: String, _ value: [Double]) { arrayStorage[key] = value }
 
-    /// Fresh randomized values for the given specs (respecting `randomizable`).
-    static func randomized(specs: [ParamSpec], seed: UInt64, keeping existing: ParamValues) -> ParamValues {
+    /// Small, seeded nudges around `base`: sliders move by up to `strength`
+    /// of their range, choices and toggles flip occasionally. Locked keys
+    /// and keys outside `specs` stay put.
+    static func mutated(specs: [ParamSpec], seed: UInt64, from base: ParamValues,
+                        strength: Double, locked: Set<String> = []) -> ParamValues {
         var rng = SeededRNG(seed: seed)
-        var out = ParamValues()
+        var out = base
+        let s = min(max(strength, 0), 1)
         for spec in specs {
-            out.storage[spec.key] = spec.randomizable
-                ? spec.randomValue(using: &rng)
+            // Always draw the same amount per spec so locks don't shift others.
+            let a = rng.unit(), b = rng.unit()
+            guard spec.randomizable, !locked.contains(spec.key) else { continue }
+            let current = base.storage[spec.key] ?? spec.defaultValue
+            switch spec.kind {
+            case .slider(let min, let max):
+                out.storage[spec.key] = Swift.min(Swift.max(current + (a * 2 - 1) * s * (max - min), min), max)
+            case .intSlider(let min, let max):
+                let moved = (current + (a * 2 - 1) * s * Double(max - min)).rounded()
+                out.storage[spec.key] = Swift.min(Swift.max(moved, Double(min)), Double(max))
+            case .choice(let options):
+                if a < s * 0.3 { out.storage[spec.key] = Double(Int(b * Double(options.count)) % options.count) }
+            case .toggle:
+                if a < s * 0.2 { out.storage[spec.key] = current >= 0.5 ? 0 : 1 }
+            }
+        }
+        return out
+    }
+
+    /// Fresh randomized values for the given specs (respecting `randomizable`
+    /// and `locked`). Keys outside `specs`, such as the shared symmetry and
+    /// region stages, carry over untouched.
+    static func randomized(specs: [ParamSpec], seed: UInt64, keeping existing: ParamValues,
+                           locked: Set<String> = []) -> ParamValues {
+        var rng = SeededRNG(seed: seed)
+        var out = existing
+        for spec in specs {
+            // Always draw, so a lock never shifts the other parameters' values.
+            let drawn = spec.randomValue(using: &rng)
+            out.storage[spec.key] = spec.randomizable && !locked.contains(spec.key)
+                ? drawn
                 : existing.storage[spec.key] ?? spec.defaultValue
         }
         return out

@@ -219,24 +219,36 @@ struct DocumentLauncher {
         return (size, dpi)
     }
 
-    private func present(_ document: PixelDocument, named name: String) {
+    /// Opens an unsaved document's recovery archive in a window of its own.
+    func openRecovered(_ archive: RecoveryArchive) {
+        // Marked edited: it exists nowhere else, so closing it must ask to save.
+        present(PixelDocument.recovered(from: archive), named: "Recovered", markEdited: true)
+    }
+
+    private func present(_ document: PixelDocument, named name: String, markEdited: Bool = false) {
         let before = Set(NSDocumentController.shared.documents.map(ObjectIdentifier.init))
         newDocument { document }
-        Self.applyDisplayName(name, excluding: before)
+        Self.configureNewDocument(named: name, markEdited: markEdited, excluding: before)
         onOpen()
     }
 
-    /// SwiftUI has no hook for an untitled document's name; set it on the
-    /// backing NSDocument so the title bar and the first Save panel use it.
-    private static func applyDisplayName(_ name: String, excluding before: Set<ObjectIdentifier>) {
+    /// SwiftUI has no hook for an untitled document's name or edited state;
+    /// set them on the backing NSDocument so the title bar, the first Save
+    /// panel and the close prompt use them.
+    private static func configureNewDocument(named name: String, markEdited: Bool,
+                                             excluding before: Set<ObjectIdentifier>) {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty, trimmed != "Untitled" else { return }
+        let rename = !trimmed.isEmpty && trimmed != "Untitled"
+        guard rename || markEdited else { return }
         func apply() -> Bool {
             guard let document = NSDocumentController.shared.documents.first(where: {
                 !before.contains(ObjectIdentifier($0))
             }) else { return false }
-            document.displayName = trimmed
-            document.windowControllers.forEach { $0.synchronizeWindowTitleWithDocumentName() }
+            if rename {
+                document.displayName = trimmed
+                document.windowControllers.forEach { $0.synchronizeWindowTitleWithDocumentName() }
+            }
+            if markEdited { document.updateChangeCount(.changeDone) }
             return true
         }
         if apply() { return }
@@ -249,11 +261,51 @@ struct DocumentLauncher {
     }
 }
 
+// MARK: - Files from Finder
+
+/// Images handed over by Finder (Open With, Dock drops, `open -a`) open as
+/// canvases through the same launcher as File > Open Image as Canvas. The
+/// launcher needs SwiftUI's document actions, so URLs that arrive during
+/// launch wait until the menu commands install it.
+final class ExternalOpenRouter {
+    static let shared = ExternalOpenRouter()
+
+    private var launcher: DocumentLauncher?
+    private var pending: [URL] = []
+
+    func install(_ launcher: DocumentLauncher) {
+        let isFirst = self.launcher == nil
+        self.launcher = launcher
+        guard isFirst, !pending.isEmpty else { return }
+        let urls = pending
+        pending = []
+        // Installed from a Commands body; present documents outside it.
+        Task { @MainActor in launcher.open(urls) }
+    }
+
+    func open(_ urls: [URL]) {
+        if let launcher { launcher.open(urls) } else { pending += urls }
+    }
+}
+
 // MARK: - App delegate
 
 /// Routes launch, Dock reopen, and last-window-closed to the Home screen.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var closeObserver: Any?
+
+    /// Implementing this takes over AppKit's default, which would hand every
+    /// URL to NSDocumentController; only projects are PixelDocuments.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        let projects = urls.filter { $0.pathExtension.lowercased() == "pixelfailure" }
+        let images = urls.filter { $0.pathExtension.lowercased() != "pixelfailure" }
+        for url in projects {
+            NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, error in
+                if error != nil { NSSound.beep() }
+            }
+        }
+        if !images.isEmpty { ExternalOpenRouter.shared.open(images) }
+    }
 
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
         LaunchAction.current == .blankCanvas && !hasLaunched

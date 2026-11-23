@@ -55,7 +55,7 @@ enum SelectionTransforms {
         return result.isEmpty ? nil : result
     }
 
-    private static let ciContext = CIContext(options: [.cacheIntermediates: false])
+    private static var ciContext: CIContext { CoreImageContext.shared }
 }
 
 // MARK: - Pixel operations on image layers
@@ -105,9 +105,12 @@ extension PixelDocument {
         ctx.draw(base, in: rect)
         ctx.setBlendMode(blendMode)
         ctx.draw(mask, in: rect)
-        guard let result = ctx.makeImage(), let data = PNGExporter.pngData(result) else { return }
+        guard let result = ctx.makeImage() else { return }
 
-        let key = storeImage(data: data, fileExtension: "png")
+        // Delete and Fill stay synchronous (Cut is copy + delete), but the
+        // PNG encode happens in the background; the bitmap is used directly.
+        let key = storeImageDeferringEncode(result)
+        renderStore.adoptOriginalImage(result, for: key)
         update(undoManager, actionName: actionName) { model in
             model.modifyLayer(id: layerID) { layer in
                 layer.recordSourceIfNeeded()
@@ -126,15 +129,12 @@ extension PixelDocument {
                 layer: layer, naturalSize: renderStore.naturalSize(for: layer, model: model),
                 config: config, parentAffine: model.parentAffine(of: layerID)),
               let mask = SelectionRasterizer.grayMask(selection: selection, transform: transform,
-                                                       pixelSize: config.pixelSize),
-              let result = ContentAwareInpainting.fill(base, mask: mask),
-              let data = PNGExporter.pngData(result) else { return }
-        let key = storeImage(data: data, fileExtension: "png")
-        update(undoManager, actionName: "Content-Aware Fill") { model in
-            model.modifyLayer(id: layerID) { layer in
-                layer.recordSourceIfNeeded()
-                layer.modifyImage { $0.imageKey = key }
-            }
+                                                       pixelSize: config.pixelSize) else { return }
+        let inputs = BakeInputs(base: base, mask: mask)
+        bakeLayerInBackground(layerID: layerID, label: "Content-Aware Fill",
+                              actionName: "Content-Aware Fill",
+                              renderStore: renderStore, undoManager: undoManager) {
+            ContentAwareInpainting.fill(inputs.base, mask: inputs.mask)
         }
     }
 
@@ -173,25 +173,32 @@ extension PixelDocument {
         }
     }
 
+    /// Largest side Super Resolution will produce. Beyond this a single
+    /// layer buffer costs over a gigabyte and stalls every render.
+    static let superResolutionMaxDimension = 16_384
+
+    enum SuperResolutionOutcome { case started, tooLarge, unavailable }
+
     @MainActor
+    @discardableResult
     func superResolveLayer(layerID: UUID, renderStore: RenderStore,
-                           undoManager: UndoManager?) {
+                           undoManager: UndoManager?) -> SuperResolutionOutcome {
         guard let layer = model.layer(id: layerID), !model.isEffectivelyLocked(layerID),
               let config = layer.imageConfig,
-              let base = renderStore.originalImage(key: config.imageKey),
-              let result = ImageUpscaler.upscale2x(base),
-              let data = PNGExporter.pngData(result) else { return }
-        let key = storeImage(data: data, fileExtension: "png")
-        update(undoManager, actionName: "Super Resolution 2×") { model in
-            model.modifyLayer(id: layerID) { layer in
-                layer.recordSourceIfNeeded()
-                layer.modifyImage {
-                    $0.imageKey = key
-                    $0.pixelSize = CGSize(width: result.width, height: result.height)
-                }
-                layer.transform.scale *= 0.5
-            }
-        }
+              let base = renderStore.originalImage(key: config.imageKey) else { return .unavailable }
+        guard max(base.width, base.height) * 2 <= Self.superResolutionMaxDimension else { return .tooLarge }
+        let inputs = BakeInputs(base: base, mask: nil)
+        bakeLayerInBackground(layerID: layerID, label: "Super Resolution",
+                              actionName: "Super Resolution 2×",
+                              renderStore: renderStore, undoManager: undoManager,
+                              work: { ImageUpscaler.upscale2x(inputs.base) },
+                              finish: { layer, result in
+                                  layer.modifyImage {
+                                      $0.pixelSize = CGSize(width: result.width, height: result.height)
+                                  }
+                                  layer.transform.scale *= 0.5
+                              })
+        return .started
     }
 
     /// Copies the selected region of an image layer into a new layer
@@ -334,6 +341,59 @@ extension PixelDocument {
                 layer.mask = LayerMask(imageKey: key, pixelSize: pixelSize,
                                        isEnabled: true,
                                        inverted: layer.mask?.inverted ?? false)
+            }
+        }
+    }
+}
+
+// MARK: - Background bakes
+
+/// Immutable bitmaps handed to a background bake.
+nonisolated struct BakeInputs: @unchecked Sendable {
+    let base: CGImage
+    let mask: CGImage!
+
+    init(base: CGImage, mask: CGImage?) {
+        self.base = base
+        self.mask = mask
+    }
+}
+
+private nonisolated struct BakeOutput: @unchecked Sendable {
+    let image: CGImage
+    let png: Data
+}
+
+extension PixelDocument {
+    /// Runs a destructive pixel operation and its PNG encode off the main
+    /// actor, then commits the result as one undo step. The status bar shows
+    /// `label` meanwhile. If the layer's pixels changed before the work
+    /// finished (another stroke, an undo), the stale result is dropped.
+    @MainActor
+    func bakeLayerInBackground(layerID: UUID, label: String, actionName: String,
+                               renderStore: RenderStore, undoManager: UndoManager?,
+                               work: @escaping @Sendable () -> CGImage?,
+                               finish: @escaping (inout Layer, CGImage) -> Void = { _, _ in }) {
+        guard backgroundTaskLabel == nil,
+              let startKey = model.layer(id: layerID)?.imageConfig?.imageKey else { return }
+        backgroundTaskLabel = label
+        Task { @MainActor [weak self, weak renderStore] in
+            let output = await Task.detached(priority: .userInitiated) { () -> BakeOutput? in
+                guard let image = work(), let png = PNGExporter.pngData(image) else { return nil }
+                return BakeOutput(image: image, png: png)
+            }.value
+            guard let self else { return }
+            self.backgroundTaskLabel = nil
+            guard let output,
+                  self.model.layer(id: layerID)?.imageConfig?.imageKey == startKey else { return }
+            let key = self.storeImage(data: output.png, fileExtension: "png")
+            renderStore?.adoptOriginalImage(output.image, for: key)
+            self.update(undoManager, actionName: actionName) { model in
+                model.modifyLayer(id: layerID) { layer in
+                    layer.recordSourceIfNeeded()
+                    layer.modifyImage { $0.imageKey = key }
+                    finish(&layer, output.image)
+                }
             }
         }
     }

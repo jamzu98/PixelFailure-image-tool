@@ -15,7 +15,7 @@ nonisolated struct WavesGenerator: PatternGenerator {
             .slider("lineWidth", "Line Width", min: 0.0008, max: 0.015, initial: 0.003),
             .choice("direction", "Direction", options: ["Horizontal", "Vertical"], initial: 0),
             .slider("ampRamp", "Amplitude Ramp", min: -1, max: 1, initial: 0),
-        ] + GenColor.specs
+        ] + GenNoise.specs + GenColor.specs
     }
 
     func generate(params: ParamValues, seed: UInt64, context: GeneratorContext) -> [VectorPrimitive] {
@@ -33,6 +33,8 @@ nonisolated struct WavesGenerator: PatternGenerator {
         let lineWidth = max(0.3, params.double("lineWidth", 0.003) * minDim)
         let vertical = params.int("direction", 0) == 1
         let ampRamp = params.double("ampRamp", 0)
+        let field: NoiseField? = GenNoise.isLegacy(params)
+            ? nil : GenNoise.field(params, seed: seed, octaves: 1)
 
         let along = vertical ? Double(size.height) : Double(size.width)
         let across = vertical ? Double(size.width) : Double(size.height)
@@ -52,7 +54,9 @@ nonisolated struct WavesGenerator: PatternGenerator {
                 let u = Double(s) / Double(sampleCount)
                 let pos = u * along
                 var offset = sin(u * frequency * 2 * .pi + phase) * lineAmp
-                offset += noise.value(u * noiseScale * 4, t * noiseScale * 4) * lineAmp * noiseAmount * 2
+                let n = field?.value(u * noiseScale * 4, t * noiseScale * 4)
+                    ?? noise.value(u * noiseScale * 4, t * noiseScale * 4)
+                offset += n * lineAmp * noiseAmount * 2
                 let point = vertical
                     ? CGPoint(x: base + offset, y: pos)
                     : CGPoint(x: pos, y: base + offset)

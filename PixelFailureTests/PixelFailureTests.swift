@@ -40,7 +40,7 @@ struct GeneratorTests {
     }
 
     @Test func generatorsAreDeterministicForSameSeed() {
-        for type in GeneratorType.allCases where type != .sampledGrid {
+        for type in GeneratorType.allCases where !type.generator.needsSourceImage && !type.isRaster {
             let generator = type.generator
             let params = ParamValues(defaults: generator.specs)
             let a = generator.generate(params: params, seed: 99, context: context)
@@ -54,7 +54,7 @@ struct GeneratorTests {
     }
 
     @Test func generatorsProduceContent() {
-        for type in GeneratorType.allCases where type != .sampledGrid {
+        for type in GeneratorType.allCases where !type.generator.needsSourceImage && !type.isRaster {
             let generator = type.generator
             let params = ParamValues(defaults: generator.specs)
             let primitives = generator.generate(params: params, seed: 5, context: context)
@@ -1469,7 +1469,7 @@ struct LayerSourceTests {
 
     /// A second bake keeps the earliest snapshot — revert always returns to
     /// the authored content, not an intermediate bake.
-    @Test func laterBakesKeepEarliestSource() {
+    @Test func laterBakesKeepEarliestSource() async {
         let document = PixelDocument()
         let store = RenderStore(document: document)
         let layerID = document.model.layers[0].id
@@ -1477,6 +1477,7 @@ struct LayerSourceTests {
 
         document.rasterizeLayer(id: layerID, renderStore: store, undoManager: nil)
         document.superResolveLayer(layerID: layerID, renderStore: store, undoManager: nil)
+        await document.waitForBackgroundTask()
 
         let layer = document.model.layer(id: layerID)
         #expect(layer?.source?.kind == originalKind)
@@ -1522,7 +1523,7 @@ struct LayerSourceTests {
     /// The pasteboard payload must carry the source's image bytes, or a
     /// pasted layer could never revert. Uses an image layer so the source
     /// snapshot actually references stored pixels.
-    @Test func transferPayloadIncludesSourceImageKeys() throws {
+    @Test func transferPayloadIncludesSourceImageKeys() async throws {
         let document = PixelDocument()
         let store = RenderStore(document: document)
         let ctx = try #require(ColorSettings.default.makeRGBAContext(width: 8, height: 8))
@@ -1537,6 +1538,7 @@ struct LayerSourceTests {
         document.update(nil) { $0.layers.append(layer) }
 
         document.superResolveLayer(layerID: layer.id, renderStore: store, undoManager: nil)
+        await document.waitForBackgroundTask()
 
         let baked = try #require(document.model.layer(id: layer.id))
         #expect(baked.imageConfig?.imageKey != originalKey)

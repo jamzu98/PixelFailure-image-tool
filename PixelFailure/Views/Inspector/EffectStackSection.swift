@@ -43,11 +43,15 @@ struct EffectStackSection: View {
             }
         } accessory: {
             Menu {
-                ForEach(EffectType.allCases, id: \.self) { type in
-                    Button(type.displayName) {
-                        document.update(undoManager, actionName: "Add \(type.displayName)") { model in
-                            target.withEffects(&model) { effects in
-                                effects.append(Effect(type: type, params: type.defaultParams))
+                ForEach(EffectType.groups, id: \.title) { group in
+                    Section(group.title) {
+                        ForEach(group.types, id: \.self) { type in
+                            Button(type.displayName) {
+                                document.update(undoManager, actionName: "Add \(type.displayName)") { model in
+                                    target.withEffects(&model) { effects in
+                                        effects.append(Effect(type: type, params: type.defaultParams))
+                                    }
+                                }
                             }
                         }
                     }

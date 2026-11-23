@@ -12,10 +12,11 @@ nonisolated struct FlowFieldGenerator: PatternGenerator {
             .slider("noiseScale", "Noise Scale", min: 0.6, max: 9, initial: 2.6),
             .slider("curl", "Curl", min: 0.2, max: 3, initial: 1.2),
             .intSlider("octaves", "Detail", min: 1, max: 4, initial: 2),
+            .toggle("curlFlow", "Curl Flow", initial: false),
             .slider("lineWidth", "Line Width", min: 0.0008, max: 0.02, initial: 0.0035),
             .slider("widthVariation", "Width Variation", min: 0, max: 1, initial: 0.5),
             .choice("colorBy", "Color By", options: ["Direction", "Line", "Random", "Position"], initial: 3),
-        ] + GenColor.specs
+        ] + GenNoise.specs + GenColor.specs
     }
 
     func generate(params: ParamValues, seed: UInt64, context: GeneratorContext) -> [VectorPrimitive] {
@@ -33,6 +34,10 @@ nonisolated struct FlowFieldGenerator: PatternGenerator {
         let baseWidth = params.double("lineWidth", 0.0035) * minDim
         let widthVariation = params.double("widthVariation", 0.5)
         let colorBy = params.int("colorBy", 3)
+        let curlFlow = params.bool("curlFlow", false)
+        // The original Perlin fbm path stays bit-identical for old documents.
+        let field: NoiseField? = GenNoise.isLegacy(params) && !curlFlow
+            ? nil : GenNoise.field(params, seed: seed, octaves: octaves)
 
         // Seed points across a slightly expanded canvas so lines flow in from the edges.
         let inset = -0.08 * minDim
@@ -51,8 +56,16 @@ nonisolated struct FlowFieldGenerator: PatternGenerator {
             var lastAngle = 0.0
 
             for _ in 0..<steps {
-                let n = noise.fbm(x * noiseScale, y * noiseScale, octaves: octaves)
-                let angle = n * .pi * 2 * curl
+                let angle: Double
+                if let field, curlFlow {
+                    // Divergence-free flow: lines swirl instead of converging.
+                    let c = field.curl(x * noiseScale, y * noiseScale)
+                    angle = atan2(c.1, c.0) * curl
+                } else if let field {
+                    angle = field.value(x * noiseScale, y * noiseScale) * .pi * 2 * curl
+                } else {
+                    angle = noise.fbm(x * noiseScale, y * noiseScale, octaves: octaves) * .pi * 2 * curl
+                }
                 lastAngle = angle
                 x += cos(angle) * stepSize
                 y += sin(angle) * stepSize

@@ -69,44 +69,196 @@ nonisolated struct RecoveryArchive: Codable, Sendable {
     var checkpoints: [PixelDocument.Checkpoint]
 }
 
+/// Crash-recovery autosaves. Each editor window writes a `<id>.recovery`
+/// directory (`manifest.json` + `images/` + `owner.json`) off the main
+/// actor; image files are keyed by immutable UUIDs, so only new images are
+/// written each time. `owner.json` records which file the window was
+/// editing, so an archive is only ever offered back to that document.
+/// Archives from older builds (a single JSON file) still load, and count
+/// as untitled.
 enum RecoveryStore {
-    static var directory: URL {
+    private nonisolated struct Manifest: Codable, Sendable {
+        var savedAt: Date
+        var model: ProjectModel
+        var checkpoints: [PixelDocument.Checkpoint]
+    }
+
+    /// Small sidecar so matching an archive to a document never has to
+    /// decode its whole model.
+    private nonisolated struct Owner: Codable, Sendable {
+        /// Standardized path of the document file; nil for untitled windows.
+        var documentPath: String?
+    }
+
+    /// Archives that windows in this process are writing right now. They
+    /// belong to an open document and are never offered for recovery.
+    private static var liveIdentifiers: Set<UUID> = []
+
+    static func markLive(_ identifier: UUID) { liveIdentifiers.insert(identifier) }
+
+    nonisolated static func documentPath(_ url: URL?) -> String? {
+        url?.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    nonisolated static var directory: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory,
                                             in: .userDomainMask).first!
         return base.appendingPathComponent("PixelFailure/Recovery", isDirectory: true)
     }
 
-    static func save(_ document: PixelDocument, identifier: UUID) throws -> URL {
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    /// Writes synchronously. Prefer `saveInBackground` from the editor.
+    static func save(_ document: PixelDocument, identifier: UUID, documentURL: URL? = nil) throws -> URL {
         let snapshot = try document.snapshot(contentType: .pixelFailureProject)
-        let archive = RecoveryArchive(savedAt: Date(), model: snapshot.model,
-                                      images: snapshot.images,
-                                      checkpoints: snapshot.checkpoints)
         let url = url(identifier: identifier)
-        try JSONEncoder().encode(archive).write(to: url, options: .atomic)
+        try write(model: snapshot.model, images: snapshot.images,
+                  checkpoints: snapshot.checkpoints, documentPath: documentPath(documentURL), to: url)
         return url
+    }
+
+    /// Takes a copy-on-write snapshot on the main actor, then encodes and
+    /// writes it on a background writer that serializes saves.
+    @discardableResult
+    static func saveInBackground(_ document: PixelDocument, identifier: UUID,
+                                 documentURL: URL? = nil) async throws -> URL {
+        let snapshot = try document.snapshot(contentType: .pixelFailureProject)
+        let url = url(identifier: identifier)
+        try await RecoveryWriter.shared.write(model: snapshot.model, images: snapshot.images,
+                                              checkpoints: snapshot.checkpoints,
+                                              documentPath: documentPath(documentURL), to: url)
+        return url
+    }
+
+    /// The newest archive worth offering to a window that just opened
+    /// `documentURL` (nil = untitled): one written for that same file, not by
+    /// a window that is still open, and holding something different from
+    /// what the window already shows.
+    static func recoverableArchive(for documentURL: URL?, currentModel: ProjectModel) -> URL? {
+        let path = documentPath(documentURL)
+        for candidate in available() {
+            if let id = identifier(of: candidate), liveIdentifiers.contains(id) { continue }
+            guard owner(of: candidate) == path,
+                  let model = try? loadModel(candidate) else { continue }
+            if model == currentModel {
+                // The document already holds this content (saved or
+                // autosaved in place), so the archive is spent.
+                try? discard(candidate)
+                continue
+            }
+            return candidate
+        }
+        return nil
+    }
+
+    nonisolated static func owner(of archiveURL: URL) -> String? {
+        let ownerURL = archiveURL.appendingPathComponent("owner.json")
+        guard let data = try? Data(contentsOf: ownerURL),
+              let owner = try? JSONDecoder().decode(Owner.self, from: data) else { return nil }
+        return owner.documentPath
+    }
+
+    nonisolated static func identifier(of archiveURL: URL) -> UUID? {
+        UUID(uuidString: archiveURL.deletingPathExtension().lastPathComponent)
+    }
+
+    nonisolated static func write(model: ProjectModel, images: [String: Data],
+                                  checkpoints: [PixelDocument.Checkpoint],
+                                  documentPath: String? = nil, to url: URL) throws {
+        let fileManager = FileManager.default
+        var isDirectory: ObjCBool = false
+        if fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory), !isDirectory.boolValue {
+            try fileManager.removeItem(at: url) // legacy single-file archive
+        }
+        let imagesURL = url.appendingPathComponent("images", isDirectory: true)
+        try fileManager.createDirectory(at: imagesURL, withIntermediateDirectories: true)
+
+        let present = Set((try? fileManager.contentsOfDirectory(atPath: imagesURL.path)) ?? [])
+        for (key, data) in images where !present.contains(key) {
+            try data.write(to: imagesURL.appendingPathComponent(key), options: .atomic)
+        }
+        // The manifest goes last, so a crash mid-write leaves the previous
+        // manifest pointing at images that are all still on disk.
+        try JSONEncoder().encode(Owner(documentPath: documentPath))
+            .write(to: url.appendingPathComponent("owner.json"), options: .atomic)
+        let manifest = Manifest(savedAt: Date(), model: model, checkpoints: checkpoints)
+        try JSONEncoder().encode(manifest)
+            .write(to: url.appendingPathComponent("manifest.json"), options: .atomic)
+        for stale in present where images[stale] == nil {
+            try? fileManager.removeItem(at: imagesURL.appendingPathComponent(stale))
+        }
     }
 
     static func available() -> [URL] {
         ((try? FileManager.default.contentsOfDirectory(at: directory,
                                                        includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
             .filter { $0.pathExtension == "recovery" }
-            .sorted { ((try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) >
-                      ((try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) }
+            .sorted { modificationDate($0) > modificationDate($1) }
+    }
+
+    /// When the archive was last written.
+    static func modificationDate(_ url: URL) -> Date {
+        let manifest = url.appendingPathComponent("manifest.json")
+        let target = FileManager.default.fileExists(atPath: manifest.path) ? manifest : url
+        return (try? target.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+            ?? .distantPast
     }
 
     static func load(_ url: URL) throws -> RecoveryArchive {
-        try JSONDecoder().decode(RecoveryArchive.self, from: Data(contentsOf: url))
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        guard isDirectory.boolValue else {
+            return try JSONDecoder().decode(RecoveryArchive.self, from: Data(contentsOf: url))
+        }
+        let manifest = try JSONDecoder().decode(
+            Manifest.self, from: Data(contentsOf: url.appendingPathComponent("manifest.json")))
+        let imagesURL = url.appendingPathComponent("images", isDirectory: true)
+        var images: [String: Data] = [:]
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: imagesURL.path)) ?? [] {
+            images[name] = try Data(contentsOf: imagesURL.appendingPathComponent(name))
+        }
+        return RecoveryArchive(savedAt: manifest.savedAt, model: manifest.model,
+                               images: images, checkpoints: manifest.checkpoints)
+    }
+
+    /// Just the archived model, without reading any image files.
+    static func loadModel(_ url: URL) throws -> ProjectModel {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        guard isDirectory.boolValue else { return try load(url).model }
+        return try JSONDecoder().decode(Manifest.self,
+                                        from: Data(contentsOf: url.appendingPathComponent("manifest.json"))).model
     }
 
     static func discard(_ url: URL) throws { try FileManager.default.removeItem(at: url) }
 
-    static func url(identifier: UUID) -> URL {
+    nonisolated static func url(identifier: UUID) -> URL {
         directory.appendingPathComponent(identifier.uuidString).appendingPathExtension("recovery")
     }
 
+    /// Removes a document's archive after any write already queued for it,
+    /// so a closing window can't leave a stale archive behind.
     static func discard(identifier: UUID) {
-        try? FileManager.default.removeItem(at: url(identifier: identifier))
+        liveIdentifiers.remove(identifier)
+        let url = url(identifier: identifier)
+        Task { await RecoveryWriter.shared.remove(url) }
+    }
+}
+
+/// Serializes recovery writes so two autosaves never interleave on disk.
+actor RecoveryWriter {
+    static let shared = RecoveryWriter()
+
+    func write(model: ProjectModel, images: [String: Data],
+               checkpoints: [PixelDocument.Checkpoint], documentPath: String?, to url: URL) throws {
+        try RecoveryStore.write(model: model, images: images, checkpoints: checkpoints,
+                                documentPath: documentPath, to: url)
+    }
+
+    func remove(_ url: URL) {
+        try? FileManager.default.removeItem(at: url)
     }
 }
 

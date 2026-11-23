@@ -95,7 +95,7 @@ struct TiledCanvasView: NSViewRepresentable {
                                     content: .raster(composite), mask: nil)]
                 background = .clear
             } else {
-                items = renderStore.renderItems(model: model, quality: quality)
+                items = renderStore.renderItems(model: model, quality: quality, progressive: true)
                 background = model.background
             }
             let snapshot = ViewportRenderSnapshot(items: items,

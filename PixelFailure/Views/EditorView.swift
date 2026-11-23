@@ -4,9 +4,14 @@ import UniformTypeIdentifiers
 
 struct EditorView: View {
     @ObservedObject var document: PixelDocument
+    /// The file this window edits (nil while untitled). Recovery archives
+    /// are tagged with it so they only come back to the same document.
+    var fileURL: URL? = nil
     @State private var editorState = EditorState()
     @State private var renderStore: RenderStore
     @Environment(\.undoManager) private var undoManager
+    @Environment(\.newDocument) private var newDocument
+    @Environment(\.openDocument) private var openDocument
     @AppStorage("didCompleteOnboarding") private var didCompleteOnboarding = false
     @State private var importNotice: String?
     @State private var recoveryID = UUID()
@@ -16,8 +21,9 @@ struct EditorView: View {
     private var prefs: Preferences { .shared }
     private var shortcuts: ShortcutStore { .shared }
 
-    init(document: PixelDocument) {
+    init(document: PixelDocument, fileURL: URL? = nil) {
         self.document = document
+        self.fileURL = fileURL
         _renderStore = State(initialValue: RenderStore(document: document))
     }
 
@@ -104,21 +110,14 @@ struct EditorView: View {
                 Button("Discard", role: .destructive) { discardPendingRecovery() }
                 Button("Later", role: .cancel) { pendingRecoveryURL = nil }
             } message: {
-                Text("An autosave from an interrupted session was found.")
+                Text(recoveryMessage)
             }
         .onDrop(of: [.fileURL, .image], isTargeted: nil) { providers in
             handleDrop(providers)
         }
         .onChange(of: document.model) { oldModel, newModel in
             renderStore.modelDidChange(from: oldModel, to: newModel)
-            recoveryTask?.cancel()
-            guard prefs.autoRecoveryEnabled else { return }
-            let delay = prefs.autoRecoveryDelay
-            recoveryTask = Task { @MainActor in
-                try? await Task.sleep(for: .seconds(delay))
-                guard !Task.isCancelled else { return }
-                _ = try? RecoveryStore.save(document, identifier: recoveryID)
-            }
+            scheduleRecoverySave()
         }
         .onChange(of: prefs.historyStates) { _, levels in undoManager?.levelsOfUndo = levels }
         .onChange(of: undoManager) { _, _ in
@@ -130,7 +129,15 @@ struct EditorView: View {
             keyboard.install()
             undoManager?.levelsOfUndo = prefs.historyStates
             AutomationBridge.shared.activeDocument = document
-            pendingRecoveryURL = RecoveryStore.available().first
+            RecoveryStore.markLive(recoveryID)
+            if !document.isRecovered {
+                pendingRecoveryURL = RecoveryStore.recoverableArchive(for: fileURL,
+                                                                      currentModel: document.model)
+            }
+            // A new, never-saved document that already has content (an image
+            // opened as a canvas, a preset) exists nowhere on disk yet;
+            // protect it before the first edit.
+            if fileURL == nil, !document.model.layers.isEmpty { scheduleRecoverySave() }
         }
         .onDisappear {
             keyboard.uninstall()
@@ -142,17 +149,47 @@ struct EditorView: View {
         }
     }
 
+    /// Writes a crash-recovery archive after the configured idle delay,
+    /// replacing any save still waiting.
+    private func scheduleRecoverySave() {
+        recoveryTask?.cancel()
+        guard prefs.autoRecoveryEnabled else { return }
+        let delay = prefs.autoRecoveryDelay
+        let fileURL = fileURL
+        recoveryTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled else { return }
+            _ = try? await RecoveryStore.saveInBackground(document, identifier: recoveryID,
+                                                          documentURL: fileURL)
+        }
+    }
+
     private var focus: EditorFocus {
         EditorFocus(document: document, editorState: editorState,
                     renderStore: renderStore, undoManager: undoManager)
     }
 
+    private var recoveryMessage: String {
+        guard let url = pendingRecoveryURL else { return "" }
+        let date = RecoveryStore.modificationDate(url).formatted(date: .abbreviated, time: .shortened)
+        return fileURL == nil
+            ? "An unsaved document from \(date) was found. Recover opens it in a new window."
+            : "Unsaved changes to this document from \(date) were found."
+    }
+
     private func recoverPendingDocument() {
         guard let url = pendingRecoveryURL,
               let archive = try? RecoveryStore.load(url) else { return }
-        document.restoreRecovery(archive)
         try? RecoveryStore.discard(url)
         pendingRecoveryURL = nil
+        if fileURL == nil {
+            // An untitled archive belongs to no particular window; restoring
+            // it here would replace this window's content with no undo.
+            DocumentLauncher(newDocument: newDocument, openDocument: openDocument).openRecovered(archive)
+        } else {
+            // The same file's newer, unsaved state.
+            document.restoreRecovery(archive)
+        }
     }
 
     private func discardPendingRecovery() {

@@ -58,6 +58,7 @@ struct ExportSheet: View {
     @State private var customHeight = 3000
     @State private var isExporting = false
     @State private var errorMessage: String?
+    @State private var plotter = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -96,6 +97,10 @@ struct ExportSheet: View {
                             }
                         }
                     }
+                }
+                if format == .svg {
+                    Toggle("Plotter Paths", isOn: $plotter)
+                        .help("Strokes only, one layer per pen, ordered to minimize pen travel")
                 }
                 formatHelpText
                     .font(.system(size: 11))
@@ -139,6 +144,8 @@ struct ExportSheet: View {
             Text("Flattened to a single page.")
         case .psd:
             Text("Layered, one raster per layer.")
+        case .svg where plotter:
+            Text("Strokes only. Images and fills are left out.")
         case .svg:
             Text(document.model.canvasEffects.isEmpty
                  ? "Vectors stay vector; images embed as PNG."
@@ -171,60 +178,35 @@ struct ExportSheet: View {
 
         isExporting = true
         errorMessage = nil
-        defer { isExporting = false }
 
-        // Full-quality render items (native-resolution effect chains).
+        // Full-quality render items (native-resolution effect chains) are
+        // resolved here; rasterizing, encoding and writing run off the main
+        // actor so the window stays responsive on large canvases.
         let items = renderStore.renderItems(model: document.model, quality: .full)
         let model = document.model
 
+        if format.raster != nil || format == .pdf {
+            let job = RasterExportJob(items: items, model: model, targetSize: targetSize(),
+                                      format: format.raster, quality: quality, url: url)
+            Task { @MainActor in
+                let failure = await Task.detached(priority: .userInitiated) { job.run() }.value
+                isExporting = false
+                if let failure { errorMessage = failure } else { dismiss() }
+            }
+            return
+        }
+
+        defer { isExporting = false }
         do {
-            if let rasterFormat = format.raster {
-                guard var image = PNGExporter.render(items: items,
-                                                     background: model.background,
-                                                     canvasSize: model.canvasSize,
-                                                     targetPixelSize: targetSize(),
-                                                     colorSettings: model.colorSettings) else {
-                    errorMessage = "Rendering failed."
-                    return
-                }
-                if !model.canvasEffects.isEmpty {
-                    image = EffectPipeline.shared.apply(effects: model.canvasEffects,
-                                                        to: image,
-                                                        palette: model.palette)
-                }
-                guard let data = ImageEncoder.encode(image, format: rasterFormat,
-                                                     quality: quality,
-                                                     background: model.background) else {
-                    errorMessage = "Encoding failed."
-                    return
-                }
-                try data.write(to: url)
-            } else if format == .pdf {
-                guard var image = PNGExporter.render(items: items,
-                                                     background: model.background,
-                                                     canvasSize: model.canvasSize,
-                                                     targetPixelSize: targetSize(),
-                                                     colorSettings: model.colorSettings) else {
-                    errorMessage = "Rendering failed."
-                    return
-                }
-                if !model.canvasEffects.isEmpty {
-                    image = EffectPipeline.shared.apply(effects: model.canvasEffects,
-                                                        to: image, palette: model.palette)
-                }
-                let inches = model.printSettings.physicalSize(for: targetSize())
-                let page = CGSize(width: inches.width * 72, height: inches.height * 72)
-                guard let data = PDFExporter.data(image: image, pageSize: page) else {
-                    errorMessage = "PDF encoding failed."
-                    return
-                }
-                try data.write(to: url)
-            } else if format == .psd {
+            if format == .psd {
                 guard let data = PSDExporter.data(model: model, renderStore: renderStore) else {
                     errorMessage = "PSD encoding failed."
                     return
                 }
                 try data.write(to: url)
+            } else if plotter {
+                let svg = PlotterSVG.svg(items: items, canvasSize: model.canvasSize)
+                try svg.write(to: url, atomically: true, encoding: .utf8)
             } else {
                 let svg = SVGExporter.svg(items: items,
                                           background: model.background,
@@ -254,5 +236,48 @@ struct ExportSheet: View {
                 try asset.data.write(to: directory.appendingPathComponent(asset.name), options: .atomic)
             }
         } catch { errorMessage = "Slice export failed: \(error.localizedDescription)" }
+    }
+}
+
+/// A raster or PDF export captured on the main actor and run anywhere.
+/// `format == nil` means PDF.
+private nonisolated struct RasterExportJob: @unchecked Sendable {
+    let items: [RenderItem]
+    let model: ProjectModel
+    let targetSize: CGSize
+    let format: ImageEncoder.Format?
+    let quality: Double
+    let url: URL
+
+    /// nil on success, otherwise a message for the sheet.
+    func run() -> String? {
+        guard var image = PNGExporter.render(items: items,
+                                             background: model.background,
+                                             canvasSize: model.canvasSize,
+                                             targetPixelSize: targetSize,
+                                             colorSettings: model.colorSettings) else {
+            return "Rendering failed."
+        }
+        if !model.canvasEffects.isEmpty {
+            image = EffectPipeline.shared.apply(effects: model.canvasEffects,
+                                                to: image, palette: model.palette)
+        }
+        let data: Data?
+        if let format {
+            data = ImageEncoder.encode(image, format: format, quality: quality,
+                                       background: model.background)
+            if data == nil { return "Encoding failed." }
+        } else {
+            let inches = model.printSettings.physicalSize(for: targetSize)
+            data = PDFExporter.data(image: image,
+                                    pageSize: CGSize(width: inches.width * 72, height: inches.height * 72))
+            if data == nil { return "PDF encoding failed." }
+        }
+        do {
+            try data?.write(to: url)
+            return nil
+        } catch {
+            return "Export failed: \(error.localizedDescription)"
+        }
     }
 }

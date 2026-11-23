@@ -117,6 +117,12 @@ nonisolated struct ProjectModel: Codable, Hashable, Sendable {
         return false
     }
 
+    /// Every image-store key the layer tree references (content, masks and
+    /// pre-bake sources, groups included).
+    var referencedImageKeys: Set<String> {
+        Set(layers.flatMap(\.referencedImageKeys))
+    }
+
     /// Every layer in the tree, depth-first, bottom-to-top within each level.
     var allLayers: [Layer] {
         Self.flatten(layers)

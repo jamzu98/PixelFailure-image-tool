@@ -5,7 +5,7 @@ import CoreGraphics
 /// Parameter schemas for each effect type. Size-like parameters are expressed
 /// as fractions of the image's min dimension so previews (rendered downscaled)
 /// and full-resolution exports look identical.
-extension EffectType {
+nonisolated extension EffectType {
     var specs: [ParamSpec] {
         switch self {
         case .adjust:
@@ -115,6 +115,40 @@ extension EffectType {
                 .slider("darkness", "Darkness", min: 0, max: 1, initial: 0.45),
                 .choice("direction", "Direction", options: ["Horizontal", "Vertical"], initial: 0),
             ]
+        case .pixelSort:
+            return [
+                .choice("direction", "Direction", options: ["Horizontal", "Vertical"], initial: 0),
+                .choice("sortBy", "Sort By", options: ["Brightness", "Hue", "Saturation"], initial: 0),
+                .slider("low", "Low Threshold", min: 0, max: 1, initial: 0.25),
+                .slider("high", "High Threshold", min: 0, max: 1, initial: 0.8),
+                .slider("maxSpan", "Max Span", min: 0.01, max: 1, initial: 0.3),
+                .toggle("reverse", "Reverse", initial: false),
+            ]
+        case .datamosh:
+            return [
+                .slider("blockSize", "Block Size", min: 0.005, max: 0.12, initial: 0.03),
+                .slider("amount", "Amount", min: 0, max: 1, initial: 0.35),
+                .slider("shift", "Shift", min: 0, max: 0.3, initial: 0.08),
+                .slider("smear", "Smear", min: 0, max: 1, initial: 0.4),
+                .slider("bleed", "Chroma Bleed", min: 0, max: 1, initial: 0.3),
+                .intSlider("variant", "Variant", min: 0, max: 100, initial: 0),
+            ]
+        case .noiseShift:
+            return [
+                .slider("amount", "Amount", min: 0, max: 0.1, initial: 0.03),
+                .slider("frequency", "Frequency", min: 0.5, max: 40, initial: 6),
+                .slider("jitter", "Jitter", min: 0, max: 1, initial: 0.2),
+                .choice("channels", "Channels", options: ["Red / Blue", "Red / Green / Blue"], initial: 0),
+                .intSlider("variant", "Variant", min: 0, max: 100, initial: 0),
+            ]
+        case .dither:
+            return [
+                .choice("method", "Method", options: ["Bayer 4×4", "Bayer 8×8", "Blue Noise", "Floyd–Steinberg"],
+                        initial: 1),
+                .choice("colors", "Colors", options: ["Palette", "Black & White", "Grays"], initial: 0),
+                .slider("cellSize", "Pixel Size", min: 0.0005, max: 0.02, initial: 0.002),
+                .slider("spread", "Spread", min: 0, max: 1.5, initial: 0.8),
+            ]
         }
     }
 
@@ -128,10 +162,10 @@ extension EffectType {
 }
 
 /// Renders an image layer's effect stack with Core Image.
-final class EffectPipeline {
+nonisolated final class EffectPipeline: @unchecked Sendable {
     static let shared = EffectPipeline()
 
-    private let context = CIContext(options: [.cacheIntermediates: false])
+    private var context: CIContext { CoreImageContext.shared }
 
     /// Applies enabled effects in order and returns a CGImage the same size as
     /// the input. `palette` feeds the Palette Map effect.
@@ -363,6 +397,18 @@ final class EffectPipeline {
 
         case .scanlines:
             return scanlines(image, extent: extent, minDim: minDim, params: p)
+
+        case .pixelSort:
+            return GlitchEffects.pixelSort(image, extent: extent, params: p)
+
+        case .datamosh:
+            return GlitchEffects.datamosh(image, extent: extent, minDim: minDim, params: p)
+
+        case .noiseShift:
+            return GlitchEffects.noiseShift(image, extent: extent, params: p)
+
+        case .dither:
+            return GlitchEffects.dither(image, extent: extent, minDim: minDim, palette: palette, params: p)
         }
     }
 

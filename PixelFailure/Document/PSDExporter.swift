@@ -16,12 +16,30 @@ enum PSDExporter {
         guard width > 0, height > 0 else { return nil }
         let items = renderStore.renderItems(model: model, quality: .full)
         let layers: [EncodedLayer] = model.layers.reversed().compactMap { layer in
-            var isolated = model
-            var visibleLayer = layer
-            visibleLayer.isVisible = true
-            isolated.layers = [visibleLayer]
-            guard let item = renderStore.renderItems(model: isolated, quality: .full).first else { return nil }
-            guard let image = PNGExporter.render(items: [item], background: .clear,
+            let item: RenderItem
+            if layer.kind.isAdjustment {
+                // An adjustment has no pixels of its own; the resolved scene
+                // carries it as the adjusted stack below, which reproduces it
+                // exactly as a pixel layer. Hidden adjustments are dropped.
+                guard let resolved = items.first(where: { $0.id == layer.id }) else { return nil }
+                item = resolved
+            } else {
+                // Pixels are written at full strength; opacity and blend mode
+                // live only in the layer record, so they apply exactly once.
+                var isolated = model
+                var flatLayer = layer
+                flatLayer.isVisible = true
+                flatLayer.opacity = 1
+                flatLayer.blendMode = .normal
+                flatLayer.clipsToBelow = false
+                isolated.layers = [flatLayer]
+                guard let resolved = renderStore.renderItems(model: isolated, quality: .full).first else { return nil }
+                item = resolved
+            }
+            var flat = item
+            flat.opacity = 1
+            flat.blendMode = .normal
+            guard let image = PNGExporter.render(items: [flat], background: .clear,
                                                  canvasSize: model.canvasSize,
                                                  targetPixelSize: model.canvasSize,
                                                  colorSettings: .default),
@@ -47,6 +65,12 @@ enum PSDExporter {
             let length = min(nameData.count, 255)
             extra.u8(UInt8(length)); extra.append(nameData.prefix(length))
             while extra.count % 4 != 0 { extra.u8(0) }
+            // Unicode name, so names outside Mac Roman survive the round trip.
+            let unicode = Array(encoded.layer.name.utf16)
+            var luni = Data(); luni.u32(UInt32(unicode.count))
+            for unit in unicode { luni.u16(unit) }
+            if !luni.count.isMultiple(of: 4) { luni.u16(0) }
+            extra.ascii("8BIM"); extra.ascii("luni"); extra.u32(UInt32(luni.count)); extra.append(luni)
             records.u32(UInt32(extra.count)); records.append(extra)
             for plane in encoded.planes { channelData.u16(0); channelData.append(contentsOf: plane) }
         }
@@ -79,7 +103,8 @@ enum PSDExporter {
                                       bitsPerComponent: 8, bytesPerRow: width * 4,
                                       space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                       bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
-        context.translateBy(x: 0, y: CGFloat(height)); context.scaleBy(x: 1, y: -1)
+        // Bitmap memory is already top-down, which is PSD's row order; a flip
+        // here wrote every layer (and the composite) upside down.
         context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
         var planes = [[UInt8](repeating: 0, count: width * height),
                       [UInt8](repeating: 0, count: width * height),

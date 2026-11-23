@@ -107,7 +107,7 @@ actor VisionSegmentation {
     private var refinePoints = 0
     private var refinePointLimit = 13
 
-    private let ciContext = CIContext(options: [.cacheIntermediates: false])
+    private var ciContext: CIContext { CoreImageContext.shared }
 
     func isPrepared(_ key: Key) -> Bool { self.key == key }
 

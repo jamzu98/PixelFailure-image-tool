@@ -8,6 +8,8 @@ nonisolated struct GeneratorContext {
     var palette: Palette
     /// Downsampled pixels of the source image layer, for image-driven generators.
     var sampler: ImageSampler?
+    /// Outline of the region layer, in the pattern's own coordinates.
+    var region: Path? = nil
 
     var minDimension: Double { Double(min(size.width, size.height)) }
 }
@@ -17,11 +19,15 @@ nonisolated protocol PatternGenerator: Sendable {
     var specs: [ParamSpec] { get }
     /// True for generators that reinterpret an existing image layer.
     var needsSourceImage: Bool { get }
+    /// True when these settings read an image layer. Defaults to
+    /// `needsSourceImage`; generators with an optional image mode override it.
+    func wantsSourceImage(_ params: ParamValues) -> Bool
     func generate(params: ParamValues, seed: UInt64, context: GeneratorContext) -> [VectorPrimitive]
 }
 
 nonisolated extension PatternGenerator {
     var needsSourceImage: Bool { false }
+    func wantsSourceImage(_ params: ParamValues) -> Bool { needsSourceImage }
 }
 
 nonisolated extension GeneratorType {
@@ -34,8 +40,30 @@ nonisolated extension GeneratorType {
         case .waves: WavesGenerator()
         case .rings: RingsGenerator()
         case .sampledGrid: SampledGridGenerator()
+        case .circlePacking: CirclePackingGenerator()
+        case .contours: ContoursGenerator()
+        case .stipple: StippleGenerator()
+        case .subdivision: SubdivisionGenerator()
+        case .spaceFilling: SpaceFillingGenerator()
+        case .lSystem: LSystemGenerator()
+        case .growth: GrowthGenerator()
+        case .waveTiles: WaveTilesGenerator()
+        case .stringArt: StringArtGenerator()
+        case .noiseField: NoiseFieldRasterGenerator()
+        case .voronoi: VoronoiRasterGenerator()
+        case .plasma: PlasmaRasterGenerator()
+        case .reactionDiffusion: ReactionDiffusionRasterGenerator()
         }
     }
+
+    /// Menu grouping: the original generators, the newer vector ones, and
+    /// the GPU raster ones.
+    static let groups: [[GeneratorType]] = [
+        [.gridLattice, .phyllotaxis, .flowField, .truchet, .waves, .rings, .sampledGrid],
+        [.circlePacking, .contours, .stipple, .subdivision, .spaceFilling, .lSystem, .growth,
+         .waveTiles, .stringArt],
+        [.noiseField, .voronoi, .plasma, .reactionDiffusion],
+    ]
 
     var displayName: String {
         switch self {
@@ -46,6 +74,19 @@ nonisolated extension GeneratorType {
         case .waves: "Interference Waves"
         case .rings: "Concentric Rings"
         case .sampledGrid: "Sampled Grid"
+        case .circlePacking: "Circle Packing"
+        case .contours: "Contours"
+        case .stipple: "Stipple"
+        case .subdivision: "Subdivision"
+        case .spaceFilling: "Space-Filling Curve"
+        case .lSystem: "L-System"
+        case .growth: "Differential Growth"
+        case .waveTiles: "Wave Tiles"
+        case .stringArt: "String Art"
+        case .noiseField: "Noise Field"
+        case .voronoi: "Voronoi"
+        case .plasma: "Plasma"
+        case .reactionDiffusion: "Reaction–Diffusion"
         }
     }
 }

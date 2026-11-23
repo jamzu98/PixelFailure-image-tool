@@ -670,7 +670,7 @@ struct InspectorView: View {
                             document.setPatternMask(on: layer.id, generator: generator,
                                                     renderStore: renderStore, undoManager: undoManager)
                         })) {
-                        ForEach(GeneratorType.allCases, id: \.self) { type in
+                        GeneratorMenuItems { type in
                             Text(type.displayName).tag(type)
                         }
                     }
@@ -711,7 +711,7 @@ struct InspectorView: View {
                         document.addMask(to: layer.id, hideAll: true, renderStore: renderStore, undoManager: undoManager)
                     }
                     Menu("Pattern") {
-                        ForEach(GeneratorType.allCases, id: \.self) { type in
+                        GeneratorMenuItems { type in
                             Button(type.displayName) {
                                 document.setPatternMask(on: layer.id, generator: type,
                                                         renderStore: renderStore, undoManager: undoManager)

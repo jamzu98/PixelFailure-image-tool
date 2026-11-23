@@ -131,6 +131,32 @@ final class RenderStore: ObservableObject {
     /// target layer's content (or mask) so painting previews live.
     var activePaintSession: PaintSession?
 
+    // MARK: Progressive resolution state
+
+    private struct BackgroundJobKey: Hashable {
+        let layerID: UUID
+        /// nil for vector primitives, which don't depend on the tier.
+        let quality: RenderQuality?
+    }
+
+    /// True while resolving for the viewport, which may show a lower tier or
+    /// the previous content while the exact result renders off the main actor.
+    private var isResolvingProgressively = false
+    /// Set when the scene being resolved borrowed any placeholder content.
+    private var resolveUsedPlaceholder = false
+    /// Hash each background job is computing, per layer and tier.
+    private var runningJobs: [BackgroundJobKey: Int] = [:]
+    /// The newest request that arrived while a job for the same key was
+    /// running. Only the latest survives, so slider drags never queue up.
+    private var queuedJobs: [BackgroundJobKey: (hash: Int, start: () -> Void)] = [:]
+    /// GPU-rendered raster patterns per layer and tier, keyed by content hash.
+    private var rasterPatterns: [RasterCacheKey: (hash: Int, image: CGImage)] = [:]
+    /// Most recent resolved raster per layer, any tier or hash.
+    private var latestImages: [UUID: CGImage] = [:]
+    /// Bumped by `invalidateResolved`, so results computed against dropped
+    /// caches are discarded.
+    private var cacheGeneration = 0
+
     init(document: PixelDocument) {
         self.document = document
     }
@@ -138,6 +164,15 @@ final class RenderStore: ObservableObject {
     // MARK: - Public
 
     func renderItems(model: ProjectModel, quality: RenderQuality) -> [RenderItem] {
+        renderItems(model: model, quality: quality, progressive: false)
+    }
+
+    /// With `progressive`, expensive layer content that isn't cached yet
+    /// (effect stacks on large images, regenerated patterns) renders on a
+    /// background task. Until it lands the scene uses the closest cached
+    /// content, and the finished result publishes a viewport invalidation.
+    /// Exporters use the default, which always resolves exactly.
+    func renderItems(model: ProjectModel, quality: RenderQuality, progressive: Bool) -> [RenderItem] {
         // Live paint is intentionally absent from ProjectModel, so it must not
         // read or populate a model-keyed scene entry.
         guard activePaintSession == nil else {
@@ -148,8 +183,12 @@ final class RenderStore: ObservableObject {
             touchScene(key)
             return cached
         }
+        isResolvingProgressively = progressive
+        resolveUsedPlaceholder = false
+        defer { isResolvingProgressively = false }
         let items = resolve(layers: model.layers, model: model, quality: quality)
-        storeScene(items, for: key)
+        // Scenes holding placeholders must never be served to an exporter.
+        if !resolveUsedPlaceholder { storeScene(items, for: key) }
         return items
     }
 
@@ -213,6 +252,11 @@ final class RenderStore: ObservableObject {
 
     /// Drops content caches; decoded originals stay (they never change per key).
     func invalidateResolved() {
+        cacheGeneration &+= 1
+        runningJobs.removeAll()
+        queuedJobs.removeAll()
+        latestImages.removeAll()
+        rasterPatterns.removeAll()
         resolvedImages.removeAll()
         sceneCache.removeAll()
         sceneCacheOrder.removeAll()
@@ -244,14 +288,7 @@ final class RenderStore: ObservableObject {
                 self?.renderBounds(for: layer, model: model) ?? .zero
             }
         }
-        guard region != .none else { return }
-        let next = ViewportInvalidation(revision: viewportInvalidation.revision &+ 1,
-                                        region: region)
-        invalidationLog.append(next)
-        if invalidationLog.count > invalidationLogLimit {
-            invalidationLog.removeFirst(invalidationLog.count - invalidationLogLimit)
-        }
-        viewportInvalidation = next
+        publish(region)
     }
 
     /// The newest revision with the union of every region published after
@@ -361,30 +398,41 @@ final class RenderStore: ObservableObject {
     private func resolve(layers: [Layer], model: ProjectModel,
                          quality: RenderQuality) -> [RenderItem] {
         var resolved: [RenderItem] = []
+        // The layer a run of clipped layers clips to. Every clipped layer in
+        // the run clips to this base, not to the clipped layer below it.
+        var clipBase: RenderItem?
         for layer in layers where layer.isVisible {
             if case .adjustment(let config) = layer.kind {
                 guard !resolved.isEmpty,
                       let base = canvasRaster(items: resolved, model: model, quality: quality) else { continue }
                 let adjusted = EffectPipeline.shared.apply(effects: config.effects, to: base,
                                                            palette: model.palette)
-                resolved.append(RenderItem(
+                let adjustmentItem = RenderItem(
                     id: layer.id, opacity: layer.opacity, blendMode: layer.blendMode,
                     transform: .identity, naturalSize: model.canvasSize,
                     content: .raster(adjusted), mask: renderMask(for: layer, model: model),
                     styles: layer.styles,
-                    svgWarning: "Adjustment layer rendered as a raster overlay."))
+                    svgWarning: "Adjustment layer rendered as a raster overlay.")
+                resolved.append(adjustmentItem)
+                clipBase = adjustmentItem
                 continue
             }
             guard var item = renderItem(for: layer, model: model, quality: quality) else { continue }
             item.styles = layer.styles
-            if layer.clipsToBelow, let base = resolved.last,
-               let clipped = clippedCanvas(item: item, base: base, model: model, quality: quality) {
-                item = RenderItem(id: layer.id, opacity: 1, blendMode: .normal,
-                                  transform: .identity, naturalSize: model.canvasSize,
-                                  content: .raster(clipped), mask: nil,
-                                  svgWarning: "Clipping mask rendered as a raster overlay.")
+            if layer.clipsToBelow, let base = clipBase {
+                if let clipped = clippedCanvas(item: item, base: base, model: model, quality: quality) {
+                    // The layer's own opacity and blend mode apply to the
+                    // clipped result as a whole, against everything below.
+                    item = RenderItem(id: layer.id, opacity: layer.opacity, blendMode: layer.blendMode,
+                                      transform: .identity, naturalSize: model.canvasSize,
+                                      content: .raster(clipped), mask: nil,
+                                      svgWarning: "Clipping mask rendered as a raster overlay.")
+                }
+                resolved.append(item)
+            } else {
+                resolved.append(item)
+                clipBase = item
             }
-            resolved.append(item)
         }
         return resolved
     }
@@ -409,9 +457,15 @@ final class RenderStore: ObservableObject {
                            colorSettings: renderSettings(model: model, quality: quality))
     }
 
+    /// The clipped layer's pixels (mask and styles included) limited to the
+    /// base's alpha. Opacity and blend mode are left out: the caller applies
+    /// them to the result so they composite against the whole stack below.
     private func clippedCanvas(item: RenderItem, base: RenderItem,
                                model: ProjectModel, quality: RenderQuality) -> CGImage? {
-        guard let foreground = canvasRaster(items: [item], model: model, quality: quality),
+        var flat = item
+        flat.opacity = 1
+        flat.blendMode = .normal
+        guard let foreground = canvasRaster(items: [flat], model: model, quality: quality),
               let alphaBase = canvasRaster(items: [base], model: model, quality: quality) else { return nil }
         let width = foreground.width, height = foreground.height
         guard let context = renderSettings(model: model, quality: quality)
@@ -426,6 +480,18 @@ final class RenderStore: ObservableObject {
     private func renderItem(for layer: Layer, model: ProjectModel, quality: RenderQuality) -> RenderItem? {
         let mask = renderMask(for: layer, model: model)
         switch layer.kind {
+        case .pattern(let config) where config.generator.isRaster:
+            guard let image = rasterPattern(for: layer, config: config, model: model, quality: quality) else { return nil }
+            return RenderItem(id: layer.id,
+                              opacity: layer.opacity,
+                              blendMode: layer.blendMode,
+                              transform: layer.transform.affine(naturalSize: model.canvasSize),
+                              naturalSize: model.canvasSize,
+                              content: .raster(image),
+                              clipsToBounds: true,
+                              deformation: layer.transform.deformation,
+                              mask: mask,
+                              svgWarning: "Raster pattern embedded as an image.")
         case .pattern, .text, .shape, .path:
             let result = primitivesResult(for: layer, model: model)
             return RenderItem(id: layer.id,
@@ -490,17 +556,19 @@ final class RenderStore: ObservableObject {
             return cached.mask
         }
         let grayscale: CGImage?
-        if let pattern = mask.pattern {
+        if let pattern = mask.pattern, pattern.generator.isRaster {
+            let palette = Palette(name: "Mask", hex: ["#000000", "#FFFFFF"])
+            grayscale = RasterPatternJob(config: pattern, size: mask.pixelSize, palette: palette,
+                                         colorSettings: .default).render()
+        } else if let pattern = mask.pattern {
             var sampler: ImageSampler?
-            if pattern.generator.generator.needsSourceImage,
+            if pattern.usesSourceImage,
                let source = sourceImageLayer(for: pattern, model: model) {
                 sampler = self.sampler(for: source, model: model)
             }
             let palette = Palette(name: "Mask", hex: ["#000000", "#FFFFFF", "#777777", "#CCCCCC", "#333333"])
             let context = GeneratorContext(size: mask.pixelSize, palette: palette, sampler: sampler)
-            let primitives = pattern.generator.generator.generate(params: pattern.params,
-                                                                  seed: pattern.seed,
-                                                                  context: context)
+            let primitives = pattern.generate(context: context)
             let item = RenderItem(id: layer.id, opacity: 1, blendMode: .normal,
                                   transform: .identity, naturalSize: mask.pixelSize,
                                   content: .primitives(primitives), mask: nil)
@@ -529,18 +597,28 @@ final class RenderStore: ObservableObject {
         switch layer.kind {
         case .pattern(let config):
             var sampler: ImageSampler?
-            if config.generator.generator.needsSourceImage {
+            if config.usesSourceImage {
                 if let sourceLayer = sourceImageLayer(for: config, model: model) {
                     hasher.combine(sourceLayer.kind)
                     sampler = self.sampler(for: sourceLayer, model: model)
                 }
             }
+            let region = regionPath(for: config, patternLayer: layer, model: model, hasher: &hasher)
             let hash = hasher.finalize()
             if let cached = primitives[layer.id], cached.hash == hash {
                 return (cached.primitives, cached.naturalSize)
             }
-            let context = GeneratorContext(size: model.canvasSize, palette: model.palette, sampler: sampler)
-            let prims = config.generator.generator.generate(params: config.params, seed: config.seed, context: context)
+            var context = GeneratorContext(size: model.canvasSize, palette: model.palette, sampler: sampler)
+            context.region = region
+            // A regenerated pattern keeps showing its previous output while
+            // the new one generates off-main; the first generation is inline.
+            if isResolvingProgressively, let stale = primitives[layer.id],
+               stale.naturalSize == model.canvasSize {
+                resolveUsedPlaceholder = true
+                schedulePrimitives(layerID: layer.id, hash: hash, config: config, context: context)
+                return (stale.primitives, stale.naturalSize)
+            }
+            let prims = config.generate(context: context)
             primitives[layer.id] = (hash, prims, model.canvasSize)
             return (prims, model.canvasSize)
 
@@ -592,6 +670,47 @@ final class RenderStore: ObservableObject {
         return model.layers.last(where: { $0.kind.isImage })
     }
 
+    /// The context a pattern layer generates in (canvas size, palette, image
+    /// sampler and region outline), for rendering variations off the main actor.
+    func generatorContext(for layer: Layer, config: PatternConfig, model: ProjectModel) -> GeneratorContext {
+        var sampler: ImageSampler?
+        if config.usesSourceImage, let source = sourceImageLayer(for: config, model: model) {
+            sampler = self.sampler(for: source, model: model)
+        }
+        var hasher = Hasher()
+        var context = GeneratorContext(size: model.canvasSize, palette: model.palette, sampler: sampler)
+        context.region = regionPath(for: config, patternLayer: layer, model: model, hasher: &hasher)
+        return context
+    }
+
+    /// The outline of a pattern's region layer (shape, text or path), mapped
+    /// into the pattern layer's own coordinates. Feeds the region's geometry
+    /// and placement into `hasher` so the pattern regenerates when it moves.
+    private func regionPath(for config: PatternConfig, patternLayer: Layer,
+                            model: ProjectModel, hasher: inout Hasher) -> Path? {
+        guard GenStages.regionMode(config.params) != .off,
+              let id = config.regionLayerID, id != patternLayer.id,
+              let regionLayer = model.layer(id: id) else { return nil }
+        switch regionLayer.kind {
+        case .shape, .text, .path: break
+        default: return nil
+        }
+        let result = primitivesResult(for: regionLayer, model: model)
+        var outline = Path()
+        for primitive in result.primitives { outline.addPath(primitive.path) }
+        let regionWorld = regionLayer.transform.affine(naturalSize: result.naturalSize)
+            .concatenating(model.parentAffine(of: id))
+        let patternWorld = patternLayer.transform.affine(naturalSize: model.canvasSize)
+            .concatenating(model.parentAffine(of: patternLayer.id))
+        guard patternWorld.isInvertible else { return nil }
+        let toPattern = regionWorld.concatenating(patternWorld.inverted())
+        hasher.combine(regionLayer.kind)
+        for value in [toPattern.a, toPattern.b, toPattern.c, toPattern.d, toPattern.tx, toPattern.ty] {
+            hasher.combine(Double(value))
+        }
+        return outline.applying(toPattern)
+    }
+
     /// Crop + effect chain, at preview or native resolution.
     func resolvedImage(for layer: Layer, config: ImageConfig, model: ProjectModel, quality: RenderQuality) -> CGImage? {
         // Live paint preview: show the in-flight buffer raw (effects re-apply
@@ -613,10 +732,12 @@ final class RenderStore: ObservableObject {
     }
 
     private func resolvedImageIgnoringSession(for layer: Layer, config: ImageConfig, model: ProjectModel, quality: RenderQuality) -> CGImage? {
+        // The tier is part of the cache key, so the hash covers content only
+        // and lets one tier stand in for another with identical content.
         var hasher = Hasher()
         hasher.combine(config)
         hasher.combine(model.palette)
-        hasher.combine(quality)
+        hasher.combine(model.colorSettings.workingSpace)
         let hash = hasher.finalize()
 
         let cacheKey = RasterCacheKey(layerID: layer.id, quality: quality)
@@ -624,25 +745,185 @@ final class RenderStore: ObservableObject {
             return cached.image
         }
 
-        guard var image = originalImage(key: config.imageKey) else { return nil }
+        let resident = originalImageIfResident(key: config.imageKey)
+        let request = ImageResolveRequest(
+            decoded: resident,
+            data: resident == nil ? document.imageData(for: config.imageKey) : nil,
+            crop: config.crop, maxDimension: quality.maxRasterDimension,
+            space: model.colorSettings.workingSpace,
+            effects: config.effects, palette: model.palette)
 
-        if let crop = config.crop {
-            let rect = CGRect(x: crop.minX * CGFloat(image.width),
-                              y: crop.minY * CGFloat(image.height),
-                              width: crop.width * CGFloat(image.width),
-                              height: crop.height * CGFloat(image.height)).integral
-            if let cropped = image.cropping(to: rect) { image = cropped }
+        if isResolvingProgressively, quality != .proxy, request.isExpensive,
+           let placeholder = placeholderImage(layerID: layer.id, hash: hash, quality: quality) {
+            resolveUsedPlaceholder = true
+            scheduleImage(layerID: layer.id, imageKey: config.imageKey, quality: quality,
+                          hash: hash, request: request)
+            return placeholder
         }
 
-        if let maxDim = quality.maxRasterDimension, max(image.width, image.height) > maxDim {
-            image = downsample(image, maxDimension: maxDim,
-                               space: model.colorSettings.workingSpace) ?? image
+        guard let resolved = request.resolve() else { return nil }
+        if let decoded = resolved.decoded { decodedImages[config.imageKey] = decoded }
+        resolvedImages[cacheKey] = (hash, resolved.image)
+        latestImages[layer.id] = resolved.image
+        return resolved.image
+    }
+
+    private func originalImageIfResident(key: String) -> CGImage? {
+        decodedImages[key] ?? document.residentImage(for: key)
+    }
+
+    /// The closest content to stand in for an uncached tier: the same content
+    /// at another tier first, then whatever this layer showed last.
+    private func placeholderImage(layerID: UUID, hash: Int, quality: RenderQuality) -> CGImage? {
+        let order: [RenderQuality] = quality == .full ? [.preview, .proxy] : [.full, .proxy]
+        for tier in order {
+            if let cached = resolvedImages[RasterCacheKey(layerID: layerID, quality: tier)],
+               cached.hash == hash { return cached.image }
         }
+        return latestImages[layerID]
+    }
 
-        let result = EffectPipeline.shared.apply(effects: config.effects, to: image, palette: model.palette)
+    /// A raster pattern at the tier's resolution. On the progressive path a
+    /// cache miss shows the closest earlier render while the GPU works.
+    private func rasterPattern(for layer: Layer, config: PatternConfig, model: ProjectModel,
+                               quality: RenderQuality) -> CGImage? {
+        var hasher = Hasher()
+        hasher.combine(config)
+        hasher.combine(model.palette)
+        hasher.combine(model.colorSettings)
+        hasher.combine(model.canvasSize.width)
+        hasher.combine(model.canvasSize.height)
+        let hash = hasher.finalize()
+        let key = RasterCacheKey(layerID: layer.id, quality: quality)
+        if let cached = rasterPatterns[key], cached.hash == hash { return cached.image }
 
-        resolvedImages[cacheKey] = (hash, result)
-        return result
+        let job = RasterPatternJob(config: config, size: targetSize(model: model, quality: quality),
+                                   palette: model.palette,
+                                   colorSettings: renderSettings(model: model, quality: quality))
+        if isResolvingProgressively, quality != .proxy {
+            let order: [RenderQuality] = quality == .full ? [.preview, .proxy] : [.full, .proxy]
+            let placeholder = order.lazy.compactMap { tier -> CGImage? in
+                guard let cached = self.rasterPatterns[RasterCacheKey(layerID: layer.id, quality: tier)],
+                      cached.hash == hash else { return nil }
+                return cached.image
+            }.first ?? latestImages[layer.id]
+            if let placeholder {
+                resolveUsedPlaceholder = true
+                scheduleRasterPattern(layerID: layer.id, quality: quality, hash: hash, job: job)
+                return placeholder
+            }
+        }
+        guard let image = job.render() else { return nil }
+        rasterPatterns[key] = (hash, image)
+        latestImages[layer.id] = image
+        return image
+    }
+
+    // MARK: - Background jobs
+
+    private func scheduleRasterPattern(layerID: UUID, quality: RenderQuality, hash: Int, job: RasterPatternJob) {
+        let key = BackgroundJobKey(layerID: layerID, quality: quality)
+        let generation = cacheGeneration
+        enqueue(key, hash: hash) { [weak self] in
+            Task.detached(priority: .userInitiated) {
+                let image = job.render()
+                await MainActor.run {
+                    guard let self else { return }
+                    defer { self.finishJob(key) }
+                    guard generation == self.cacheGeneration, let image else { return }
+                    self.rasterPatterns[RasterCacheKey(layerID: layerID, quality: quality)] = (hash, image)
+                    self.latestImages[layerID] = image
+                    self.backgroundContentDidChange(layerID: layerID)
+                }
+            }
+        }
+    }
+
+    private func scheduleImage(layerID: UUID, imageKey: String, quality: RenderQuality,
+                               hash: Int, request: ImageResolveRequest) {
+        let key = BackgroundJobKey(layerID: layerID, quality: quality)
+        let generation = cacheGeneration
+        enqueue(key, hash: hash) { [weak self] in
+            Task.detached(priority: .userInitiated) {
+                let resolved = request.resolve()
+                await MainActor.run {
+                    guard let self else { return }
+                    defer { self.finishJob(key) }
+                    guard generation == self.cacheGeneration, let resolved else { return }
+                    if let decoded = resolved.decoded { self.decodedImages[imageKey] = decoded }
+                    self.resolvedImages[RasterCacheKey(layerID: layerID, quality: quality)] = (hash, resolved.image)
+                    self.latestImages[layerID] = resolved.image
+                    self.backgroundContentDidChange(layerID: layerID)
+                }
+            }
+        }
+    }
+
+    private func schedulePrimitives(layerID: UUID, hash: Int, config: PatternConfig,
+                                    context: GeneratorContext) {
+        let key = BackgroundJobKey(layerID: layerID, quality: nil)
+        let generation = cacheGeneration
+        let job = PatternJob(config: config, context: context)
+        enqueue(key, hash: hash) { [weak self] in
+            Task.detached(priority: .userInitiated) {
+                let prims = job.generate()
+                await MainActor.run {
+                    guard let self else { return }
+                    defer { self.finishJob(key) }
+                    guard generation == self.cacheGeneration else { return }
+                    self.primitives[layerID] = (hash, prims, job.context.size)
+                    self.backgroundContentDidChange(layerID: layerID)
+                }
+            }
+        }
+    }
+
+    /// Starts a job unless the same result is already being computed. A
+    /// different request for a busy key waits, replacing any older waiter.
+    private func enqueue(_ key: BackgroundJobKey, hash: Int, start: @escaping () -> Void) {
+        if let running = runningJobs[key] {
+            if running != hash { queuedJobs[key] = (hash, start) }
+            return
+        }
+        runningJobs[key] = hash
+        start()
+    }
+
+    private func finishJob(_ key: BackgroundJobKey) {
+        runningJobs[key] = nil
+        if let next = queuedJobs.removeValue(forKey: key) {
+            runningJobs[key] = next.hash
+            next.start()
+        }
+    }
+
+    /// A background result landed: drop scenes that may hold its placeholder
+    /// and repaint what the layer covers.
+    private func backgroundContentDidChange(layerID: UUID) {
+        sceneCache.removeAll()
+        sceneCacheOrder.removeAll()
+        composites.removeAll()
+        let model = document.model
+        let region: RenderInvalidationRegion
+        if let layer = model.layer(id: layerID),
+           !model.allLayers.contains(where: { $0.kind.isAdjustment || $0.clipsToBelow }) {
+            let canvas = CGRect(origin: .zero, size: model.canvasSize)
+            let bounds = renderBounds(for: layer, model: model).intersection(canvas)
+            region = bounds.isNull || bounds.isEmpty ? .none : .rect(bounds)
+        } else {
+            region = .full
+        }
+        publish(region)
+    }
+
+    private func publish(_ region: RenderInvalidationRegion) {
+        guard region != .none else { return }
+        let next = ViewportInvalidation(revision: viewportInvalidation.revision &+ 1, region: region)
+        invalidationLog.append(next)
+        if invalidationLog.count > invalidationLogLimit {
+            invalidationLog.removeFirst(invalidationLog.count - invalidationLogLimit)
+        }
+        viewportInvalidation = next
     }
 
     private func storeScene(_ items: [RenderItem], for key: SceneCacheKey) {
@@ -670,23 +951,16 @@ final class RenderStore: ObservableObject {
         if let cached = samplers[layer.id], cached.hash == hash {
             return cached.sampler
         }
+        // The sampler is cached by content, so it must never be built from a
+        // progressive placeholder.
+        let wasProgressive = isResolvingProgressively
+        isResolvingProgressively = false
+        defer { isResolvingProgressively = wasProgressive }
         guard let resolved = resolvedImage(for: layer, config: config, model: model, quality: .preview),
               let sampler = ImageSampler(cgImage: resolved, maxDimension: 220,
                                          space: model.colorSettings.workingSpace) else { return nil }
         samplers[layer.id] = (hash, sampler)
         return sampler
-    }
-
-    private func downsample(_ image: CGImage, maxDimension: Int,
-                            space: WorkingColorSpace) -> CGImage? {
-        let scale = Double(maxDimension) / Double(max(image.width, image.height))
-        let w = max(1, Int(Double(image.width) * scale))
-        let h = max(1, Int(Double(image.height) * scale))
-        guard let ctx = ColorSettings(workingSpace: space, bitDepth: .eight)
-            .makeRGBAContext(width: w, height: h) else { return nil }
-        ctx.interpolationQuality = .high
-        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
-        return ctx.makeImage()
     }
 
     /// Canvas-space bounds of everything a layer draws (styles and
@@ -747,9 +1021,25 @@ enum RenderInvalidationPlanner {
             }
         }
 
+        // Layers a pattern reads from (source image, region outline): a change
+        // to one re-renders that whole pattern, not just the layer's own box.
+        var referenced = Set<UUID>()
+        for layer in newLayers {
+            guard let config = layer.patternConfig else { continue }
+            if config.usesSourceImage, let id = config.sourceImageLayerID { referenced.insert(id) }
+            if config.usesSourceImage, config.sourceImageLayerID == nil,
+               let fallback = newModel.layers.last(where: { $0.kind.isImage })?.id {
+                referenced.insert(fallback)
+            }
+            if GenStages.regionMode(config.params) != .off, let id = config.regionLayerID {
+                referenced.insert(id)
+            }
+        }
+
         var dirty: CGRect?
         for oldLayer in oldLayers {
             guard let newLayer = newModel.layer(id: oldLayer.id), oldLayer != newLayer else { continue }
+            if referenced.contains(oldLayer.id) { return .full }
             if oldLayer.kind.isGroup || newLayer.kind.isGroup
                 || oldLayer.kind.isAdjustment || newLayer.kind.isAdjustment
                 || oldLayer.clipsToBelow || newLayer.clipsToBelow {
@@ -764,5 +1054,92 @@ enum RenderInvalidationPlanner {
         let canvas = CGRect(origin: .zero, size: newModel.canvasSize)
         let clipped = dirty.intersection(canvas)
         return clipped.isNull || clipped.isEmpty ? .none : .rect(clipped)
+    }
+}
+
+/// Everything needed to resolve one image layer's pixels, captured on the
+/// main actor so the decode, crop, downsample and effect stack can run on
+/// any thread.
+nonisolated struct ImageResolveRequest: @unchecked Sendable {
+    var decoded: CGImage?
+    var data: Data?
+    var crop: CGRect?
+    var maxDimension: Int?
+    var space: WorkingColorSpace
+    var effects: [Effect]
+    var palette: Palette
+
+    /// Work worth moving off the main actor: an effect stack, a decode, or
+    /// a large downsample. Small cached images resolve inline.
+    var isExpensive: Bool {
+        if effects.contains(where: \.isEnabled) { return true }
+        guard let decoded else { return true }
+        if let maxDimension, max(decoded.width, decoded.height) > maxDimension * 2 { return true }
+        return false
+    }
+
+    /// The final pixels, plus the decoded original when this call decoded it.
+    func resolve() -> (image: CGImage, decoded: CGImage?)? {
+        var freshlyDecoded: CGImage?
+        var image: CGImage
+        if let decoded {
+            image = decoded
+        } else {
+            guard let data,
+                  let source = CGImageSourceCreateWithData(data as CFData, nil),
+                  let decoded = CGImageSourceCreateImageAtIndex(source, 0, [
+                      kCGImageSourceShouldCache: true,
+                  ] as CFDictionary) else { return nil }
+            image = decoded
+            freshlyDecoded = decoded
+        }
+        if let crop {
+            let rect = CGRect(x: crop.minX * CGFloat(image.width),
+                              y: crop.minY * CGFloat(image.height),
+                              width: crop.width * CGFloat(image.width),
+                              height: crop.height * CGFloat(image.height)).integral
+            if let cropped = image.cropping(to: rect) { image = cropped }
+        }
+        if let maxDimension, max(image.width, image.height) > maxDimension {
+            image = Self.downsample(image, maxDimension: maxDimension, space: space) ?? image
+        }
+        let result = EffectPipeline.shared.apply(effects: effects, to: image, palette: palette)
+        return (result, freshlyDecoded)
+    }
+
+    static func downsample(_ image: CGImage, maxDimension: Int, space: WorkingColorSpace) -> CGImage? {
+        let scale = Double(maxDimension) / Double(max(image.width, image.height))
+        let w = max(1, Int(Double(image.width) * scale))
+        let h = max(1, Int(Double(image.height) * scale))
+        guard let ctx = ColorSettings(workingSpace: space, bitDepth: .eight)
+            .makeRGBAContext(width: w, height: h) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage()
+    }
+}
+
+/// A pattern regeneration that can run on any thread. Generators are pure
+/// and seeded, so the result matches an inline generation exactly.
+nonisolated struct PatternJob: @unchecked Sendable {
+    let config: PatternConfig
+    let context: GeneratorContext
+
+    func generate() -> [VectorPrimitive] {
+        config.generate(context: context)
+    }
+}
+
+/// A raster pattern render that can run on any thread.
+nonisolated struct RasterPatternJob: @unchecked Sendable {
+    let config: PatternConfig
+    let size: CGSize
+    let palette: Palette
+    let colorSettings: ColorSettings
+
+    func render() -> CGImage? {
+        guard let generator = config.generator.generator as? any RasterGenerator else { return nil }
+        return generator.render(params: config.params, seed: config.seed, pixelSize: size,
+                                palette: palette, colorSettings: colorSettings)
     }
 }

@@ -8,6 +8,9 @@ struct PatternInspector: View {
     let renderStore: RenderStore
     @Environment(\.undoManager) private var undoManager
     @State private var showVariations = false
+    @State private var showSavePreset = false
+    @State private var presetName = ""
+    private var userPresets: UserPresetStore { .shared }
 
     private var selectedKeyframe: AnimationKeyframe? {
         guard editorState.animationLayerID == layerID,
@@ -31,6 +34,7 @@ struct PatternInspector: View {
     }
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
         InspectorSection("Pattern") {
             if editorState.animationLayerID == layerID {
                 if let selectedKeyframe {
@@ -49,7 +53,7 @@ struct PatternInspector: View {
                 get: { config.generator },
                 set: { switchGenerator(to: $0) }
             )) {
-                ForEach(GeneratorType.allCases, id: \.self) { type in
+                GeneratorMenuItems { type in
                     Text(type.displayName).tag(type)
                 }
             }
@@ -76,6 +80,8 @@ struct PatternInspector: View {
                     }
                     .buttonStyle(IconButtonStyle(size: 22))
                     .help("Randomize (⌥⌘R)")
+
+                    seedHistoryMenu
                 }
                 .disabled(animationIsReadOnly)
             }
@@ -97,29 +103,219 @@ struct PatternInspector: View {
                 }
             }
 
-            if config.generator.generator.needsSourceImage {
+            if config.generator.generator.wantsSourceImage(displayedConfig.params) {
                 sourceImagePicker
             }
 
             ParamControls(document: document,
                           specs: config.generator.generator.specs,
-                          values: displayedConfig.params) { model, key, value in
-                if let keyframeID = editorState.selectedAnimationKeyframeID,
-                   editorState.animationLayerID == layerID,
-                   let index = model.animation.keyframes.firstIndex(where: { $0.id == keyframeID }) {
-                    model.animation.keyframes[index].parameters[key] = value
-                } else {
-                    model.modifyLayer(id: layerID) { layer in
-                        layer.modifyPattern { $0.params.set(key, value) }
-                    }
-                }
-            }
+                          values: displayedConfig.params, write: writeParam,
+                          locked: config.lockedParams, onToggleLock: toggleLock)
             .disabled(animationIsReadOnly)
+        } accessory: {
+            presetMenu
+        }
+        if !config.generator.isRaster {
+            stageSections
+        }
         }
         .sheet(isPresented: $showVariations) {
             VariationsSheet(document: document, layerID: layerID,
                             baseConfig: displayedConfig, renderStore: renderStore,
                             keyframeID: selectedKeyframe?.id)
+        }
+        .alert("Save Preset", isPresented: $showSavePreset) {
+            TextField("Name", text: $presetName)
+            Button("Save") {
+                userPresets.save(GeneratorPreset.capture(config, name: presetName))
+            }
+            Button("Cancel", role: .cancel) {}
+        }
+        .onChange(of: config.seed) { oldSeed, _ in
+            editorState.recordSeed(oldSeed, for: layerID)
+        }
+    }
+
+    // MARK: - Presets, locks and seed history
+
+    private var presetMenu: some View {
+        Menu {
+            let builtIn = BuiltInGeneratorPresets.presets(for: config.generator)
+            if !builtIn.isEmpty {
+                Section("Presets") {
+                    ForEach(builtIn) { preset in
+                        Button(preset.name) { apply(preset) }
+                    }
+                }
+            }
+            let saved = userPresets.presets(for: config.generator)
+            if !saved.isEmpty {
+                Section("My Presets") {
+                    ForEach(saved) { preset in
+                        Button(preset.name) { apply(preset) }
+                    }
+                }
+            }
+            Divider()
+            Button("Save Current…") {
+                presetName = config.generator.displayName
+                showSavePreset = true
+            }
+            if !saved.isEmpty {
+                Menu("Delete") {
+                    ForEach(saved) { preset in
+                        Button(preset.name, role: .destructive) { userPresets.remove(preset) }
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "square.stack")
+                .font(.system(size: 10.5))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Presets")
+        .disabled(animationIsReadOnly)
+    }
+
+    private func apply(_ preset: GeneratorPreset) {
+        document.update(undoManager, actionName: "Apply Preset “\(preset.name)”") { model in
+            model.modifyLayer(id: layerID) { layer in
+                layer.modifyPattern { $0 = preset.applied(to: $0) }
+            }
+        }
+    }
+
+    private func toggleLock(_ key: String) {
+        document.update(undoManager, actionName: "Lock Parameter") { model in
+            model.modifyLayer(id: layerID) { layer in
+                layer.modifyPattern { pattern in
+                    if pattern.lockedParams.contains(key) {
+                        pattern.lockedParams.remove(key)
+                    } else {
+                        pattern.lockedParams.insert(key)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var seedHistoryMenu: some View {
+        let history = (editorState.seedHistory[layerID] ?? []).filter { $0 != config.seed }
+        Menu {
+            ForEach(history, id: \.self) { seed in
+                Button("Seed \(seed % 100000)") {
+                    document.update(undoManager, actionName: "Restore Seed") { model in
+                        model.modifyLayer(id: layerID) { layer in
+                            layer.modifyPattern { $0.seed = seed }
+                        }
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.system(size: 10.5))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .disabled(history.isEmpty || selectedKeyframe != nil)
+        .help("Earlier Seeds")
+    }
+
+    /// Writes one parameter to the selected keyframe while animating, or to
+    /// the layer's pattern otherwise.
+    private func writeParam(_ model: inout ProjectModel, _ key: String, _ value: Double) {
+        if let keyframeID = editorState.selectedAnimationKeyframeID,
+           editorState.animationLayerID == layerID,
+           let index = model.animation.keyframes.firstIndex(where: { $0.id == keyframeID }) {
+            model.animation.keyframes[index].parameters[key] = value
+        } else {
+            // Turning a region on with nothing chosen picks the topmost
+            // shape, text or path layer, so the change is visible at once.
+            let candidate = model.allLayers.last { layer in
+                guard layer.id != layerID else { return false }
+                switch layer.kind {
+                case .shape, .text, .path: return true
+                default: return false
+                }
+            }?.id
+            model.modifyLayer(id: layerID) { layer in
+                layer.modifyPattern { pattern in
+                    pattern.params.set(key, value)
+                    if key == "stage.region", value != 0, pattern.regionLayerID == nil {
+                        pattern.regionLayerID = candidate
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Shared stages
+
+    @ViewBuilder
+    private var stageSections: some View {
+        let params = displayedConfig.params
+        let symmetry = GenStages.symmetry(params)
+        let repeats = GenStages.repeatCount(params) > 1
+        InspectorSection("Symmetry") {
+            ParamControls(document: document,
+                          specs: GenStages.symmetrySpecs.filter { spec in
+                              switch spec.key {
+                              case "stage.segments": symmetry.usesSegments
+                              case "stage.centerX", "stage.centerY": symmetry != .none
+                              default: true
+                              }
+                          } + GenStages.repeatSpecs.filter { $0.key != "stage.brick" || repeats },
+                          values: params, write: writeParam)
+            .disabled(animationIsReadOnly)
+        }
+        InspectorSection("Region & Color") {
+            ParamControls(document: document, specs: GenStages.regionSpecs,
+                          values: params, write: writeParam)
+            if GenStages.regionMode(params) != .off {
+                regionPicker
+            }
+            ParamControls(document: document, specs: GenStages.colorSpecs,
+                          values: params, write: writeParam)
+            if GenStages.colorSource(params) == .image, !config.generator.generator.wantsSourceImage(params) {
+                sourceImagePicker
+            }
+        }
+        .disabled(animationIsReadOnly)
+    }
+
+    /// Shape, text and path layers can act as a region.
+    @ViewBuilder
+    private var regionPicker: some View {
+        let candidates = document.model.allLayers.filter { layer in
+            guard layer.id != layerID else { return false }
+            switch layer.kind {
+            case .shape, .text, .path: return true
+            default: return false
+            }
+        }
+        if candidates.isEmpty {
+            Label("Needs a shape, text or path layer", systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(Theme.warning)
+        } else {
+            PanelPicker("Layer", selection: Binding(
+                get: { config.regionLayerID },
+                set: { newValue in
+                    document.update(undoManager, actionName: "Region Layer") { model in
+                        model.modifyLayer(id: layerID) { layer in
+                            layer.modifyPattern { $0.regionLayerID = newValue }
+                        }
+                    }
+                }
+            )) {
+                Text("None").tag(UUID?.none)
+                ForEach(candidates) { layer in
+                    Text(layer.name).tag(Optional(layer.id))
+                }
+            }
         }
     }
 
@@ -133,7 +329,8 @@ struct PatternInspector: View {
         var params = displayedConfig.params
         if randomizeParams {
             params = ParamValues.randomized(specs: config.generator.generator.specs,
-                                             seed: seed, keeping: params)
+                                             seed: seed, keeping: params,
+                                             locked: config.lockedParams)
         }
         document.updateAnimationKeyframe(keyframe.id, seed: seed,
                                          parameters: randomizeParams ? params : nil,
@@ -160,6 +357,12 @@ struct PatternInspector: View {
                             migrated.storage[spec.key] = existing
                         }
                     }
+                    // Symmetry, region and color stages belong to the layer,
+                    // not the algorithm, so they survive the switch.
+                    for key in GenStages.keys {
+                        if let existing = pattern.params.storage[key] { migrated.storage[key] = existing }
+                    }
+                    pattern.lockedParams.formIntersection(Set(newSpecs.map(\.key)))
                     pattern.generator = newType
                     pattern.params = migrated
                     if newType.generator.needsSourceImage, pattern.sourceImageLayerID == nil {
@@ -201,12 +404,16 @@ struct PatternInspector: View {
 }
 
 private struct VariationPreview: Identifiable {
-    let id = UUID()
+    let id: Int
     let seed: UInt64
     let params: ParamValues
-    let image: CGImage
+    var image: CGImage?
+    let isCurrent: Bool
 }
 
+/// Twelve takes on the current pattern, rendered off the main actor and
+/// filled in as they finish. "Mutate" nudges unlocked parameters around the
+/// current look; "Wild" randomizes them. The first cell is the current state.
 private struct VariationsSheet: View {
     @ObservedObject var document: PixelDocument
     let layerID: UUID
@@ -217,85 +424,162 @@ private struct VariationsSheet: View {
     @Environment(\.undoManager) private var undoManager
     @State private var batchSeed = SeededRNG.randomSeed()
     @State private var previews: [VariationPreview] = []
+    @State private var wild = false
+    @State private var strength = 0.25
+    @State private var keepSeed = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                VStack(alignment: .leading) {
-                    Text("Variations").font(.title2.weight(.semibold))
-                    Text("Click one to apply it.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+            HStack(spacing: 10) {
+                Text("Variations").font(.title2.weight(.semibold))
                 Spacer()
-                Button("Regenerate") { batchSeed = SeededRNG.randomSeed() }
-                Button("Cancel") { dismiss() }
+                Picker("", selection: $wild) {
+                    Text("Mutate").tag(false)
+                    Text("Wild").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 150)
+                if !wild {
+                    Text("Strength").foregroundStyle(.secondary)
+                    Slider(value: $strength, in: 0.05...0.8) { editing in
+                        if !editing { batchSeed = SeededRNG.randomSeed() }
+                    }
+                    .frame(width: 110)
+                }
+                Toggle("Keep Seed", isOn: $keepSeed)
+                Button {
+                    batchSeed = SeededRNG.randomSeed()
+                } label: { Image(systemName: "arrow.clockwise") }
+                .help("New Batch")
+                Button("Done") { dismiss() }
             }
-            if previews.isEmpty {
-                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
-                        ForEach(previews) { preview in
-                            Button {
-                                if let keyframeID {
-                                    document.applyAnimationVariation(seed: preview.seed, params: preview.params,
-                                                                     keyframeID: keyframeID,
-                                                                     undoManager: undoManager)
-                                } else {
-                                    document.applyPatternVariation(seed: preview.seed, params: preview.params,
-                                                                   layerID: layerID,
-                                                                   undoManager: undoManager)
+            ScrollView {
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4), spacing: 8) {
+                    ForEach(previews) { preview in
+                        Button {
+                            choose(preview)
+                        } label: {
+                            VStack(spacing: 4) {
+                                ZStack {
+                                    Rectangle().fill(Color.primary.opacity(0.04))
+                                    if let image = preview.image {
+                                        Image(decorative: image, scale: 1)
+                                            .resizable().aspectRatio(contentMode: .fit)
+                                    } else {
+                                        ProgressView().controlSize(.small)
+                                    }
                                 }
-                                dismiss()
-                            } label: {
-                                VStack(spacing: 4) {
-                                    Image(decorative: preview.image, scale: 1)
-                                        .resizable().aspectRatio(contentMode: .fit)
-                                    Text("Seed \(preview.seed % 100000)")
-                                        .font(.caption.monospacedDigit())
-                                        .lineLimit(1)
-                                        .frame(maxWidth: .infinity)
-                                }
-                                .padding(5)
-                                .background(Color.primary.opacity(0.05),
-                                            in: RoundedRectangle(cornerRadius: 7))
+                                .aspectRatio(document.model.canvasSize.width / max(document.model.canvasSize.height, 1),
+                                             contentMode: .fit)
+                                Text(preview.isCurrent ? "Current" : "Seed \(preview.seed % 100000)")
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(preview.isCurrent ? Theme.accent : .secondary)
+                                    .lineLimit(1)
+                                    .frame(maxWidth: .infinity)
                             }
-                            .buttonStyle(.plain)
+                            .padding(5)
+                            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 7))
                         }
+                        .buttonStyle(.plain)
                     }
                 }
             }
         }
         .padding(16)
-        .frame(minWidth: 560, idealWidth: 760, maxWidth: 900,
-               minHeight: 420, idealHeight: 700, maxHeight: 760)
-        .task(id: batchSeed) { generate() }
+        .frame(minWidth: 720, idealWidth: 900, maxWidth: 1100, minHeight: 480, idealHeight: 720, maxHeight: 820)
+        .task(id: TaskKey(seed: batchSeed, wild: wild, keepSeed: keepSeed)) { await generate() }
     }
 
-    private func generate() {
-        previews = []
+    private struct TaskKey: Equatable { let seed: UInt64; let wild: Bool; let keepSeed: Bool }
+
+    private func choose(_ preview: VariationPreview) {
+        guard !preview.isCurrent else { dismiss(); return }
+        if let keyframeID {
+            document.applyAnimationVariation(seed: preview.seed, params: preview.params,
+                                             keyframeID: keyframeID, undoManager: undoManager)
+        } else {
+            document.applyPatternVariation(seed: preview.seed, params: preview.params,
+                                           layerID: layerID, undoManager: undoManager)
+        }
+        dismiss()
+    }
+
+    private func generate() async {
+        let model = document.model
+        guard let layer = model.layer(id: layerID) else { return }
+        let specs = baseConfig.generator.generator.specs
         var rng = SeededRNG(seed: batchSeed ^ baseConfig.seed)
-        let seeds = (0..<9).map { _ in rng.next() }
-        let canvas = document.model.canvasSize
-        let maxDimension = 220.0
-        let scale = min(1, maxDimension / Double(max(canvas.width, canvas.height)))
+        var takes: [(UInt64, ParamValues)] = [(baseConfig.seed, baseConfig.params)]
+        for _ in 0..<11 {
+            let draw = rng.next()
+            let seed = keepSeed ? baseConfig.seed : draw
+            let params = wild
+                ? ParamValues.randomized(specs: specs, seed: draw, keeping: baseConfig.params,
+                                         locked: baseConfig.lockedParams)
+                : ParamValues.mutated(specs: specs, seed: draw, from: baseConfig.params,
+                                      strength: strength, locked: baseConfig.lockedParams)
+            takes.append((seed, params))
+        }
+        previews = takes.enumerated().map { index, take in
+            VariationPreview(id: index, seed: take.0, params: take.1, image: nil, isCurrent: index == 0)
+        }
+
+        // Everything else in the document comes from the cached scene; only
+        // the pattern layer is regenerated per take.
+        let items = renderStore.renderItems(model: model, quality: .preview)
+        let context = renderStore.generatorContext(for: layer, config: baseConfig, model: model)
+        let canvas = model.canvasSize
+        let scale = min(1, 360 / Double(max(canvas.width, canvas.height)))
         let size = CGSize(width: max(16, (canvas.width * scale).rounded()),
                           height: max(16, (canvas.height * scale).rounded()))
-        previews = seeds.compactMap { seed in
-            var model = document.model
-            let params = ParamValues.randomized(specs: baseConfig.generator.generator.specs,
-                                                seed: seed, keeping: baseConfig.params)
-            model.modifyLayer(id: layerID) {
-                $0.modifyPattern {
-                    $0.seed = seed
-                    $0.params = params
-                }
+        let job = VariationRenderJob(items: items, layerID: layerID, context: context, canvas: canvas,
+                                     size: size, background: model.background,
+                                     colorSettings: model.colorSettings.previewVariant)
+        await withTaskGroup(of: (Int, CGImage?).self) { group in
+            for (index, take) in takes.enumerated() {
+                var config = baseConfig
+                config.seed = take.0
+                config.params = take.1
+                group.addTask(priority: .userInitiated) { (index, job.render(config)) }
             }
-            let items = renderStore.renderItems(model: model, quality: .preview)
-            guard let image = PNGExporter.render(items: items, background: model.background,
-                                                 canvasSize: canvas, targetPixelSize: size,
-                                                 colorSettings: model.colorSettings.previewVariant) else { return nil }
-            return VariationPreview(seed: seed, params: params, image: image)
+            for await (index, image) in group {
+                guard !Task.isCancelled, previews.indices.contains(index) else { continue }
+                previews[index].image = image
+            }
         }
+    }
+}
+
+/// Renders one variation: the cached scene with the pattern layer's content
+/// swapped for the variation's. Runs on any thread.
+private nonisolated struct VariationRenderJob: @unchecked Sendable {
+    let items: [RenderItem]
+    let layerID: UUID
+    let context: GeneratorContext
+    let canvas: CGSize
+    let size: CGSize
+    let background: RGBAColor
+    let colorSettings: ColorSettings
+
+    func render(_ config: PatternConfig) -> CGImage? {
+        let content: RenderItem.Content
+        if config.generator.isRaster {
+            guard let image = RasterPatternJob(config: config, size: size, palette: context.palette,
+                                               colorSettings: colorSettings).render() else { return nil }
+            content = .raster(image)
+        } else {
+            content = .primitives(config.generate(context: context))
+        }
+        var scene = items
+        if let index = scene.firstIndex(where: { $0.id == layerID }) {
+            scene[index].content = content
+        } else {
+            // Nested in a group: show the pattern on its own.
+            scene = [RenderItem(id: layerID, opacity: 1, blendMode: .normal, transform: .identity,
+                                naturalSize: canvas, content: content, clipsToBounds: true, mask: nil)]
+        }
+        return PNGExporter.render(items: scene, background: background, canvasSize: canvas,
+                                  targetPixelSize: size, colorSettings: colorSettings)
     }
 }

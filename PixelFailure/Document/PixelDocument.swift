@@ -34,11 +34,17 @@ final class PixelDocument: ReferenceFileDocument, @unchecked Sendable {
     @Published var model: ProjectModel
     @Published private(set) var history: [Checkpoint] = []
     @Published private(set) var checkpoints: [Checkpoint] = []
+    /// Created by Recover; such a window never offers another archive, so
+    /// recoveries don't chain from window to window. Not persisted.
+    private(set) var isRecovered = false
     @MainActor lazy var actionRecorder = ActionRecorder()
     /// True only while a continuous editor gesture is changing the model.
     /// The viewport uses this transient state to render a lightweight proxy,
     /// then restores native-resolution content after the gesture settles.
     @Published private(set) var isContinuousEditing = false
+    /// Name of the pixel operation running in the background, if any. One
+    /// runs at a time; the status bar shows it.
+    @Published var backgroundTaskLabel: String?
     /// Raw data of imported images, keyed by file name inside images/.
     /// Append-only within a session so undo can always resolve references.
     private(set) var images: [String: Data]
@@ -96,8 +102,21 @@ final class PixelDocument: ReferenceFileDocument, @unchecked Sendable {
     }
 
     func snapshot(contentType: UTType) throws -> Snapshot {
-        for key in Array(pendingImages.keys) { _ = flushPendingImage(key) }
-        return Snapshot(model: model, images: images, checkpoints: checkpoints)
+        let live = liveImageKeys
+        for key in Array(pendingImages.keys) where live.contains(key) { _ = flushPendingImage(key) }
+        // The in-memory store stays append-only so undo can always resolve
+        // older keys; only images something can still reach are persisted.
+        return Snapshot(model: model, images: images.filter { live.contains($0.key) },
+                        checkpoints: checkpoints)
+    }
+
+    /// Image keys reachable from what a saved package can reopen: the current
+    /// model and named snapshots. Undo and the History panel are session-only,
+    /// so strokes that were painted over are not written to disk.
+    var liveImageKeys: Set<String> {
+        var keys = model.referencedImageKeys
+        for state in checkpoints { keys.formUnion(state.model.referencedImageKeys) }
+        return keys
     }
 
     func fileWrapper(snapshot: Snapshot, configuration: WriteConfiguration) throws -> FileWrapper {
@@ -110,8 +129,18 @@ final class PixelDocument: ReferenceFileDocument, @unchecked Sendable {
         manifestWrapper.preferredFilename = "manifest.json"
         root.addFileWrapper(manifestWrapper)
 
-        let imagesDir = FileWrapper(directoryWithFileWrappers:
-            snapshot.images.mapValues { FileWrapper(regularFileWithContents: $0) })
+        // Keys are immutable UUIDs, so an image already in the saved package
+        // never changes. Reusing its wrapper lets the write skip it.
+        let existing = configuration.existingFile?.fileWrappers?["images"]?.fileWrappers ?? [:]
+        var children: [String: FileWrapper] = [:]
+        for (key, data) in snapshot.images {
+            if let wrapper = existing[key], wrapper.isRegularFile {
+                children[key] = wrapper
+            } else {
+                children[key] = FileWrapper(regularFileWithContents: data)
+            }
+        }
+        let imagesDir = FileWrapper(directoryWithFileWrappers: children)
         imagesDir.preferredFilename = "images"
         root.addFileWrapper(imagesDir)
         if !snapshot.checkpoints.isEmpty {
@@ -214,6 +243,16 @@ final class PixelDocument: ReferenceFileDocument, @unchecked Sendable {
     func restoreCheckpoint(_ id: UUID, undoManager: UndoManager?) {
         guard let state = checkpoints.first(where: { $0.id == id }) else { return }
         update(undoManager, actionName: "Restore Snapshot") { $0 = state.model }
+    }
+
+    /// A new, untitled document holding an archive's content, so recovering
+    /// never replaces what another window shows.
+    @MainActor
+    static func recovered(from archive: RecoveryArchive) -> PixelDocument {
+        let document = PixelDocument(model: archive.model)
+        document.restoreRecovery(archive)
+        document.isRecovered = true
+        return document
     }
 
     @MainActor

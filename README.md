@@ -6,7 +6,7 @@ PixelFailure is a macOS image editor built with SwiftUI. It combines seeded gene
 
 ## What it does
 
-- **Generators.** Flow fields, waves, rings, phyllotaxis, Truchet tiles, grids and image-sampled mosaics. Every generator is seeded, so the same settings always give the same output.
+- **Generators.** Twenty seeded generators: flow fields, waves, rings, phyllotaxis, Truchet tiles, grids, image mosaics, circle packing, contours, stippling, subdivision, space-filling curves, L-systems, differential growth, wave-function tiles and string art, plus GPU noise fields, Voronoi, plasma and reaction–diffusion. Any vector generator can be mirrored, kaleidoscoped, tiled, clipped to a shape or text, or colored from an image. Presets, parameter locks and a Variations grid help explore, and the same settings always give the same output.
 - **Layers.** Image, pattern, shape, text, fill, paint, path, adjustment and group layers, with masks, opacity, blend modes and clipping.
 - **Color.** sRGB or Display P3 documents at 8 or 16 bits per channel. Embedded profiles are kept on import and written on export.
 - **Non-destructive editing.** Transforms and effect stacks don't touch the original pixels. History states can be named, and you can take snapshots.
@@ -18,14 +18,14 @@ PixelFailure is a macOS image editor built with SwiftUI. It combines seeded gene
 
 ## Export formats
 
-PNG, JPEG, TIFF, HEIC, WebP, PDF, SVG and layered PSD. Raster formats can embed a color profile. SVG export keeps supported patterns, shapes and outlined text as real vectors instead of rasterizing them.
+PNG, JPEG, TIFF, HEIC, WebP, PDF, SVG (including a plotter-ready mode) and layered PSD. Raster formats can embed a color profile. SVG export keeps supported patterns, shapes and outlined text as real vectors instead of rasterizing them.
 
 Projects are saved as `.pixelfailure` document packages that contain everything the project needs.
 
 ## Requirements
 
-- macOS 15.0 or later
-- Xcode 16 or later
+- macOS 27.0 or later (smart selection uses Vision APIs new in macOS 27)
+- Xcode 27 or later
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen), if you need to regenerate the Xcode project
 
 ## Building

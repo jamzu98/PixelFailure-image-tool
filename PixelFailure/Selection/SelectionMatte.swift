@@ -187,7 +187,7 @@ nonisolated struct SelectionMatte: @unchecked Sendable {
 
     // MARK: - Helpers
 
-    private static let ciContext = CIContext(options: [.cacheIntermediates: false])
+    private static var ciContext: CIContext { CoreImageContext.shared }
 
     private static func cappedSize(width: Int, height: Int) -> (Int, Int) {
         let longSide = max(width, height, 1)

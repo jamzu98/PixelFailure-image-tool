@@ -16,7 +16,7 @@ struct PixelFailureApp: App {
         DocumentGroup(newDocument: {
             PixelDocument(model: NewDocumentStore.loadLastUsed().makeModel())
         }) { configuration in
-            EditorView(document: configuration.document)
+            EditorView(document: configuration.document, fileURL: configuration.fileURL)
         }
         .defaultSize(width: 1440, height: 900)
         // One slim bar: title and toolbar items share a single compact row.
@@ -104,6 +104,7 @@ struct FileCommands: Commands {
     @Environment(\.openWindow) private var openWindow
     @Environment(\.newDocument) private var newDocument
     @Environment(\.openDocument) private var openDocument
+    @Environment(\.dismissWindow) private var dismissWindow
     @FocusedValue(\.editorFocus) private var focus
 
     private var launcher: DocumentLauncher {
@@ -111,6 +112,10 @@ struct FileCommands: Commands {
     }
 
     var body: some Commands {
+        let _ = ExternalOpenRouter.shared.install(
+            DocumentLauncher(newDocument: newDocument, openDocument: openDocument) {
+                dismissWindow(id: HomeModel.windowID)
+            })
         CommandGroup(replacing: .newItem) {
             AppActionButton(action: .newDocument) { HomeModel.shared.show(.new, using: openWindow) }
             AppActionButton(action: .newBlankCanvas) {
@@ -305,7 +310,7 @@ struct LayerCommands: Commands {
             Menu("New") {
                 if let focus {
                     Menu("Pattern") {
-                        ForEach(GeneratorType.allCases, id: \.self) { type in
+                        GeneratorMenuItems { type in
                             Button(type.displayName) {
                                 focus.editorState.selectedLayerID =
                                     focus.document.addPatternLayer(type, undoManager: focus.undoManager)
@@ -398,8 +403,14 @@ struct LayerCommands: Commands {
 
             Button("Super Resolution 2×") {
                 guard let focus, let id = focus.editorState.selectedLayerID else { return }
-                focus.document.superResolveLayer(layerID: id, renderStore: focus.renderStore,
-                                                 undoManager: focus.undoManager)
+                let outcome = focus.document.superResolveLayer(layerID: id, renderStore: focus.renderStore,
+                                                               undoManager: focus.undoManager)
+                if outcome == .tooLarge {
+                    let alert = NSAlert()
+                    alert.messageText = "Layer Too Large"
+                    alert.informativeText = "Super Resolution output is limited to \(PixelDocument.superResolutionMaxDimension) px on the long side."
+                    alert.runModal()
+                }
             }
             .disabled(focus?.editorState.selectedLayerID.flatMap {
                 focus?.document.model.layer(id: $0)?.kind.isImage

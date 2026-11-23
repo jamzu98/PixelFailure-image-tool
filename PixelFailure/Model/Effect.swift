@@ -27,6 +27,20 @@ nonisolated enum EffectType: String, Codable, CaseIterable, Hashable, Sendable {
     case sliceGlitch
     case chromaticAberration
     case scanlines
+    case pixelSort
+    case datamosh
+    case noiseShift
+    case dither
+
+    /// Menu sections for the add-effect menu.
+    static let groups: [(title: String, types: [EffectType])] = [
+        ("Tone & Color", [.adjust, .curves, .levels, .targetedHSL, .whiteBalance, .vibrance,
+                          .shadowsHighlights, .rawDevelop]),
+        ("Detail", [.blur, .sharpen, .noiseReduction, .lensCorrection, .grain, .bloom]),
+        ("Stylize", [.pixelate, .hexPixelate, .halftone, .lineScreen, .posterize, .threshold, .duotone]),
+        ("Glitch", [.sliceGlitch, .chromaticAberration, .scanlines, .pixelSort, .datamosh, .noiseShift,
+                    .dither]),
+    ]
 
     var displayName: String {
         switch self {
@@ -54,6 +68,10 @@ nonisolated enum EffectType: String, Codable, CaseIterable, Hashable, Sendable {
         case .sliceGlitch: "Slice Glitch"
         case .chromaticAberration: "Chromatic Aberration"
         case .scanlines: "Scanlines"
+        case .pixelSort: "Pixel Sort"
+        case .datamosh: "Datamosh"
+        case .noiseShift: "Noise RGB Shift"
+        case .dither: "Dither"
         }
     }
 }

@@ -123,7 +123,7 @@ enum SelectionRasterizer {
                 .translatedBy(x: 0, y: -bufferPixelSize.height))
     }
 
-    private static let sharedCIContext = CIContext(options: [.cacheIntermediates: false])
+    private static var sharedCIContext: CIContext { CoreImageContext.shared }
 
     private static func withTransform(_ path: CGPath, _ transform: CGAffineTransform) -> CGPath? {
         var t = transform

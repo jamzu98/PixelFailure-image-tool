@@ -179,6 +179,16 @@ final class BrushSettings {
 /// Per-window UI state that isn't part of the document.
 @Observable
 final class EditorState {
+    /// Earlier seeds of each pattern layer this session, newest first.
+    var seedHistory: [UUID: [UInt64]] = [:]
+
+    func recordSeed(_ seed: UInt64, for layerID: UUID) {
+        var history = seedHistory[layerID, default: []]
+        history.removeAll { $0 == seed }
+        history.insert(seed, at: 0)
+        seedHistory[layerID] = Array(history.prefix(20))
+    }
+
     /// Multi-selection. Most single-layer flows use `selectedLayerID`, which
     /// is non-nil exactly when one layer is selected.
     var selectedLayerIDs: Set<UUID> = []

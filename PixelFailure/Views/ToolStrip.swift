@@ -11,7 +11,7 @@ struct AddLayerMenuItems: View {
 
     var body: some View {
         Menu("Pattern") {
-            ForEach(GeneratorType.allCases, id: \.self) { type in
+            GeneratorMenuItems { type in
                 Button(type.displayName) {
                     editorState.selectedLayerID = document.addPatternLayer(type, undoManager: undoManager)
                 }

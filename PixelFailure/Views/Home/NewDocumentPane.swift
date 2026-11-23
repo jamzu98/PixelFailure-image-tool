@@ -335,7 +335,7 @@ private struct PresetDetails: View {
         PanelPicker("Start With", selection: $settings.starterGenerator) {
             Text("Blank").tag(GeneratorType?.none)
             Divider()
-            ForEach(GeneratorType.allCases.filter { $0 != .sampledGrid }, id: \.self) { type in
+            GeneratorMenuItems(filter: { !$0.generator.needsSourceImage }) { type in
                 Text(type.displayName).tag(GeneratorType?.some(type))
             }
         }
